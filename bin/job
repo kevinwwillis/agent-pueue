@@ -1,0 +1,1122 @@
+#!/usr/bin/env python3
+"""job (agent-pueue): run long jobs under pueue and wait on them correctly.
+
+A thin wrapper around pueue for agents. Pueue owns every process; this tool
+never finds a process by name or command line. One call, `job run`, queues a
+command on a host and blocks until it ends, then prints the outcome and exits
+with the job's own exit code. See docs/usage.md.
+
+Hosts other than `local` are read from ~/.config/agent-pueue/hosts (one
+`name [ssh-destination]` per line). The same file is installed on every host
+(~/.local/bin/job). For a remote host
+the client runs `ssh <host> ~/.local/bin/job _host <op>` with a JSON request on
+stdin and reads a JSON reply on stdout; nothing the user typed goes into the
+ssh argv.
+"""
+
+import argparse
+import base64
+import datetime as dt
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+VERSION = "0.4.1"
+PROTOCOL = 3
+
+
+def _load_hosts():
+    """host name -> ssh destination (None = run here), from the hosts file."""
+    hosts = {"local": None}
+    path = HOSTS_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                parts = line.split("#", 1)[0].split()
+                if not parts:
+                    continue
+                name, dest = parts[0], (parts[1] if len(parts) > 1 else parts[0])
+                ok = name != "local" and not name.startswith("-") and len(parts) <= 2 and all(
+                    c.isalnum() or c in "._-" for c in name) and not dest.startswith("-")
+                if not ok:
+                    sys.stderr.write("job: %s line %d ignored: %r\n" % (path, n, line.strip()))
+                    continue
+                hosts[name] = dest
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:  # unreadable, a directory, not UTF-8
+        sys.stderr.write("job: cannot read the hosts file %s (%s); only 'local' is known\n" % (path, e))
+    return hosts
+
+
+HOSTS_FILE = os.environ.get("JOB_HOSTS_FILE") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "agent-pueue", "hosts")
+HOSTS = _load_hosts()
+LISTED = list(HOSTS)  # what `job ls` lists by default
+# On a server, its own name means this machine too (no ssh to itself).
+SELF = socket.gethostname().split(".")[0].lower()
+for _name in list(HOSTS):
+    if _name.split(".")[0].lower() == SELF:
+        HOSTS[_name] = None  # a listed name (any case, short or full) for this machine
+if SELF not in {n.lower() for n in HOSTS}:
+    HOSTS[SELF] = None  # this machine's own name works even when it is not listed
+
+# Wrapper exit codes for outcomes that are not the job's own exit code.
+EXIT = {
+    "USAGE": 2,
+    "FAILED_TO_SPAWN": 127,
+    "KILLED": 137,
+    "STALLED": 200,
+    "ALERT": 201,
+    "UNREACHABLE": 202,
+    "ERRORED": 203,
+    "DEPENDENCY_FAILED": 203,
+    "GONE": 204,
+    "WRAPPER_ERROR": 205,
+}
+# Outcomes that end a multi-job wait at once (the agent must look now).
+URGENT = ("STALLED", "ALERT", "UNREACHABLE", "GONE", "WRAPPER_ERROR")
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "agent-pueue"
+)
+CHUNK = 4 * 1024 * 1024        # max log bytes moved per probe
+TAIL_BYTES = 64 * 1024         # the log tail is read from at most this many final bytes
+TAIL_LINE_MAX = 1000           # longer tail lines are cut
+PARTIAL_MAX = 1024 * 1024      # an unterminated line longer than this goes to the check anyway
+SCRIPT_KEEP_DAYS = 30
+POLL_LOCAL, POLL_REMOTE = 3.0, 20.0
+PUEUE_TIMEOUT = 60
+
+# Variables passed from the submitting shell into the job (pueue stores the
+# job's environment in its state file, so nothing else is passed; --env adds more).
+ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TERM", "TMPDIR",
+             "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+
+
+class JobError(Exception):
+    """A failure of the wrapper itself (not of the job)."""
+
+
+class ProtocolError(JobError):
+    """Client and host run different versions of job; retrying cannot help."""
+
+
+# --------------------------------------------------------------------------
+# host side: everything here runs on the machine that owns the pueue daemon
+# --------------------------------------------------------------------------
+
+def _pueue_base():
+    cmd = ["pueue"]
+    cfg = os.environ.get("JOB_PUEUE_CONFIG")
+    if cfg:
+        cmd += ["-c", cfg]
+    return cmd
+
+
+def _with_local_bin(path):
+    local_bin = os.path.expanduser("~/.local/bin")
+    parts = (path or "/usr/local/bin:/usr/bin:/bin").split(":")
+    return path if local_bin in parts else local_bin + ":" + (path or "/usr/local/bin:/usr/bin:/bin")
+
+
+def _pueue(args, env=None, check=True):
+    if env is None:
+        env = dict(os.environ, PATH=_with_local_bin(os.environ.get("PATH")))
+    try:
+        p = subprocess.run(_pueue_base() + args, capture_output=True, encoding="utf-8",
+                           errors="replace", env=env, timeout=PUEUE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise JobError("pueue %s did not answer within %d s" % (" ".join(args[:2]), PUEUE_TIMEOUT))
+    except OSError as e:
+        raise JobError("cannot run pueue: %s" % e)
+    if check and p.returncode != 0:
+        raise JobError("pueue %s failed (exit %d): %s" % (
+            " ".join(args[:2]), p.returncode, (p.stderr or p.stdout).strip()[-2000:]))
+    return p
+
+
+def _pueue_status():
+    p = _pueue(["status", "--json"])
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        raise JobError("pueue status --json returned no JSON: %r" % p.stdout[:300])
+
+
+def _pueue_directory():
+    """The daemon's data directory (holds task_logs/<id>.log)."""
+    cfg = os.environ.get("JOB_PUEUE_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "pueue", "pueue.yml")
+    try:
+        with open(cfg, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("pueue_directory:"):
+                    val = s.split(":", 1)[1].strip().strip("'\"")
+                    if val and val not in ("null", "~"):
+                        return os.path.expanduser(val)
+    except OSError:
+        pass
+    return os.path.join(
+        os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "pueue")
+
+
+def _log_path(task_id):
+    return os.path.join(_pueue_directory(), "task_logs", "%d.log" % int(task_id))
+
+
+def _proc_tree(token):
+    """CPU ticks used so far by the job's processes.
+
+    The job's processes are found by the unique token that `job submit` put in
+    the task's environment (pueue starts the task with that environment, and
+    children inherit it), plus every descendant of those processes. Names and
+    command lines are never looked at. Each process counts its own CPU time and
+    that of its children it has already reaped, so work done by short-lived
+    children is not lost. Returns (ticks, nprocs, runnable); (None, 0, 0) when no
+    process is alive. runnable counts processes in state R (running or waiting
+    for a CPU), so a job starved of CPU on a busy machine is not mistaken for an
+    idle one.
+    """
+    if not token:
+        return None, 0, 0
+    needle = ("JOB_TOKEN=" + token).encode()
+    stats = {}
+    members = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open("/proc/%d/stat" % pid, "rb") as f:
+                raw = f.read().decode("ascii", "replace")
+            # comm may hold spaces or parentheses; the fields after the last ')' are fixed.
+            rest = raw[raw.rindex(")") + 2:].split()
+            ppid = int(rest[1])
+            ticks = int(rest[11]) + int(rest[12]) + int(rest[13]) + int(rest[14])  # utime stime cutime cstime
+            stats[pid] = (ppid, ticks, rest[0] == "R")
+        except (OSError, ValueError, IndexError):
+            continue
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as f:
+                if needle in f.read().split(b"\0"):
+                    members.add(pid)
+        except OSError:
+            continue
+    if not members:
+        return None, 0, 0
+    # add descendants (a child may have cleared its environment)
+    children = {}
+    for pid, (ppid, _, _) in stats.items():
+        children.setdefault(ppid, []).append(pid)
+    stack = list(members)
+    while stack:
+        for c in children.get(stack.pop(), []):
+            if c not in members:
+                members.add(c)
+                stack.append(c)
+    live = [stats[p] for p in members if p in stats]
+    return sum(x[1] for x in live), len(members), sum(1 for x in live if x[2])
+
+
+def _summarize_task(t):
+    status = t.get("status") or {}
+    kind = next(iter(status), "Unknown") if isinstance(status, dict) else str(status)
+    info = status.get(kind, {}) if isinstance(status, dict) else {}
+    if not isinstance(info, dict):
+        info = {}
+    result = info.get("result")
+    if isinstance(result, dict):
+        rkind = next(iter(result))
+        rval = result[rkind]
+    else:
+        rkind, rval = result, None
+    envs = t.get("envs") or {}
+    return {
+        "id": t.get("id"),
+        "label": t.get("label"),
+        "group": t.get("group"),
+        "path": t.get("path"),
+        "command": t.get("original_command") or t.get("command"),
+        "status": kind,
+        "result": rkind,
+        "result_value": rval,
+        "enqueued_at": info.get("enqueued_at"),
+        "start": info.get("start"),
+        "end": info.get("end"),
+        "token": envs.get("JOB_TOKEN"),
+        "session": envs.get("JOB_SESSION"),
+        "summary": envs.get("JOB_SUMMARY"),
+        "submitted_from": envs.get("JOB_SUBMITTED_FROM"),
+    }
+
+
+def _clean_old_files(state, in_use):
+    """Remove scripts and result records older than SCRIPT_KEEP_DAYS whose task pueue no longer holds."""
+    cutoff = time.time() - SCRIPT_KEEP_DAYS * 86400
+    for sub in ("scripts", "results"):
+        d = os.path.join(state, sub)
+        try:
+            for name in os.listdir(d):
+                p = os.path.join(d, name)
+                if name.split(".")[0] not in in_use and os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+        except OSError:
+            pass
+
+
+def host_submit(req):
+    command = req["command"]
+    token = req.get("token") or uuid.uuid4().hex
+    if not all(c in "0123456789abcdef" for c in token):
+        raise JobError("bad token")
+    st = _pueue_status()
+    tokens = {}
+    for _, t in st.get("tasks", {}).items():
+        tok = (t.get("envs") or {}).get("JOB_TOKEN")
+        if tok:
+            tokens[tok] = int(t["id"])
+    if token in tokens:  # a retried submit whose first attempt got through
+        return {"id": tokens[token], "token": token, "host": socket.gethostname(), "existing": True}
+
+    cwd = os.path.expanduser(req.get("cwd") or "~")
+    if not os.path.isdir(cwd):
+        raise JobError("working directory does not exist on %s: %s" % (socket.gethostname(), cwd))
+    group = req.get("group") or "default"
+    if group != "default" and group not in st.get("groups", {}):
+        raise JobError("pueue group %r does not exist on %s; create it with "
+                       "'job group <host> %s <n>'" % (group, socket.gethostname(), group))
+
+    scripts = os.path.join(STATE_DIR, "scripts")
+    results = os.path.join(STATE_DIR, "results")
+    os.makedirs(scripts, mode=0o700, exist_ok=True)
+    os.makedirs(results, mode=0o700, exist_ok=True)
+    _clean_old_files(STATE_DIR, set(tokens))
+    script = os.path.join(scripts, token + ".sh")
+    body = os.path.join(scripts, token + ".cmd")
+    record = os.path.join(results, token + ".exit")
+    with open(body, "w", encoding="utf-8") as f:
+        f.write(command)
+        if not command.endswith("\n"):
+            f.write("\n")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("#!/bin/bash\n")
+        f.write("# written by job %s for task %s at %s\n" % (
+            VERSION, req.get("task", "?"), dt.datetime.now().astimezone().isoformat()))
+        f.write('export PATH="$HOME/.local/bin:$PATH"\n')
+        # the command runs in its own bash; its exit code is recorded here, so the record
+        # survives pueue's cleanup and cannot be undone by a trap in the command
+        f.write("bash -o pipefail %s\n" % shlex.quote(body))
+        f.write("rc=$?\n")
+        f.write("echo $rc > %s\n" % shlex.quote(record))
+        f.write("exit $rc\n")
+    os.chmod(script, 0o700)
+    runner = "nice -n 19 ionice -c 3 bash %s" % shlex.quote(script)
+
+    env = {k: v for k, v in os.environ.items()
+           if k in ENV_ALLOW or k.startswith("LC_")}
+    env["PATH"] = _with_local_bin(env.get("PATH"))
+    env.update(req.get("env") or {})
+    env.update({
+        "JOB_TOKEN": token,
+        "JOB_TASK": req["task"],
+        "JOB_SESSION": req.get("session") or "unknown",
+        "JOB_SUMMARY": " ".join(command.split())[:200],
+        "JOB_SUBMITTED_FROM": req.get("from") or "?",
+    })
+    args = ["add", "--print-task-id", "--label", req["task"], "--working-directory", cwd,
+            "--group", group, "--", runner]
+    try:
+        p = _pueue(args, env=env)
+    except JobError:
+        os.remove(script)
+        os.remove(body)
+        raise
+    try:
+        task_id = int(p.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise JobError("pueue add printed no task id: %r" % p.stdout[:300])
+    return {"id": task_id, "token": token, "host": socket.gethostname(), "existing": False}
+
+
+def host_probe(req):
+    tid = int(req["id"])
+    st = _pueue_status()
+    t = st.get("tasks", {}).get(str(tid))
+    want_token = req.get("token")
+    if t is None or (want_token and (t.get("envs") or {}).get("JOB_TOKEN") != want_token):
+        out = {"found": t is not None, "token_mismatch": t is not None}
+        rec = os.path.join(STATE_DIR, "results", "%s.exit" % want_token) if want_token else None
+        if rec and os.path.exists(rec):
+            try:
+                with open(rec) as f:
+                    code = int(f.read().strip())
+                out["record"] = {"exit": code, "end": dt.datetime.fromtimestamp(
+                    os.path.getmtime(rec)).astimezone().isoformat()}
+            except (OSError, ValueError):
+                pass
+        return out
+    s = _summarize_task(t)
+    s["found"] = True
+    s["token_mismatch"] = False
+    g = st.get("groups", {}).get(s["group"]) or {}
+    s["group_parallel"] = g.get("parallel_tasks")
+    s["group_running"] = sum(1 for x in st.get("tasks", {}).values()
+                             if x.get("group") == s["group"] and "Running" in (x.get("status") or {}))
+    s["clk_tck"] = os.sysconf("SC_CLK_TCK")
+    path = _log_path(tid)
+    s["log_path"] = path
+    # status is read before the log, so a Done status means the log is complete
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    s["log_size"] = size
+    if s["status"] == "Running":
+        s["cpu_ticks"], s["nprocs"], s["runnable"] = _proc_tree(s["token"])
+    else:
+        s["cpu_ticks"], s["nprocs"], s["runnable"] = None, 0, 0
+    off = req.get("log_offset")
+    if off is not None and size > off:
+        with open(path, "rb") as f:
+            f.seek(off)
+            data = f.read(min(CHUNK, size - off))
+        s["new_offset"] = off + len(data)
+        s["new_bytes"] = base64.b64encode(data).decode()
+    tail = req.get("tail_lines")
+    if tail:
+        s["tail"] = _tail(path, int(tail))
+    return s
+
+
+def _tail(path, n):
+    """The last n lines among the log's final TAIL_BYTES, each cut to TAIL_LINE_MAX characters."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - TAIL_BYTES))
+            buf = f.read()
+    except OSError:
+        return []
+    text = buf.decode("utf-8", "replace").replace("\r\n", "\n")
+    lines = []
+    for line in text.split("\n"):
+        line = line.rsplit("\r", 1)[-1] if "\r" in line else line  # progress bars: keep the last redraw
+        if len(line) > TAIL_LINE_MAX:
+            line = line[:TAIL_LINE_MAX] + " ...[line cut]"
+        lines.append(line)
+    if lines and lines[-1] == "":
+        lines.pop()
+    if size > TAIL_BYTES and lines:
+        lines.pop(0)  # the first line is probably partial
+    return lines[-n:]
+
+
+def host_ls(req):
+    st = _pueue_status()
+    out = [_summarize_task(t) for _, t in sorted(st.get("tasks", {}).items(), key=lambda kv: int(kv[0]))]
+    return {"tasks": out, "groups": st.get("groups", {}), "hostname": socket.gethostname()}
+
+
+def host_group(req):
+    name, n = req["name"], int(req["parallel"])
+    if n < 1:
+        raise JobError("parallel limit must be at least 1")
+    created = False
+    if name not in _pueue_status().get("groups", {}):
+        _pueue(["group", "add", name])
+        created = True
+    _pueue(["parallel", str(n), "--group", name])
+    return {"name": name, "parallel": n, "created": created}
+
+
+def host_kill(req):
+    tid = int(req["id"])
+    t = _pueue_status().get("tasks", {}).get(str(tid))
+    if t is None:
+        raise JobError("no task %d" % tid)
+    tok = req.get("token")
+    if tok and (t.get("envs") or {}).get("JOB_TOKEN") != tok:
+        raise JobError("task %d now belongs to a different job; not killed" % tid)
+    status = next(iter(t.get("status") or {"?": 0}))
+    if status == "Running":
+        _pueue(["kill", str(tid)])
+        return {"id": tid, "action": "killed"}
+    if status in ("Queued", "Stashed", "Locked"):
+        _pueue(["remove", str(tid)])
+        return {"id": tid, "action": "removed from the queue"}
+    raise JobError("task %d is %s; nothing to kill" % (tid, status))
+
+
+HOST_OPS = {"submit": host_submit, "probe": host_probe, "ls": host_ls,
+            "group": host_group, "kill": host_kill}
+
+
+def host_main(op):
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+        if req.get("pueue_config"):  # tests: point the host side at a throwaway pueued
+            os.environ["JOB_PUEUE_CONFIG"] = req["pueue_config"]
+            global STATE_DIR
+            STATE_DIR = os.path.join(os.path.dirname(req["pueue_config"]), "state")
+        if req.get("protocol") != PROTOCOL:
+            raise JobError("protocol mismatch: client %s, host %s (job %s on %s); install the same "
+                           "version on both (install.sh)" % (req.get("protocol"), PROTOCOL, VERSION,
+                                                             socket.gethostname()))
+        reply = {"ok": True, "data": HOST_OPS[op](req)}
+    except JobError as e:
+        reply = {"ok": False, "error": str(e)}
+    except Exception as e:  # report, never hang the client
+        reply = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    sys.stdout.write("\n" + json.dumps(reply) + "\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# client side
+# --------------------------------------------------------------------------
+
+class Unreachable(Exception):
+    pass
+
+
+def call(host, op, req, timeout=120):
+    """Run a host op on `host` and return its data, raising JobError or Unreachable."""
+    if host not in HOSTS:
+        raise JobError("unknown host %r; known hosts: %s (add it to %s)" % (host, ", ".join(HOSTS), HOSTS_FILE))
+    req = dict(req, protocol=PROTOCOL)
+    dest = HOSTS[host]
+    if dest is None:
+        try:
+            return HOST_OPS[op](req)
+        except OSError as e:
+            raise JobError(str(e))
+    if os.environ.get("JOB_REMOTE_PUEUE_CONFIG"):
+        req["pueue_config"] = os.environ["JOB_REMOTE_PUEUE_CONFIG"]
+    remote_cmd = "$HOME/.local/bin/job _host %s" % op
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+             "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/job-cm-%C", "-o", "ControlPersist=5m",
+             dest, remote_cmd],
+            input=json.dumps(req), capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Unreachable("ssh %s timed out after %ds" % (dest, timeout))
+    except OSError as e:
+        raise JobError("cannot run ssh: %s" % e)
+    if p.returncode == 255:
+        raise Unreachable("ssh %s: %s" % (dest, p.stderr.strip()[-500:]))
+    reply = None
+    for line in reversed(p.stdout.splitlines()):  # tolerate login noise before the reply
+        if line.startswith("{"):
+            try:
+                reply = json.loads(line)
+            except ValueError:
+                reply = None
+            break
+    if not isinstance(reply, dict):
+        raise JobError("%s: no reply from job on the host (exit %d): %s" % (
+            host, p.returncode, (p.stderr or p.stdout).strip()[-800:]))
+    if not reply.get("ok"):
+        err = reply.get("error") or ""
+        if err.startswith("protocol mismatch"):
+            raise ProtocolError("%s: %s" % (host, err))
+        raise JobError("%s: %s" % (host, err))
+    return reply["data"]
+
+
+def _session():
+    for k in ("JOB_SESSION", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
+        v = os.environ.get(k)
+        if v:
+            return v
+    return "unknown"
+
+
+def _parse_time(s):
+    if not s:
+        return None
+    # pueue prints nanoseconds; Python before 3.11 wants at most microseconds
+    try:
+        head, frac_tz = s.split(".", 1)
+        i = 0
+        while i < len(frac_tz) and frac_tz[i].isdigit():
+            i += 1
+        s = head + "." + frac_tz[:i][:6].ljust(6, "0") + frac_tz[i:]
+    except ValueError:
+        pass
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _fmt_dur(seconds):
+    if seconds is None:
+        return "?"
+    seconds = float(seconds)
+    if seconds < 90:
+        return "%.0f s" % seconds
+    if seconds < 5400:
+        return "%.1f min" % (seconds / 60)
+    if seconds < 172800:
+        return "%.1f h" % (seconds / 3600)
+    return "%.1f d" % (seconds / 86400)
+
+
+def _fmt_et(t):
+    """A time in this machine's local zone."""
+    if t is None:
+        return "?"
+    return t.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _runtime(s):
+    start, end = _parse_time(s.get("start")), _parse_time(s.get("end"))
+    if start is None:
+        return None
+    end = end or dt.datetime.now(start.tzinfo)
+    return (end - start).total_seconds()
+
+
+def _parse_env(items):
+    env = {}
+    for it in items or []:
+        if "=" in it:
+            k, v = it.split("=", 1)
+        else:
+            k, v = it, os.environ.get(it)
+            if v is None:
+                raise JobError("--env %s: not set in this shell" % it)
+        if not k or k.startswith("JOB_"):
+            raise JobError("--env: bad variable name %r" % k)
+        env[k] = v
+    return env
+
+
+def submit(args, command):
+    """Queue the command; retried safely when the connection drops (the token makes it idempotent)."""
+    token = uuid.uuid4().hex
+    req = {"command": command, "task": args.task, "group": args.group, "cwd": args.cwd,
+           "session": _session(), "from": socket.gethostname(), "token": token,
+           "env": _parse_env(args.env)}
+    if args.cwd is None and HOSTS.get(args.host) is None:
+        req["cwd"] = os.getcwd()
+    last = None
+    for attempt in range(4):
+        try:
+            return call(args.host, "submit", req)
+        except Unreachable as e:
+            last = e
+            sys.stderr.write("job: %s unreachable while queueing (%s); retrying\n" % (args.host, e))
+            time.sleep(15 * (attempt + 1))
+    raise Unreachable("%s; the job may or may not have been queued: check 'job ls %s' for task %s"
+                      % (last, args.host, args.task))
+
+
+def verdict_of(s):
+    """Map a finished pueue task to (verdict, exit code)."""
+    r, v = s.get("result"), s.get("result_value")
+    if r == "Success":
+        return "SUCCESS", 0
+    if r == "Failed":
+        try:
+            return "FAILED", int(v)
+        except (TypeError, ValueError):
+            return "FAILED", 1
+    if r == "Killed":
+        return "KILLED", EXIT["KILLED"]
+    if r == "FailedToSpawn":
+        return "FAILED_TO_SPAWN", EXIT["FAILED_TO_SPAWN"]
+    if r == "DependencyFailed":
+        return "DEPENDENCY_FAILED", EXIT["DEPENDENCY_FAILED"]
+    return "ERRORED", EXIT["ERRORED"]
+
+
+def report(host, o, out):
+    s, verdict, code = o["s"], o["verdict"], o["code"]
+    label = s.get("label") or "-"
+    head = "job: %s %s#%s (%s)" % (verdict, host, s.get("id"), label)
+    if verdict in ("SUCCESS", "FAILED"):
+        head += " exit %d" % code
+    head += " after %s" % _fmt_dur(_runtime(s))
+    lines = [head]
+    if o.get("note"):
+        lines.append("note: " + o["note"])
+    if s.get("status"):
+        lines.append("status: %s%s" % (s.get("status"), (" / %s" % s.get("result")) if s.get("result") else ""))
+        lines.append("started: %s   ended: %s" % (
+            _fmt_et(_parse_time(s.get("start"))),
+            _fmt_et(_parse_time(s.get("end"))) if s.get("end") else "not ended"))
+        if s.get("summary") or s.get("command"):
+            lines.append("command: %s" % (s.get("summary") or s.get("command")))
+        if s.get("log_path"):
+            lines.append("log: %s:%s" % (host, s.get("log_path")))
+    if verdict == "ALERT" and s.get("status") == "Done":
+        v, c = verdict_of(s)
+        lines.append("the job has also ended: %s exit %d" % (v, c))
+    if verdict in URGENT and s.get("status") not in (None, "Done"):
+        tok = (" --token %s" % s["token"]) if s.get("token") else ""
+        lines.append("the job was left running; reattach: job wait %s %s%s ; stop it: job kill %s %s%s"
+                     % (host, s.get("id"), tok, host, s.get("id"), tok))
+    tail = o.get("tail")
+    if tail:
+        lines.append("--- last %d log lines ---" % len(tail))
+        lines.extend(tail)
+        lines.append("--- end of log tail ---")
+    out.write("\n".join(lines) + "\n")
+
+
+def run_check(check, data, host, tid):
+    env = dict(os.environ, JOB_HOST=host, JOB_ID=str(tid))
+    try:
+        p = subprocess.run([check], input=data, capture_output=True, env=env, timeout=300)
+    except subprocess.TimeoutExpired:
+        return False, "check script timed out after 300 s"
+    except OSError as e:
+        return False, "check script could not run: %s" % e
+    msg = (p.stdout + p.stderr).decode("utf-8", "replace").strip()
+    return p.returncode == 0, msg[-4000:] or ("check exited %d" % p.returncode)
+
+
+class Waiter:
+    """Follows one pueue task; step() returns None while it should keep waiting, else an outcome."""
+
+    AGAIN = "again"  # more log output is waiting; step again before sleeping
+
+    def __init__(self, host, tid, token=None, stall_min=30.0, stall_cpu=0.5, check=None,
+                 from_start=False, tail=40, unreachable_min=15.0):
+        self.host, self.tid, self.token = host, int(tid), token
+        self.stall_s = stall_min * 60.0
+        self.stall_cpu = stall_cpu / 100.0  # fraction of one core
+        self.check, self.from_start, self.tail = check, from_start, tail
+        self.unreachable_s = unreachable_min * 60.0
+        self.offset = None
+        self.partial = b""
+        self.samples = []  # (monotonic time, log size, cpu ticks) while Running
+        self.err_since = None
+        self.told_queued = False
+        self.told_notoken = False
+
+    def _outcome(self, verdict, code, s, note=None, tail=True):
+        """The verdict is already decided; a last probe only refreshes what is shown (status, tail)."""
+        o = {"verdict": verdict, "code": code, "s": s, "note": note}
+        if tail and s.get("found"):
+            try:
+                fresh = call(self.host, "probe", {"id": self.tid, "token": self.token, "tail_lines": self.tail})
+            except (JobError, Unreachable):
+                fresh = None
+            if fresh and fresh.get("found") and not fresh.get("token_mismatch"):
+                o["s"], o["tail"] = fresh, fresh.get("tail")
+        return o
+
+    def _run_check(self, data, s):
+        ok, msg = run_check(self.check, data, self.host, self.tid)
+        if ok:
+            return None
+        return self._outcome("ALERT", EXIT["ALERT"], s, note="check %s failed: %s" % (self.check, msg))
+
+    def step(self):
+        req = {"id": self.tid, "token": self.token}
+        if self.check and self.offset is not None:
+            req["log_offset"] = self.offset
+        try:
+            s = call(self.host, "probe", req)
+        except ProtocolError as e:
+            return self._outcome("WRAPPER_ERROR", EXIT["WRAPPER_ERROR"], {"id": self.tid},
+                                 note="%s. The job keeps running; after reinstalling, reattach with: "
+                                      "job wait %s %s%s" % (e, self.host, self.tid,
+                                                            (" --token %s" % self.token) if self.token else ""),
+                                 tail=False)
+        except (Unreachable, JobError) as e:
+            now = time.monotonic()
+            self.err_since = self.err_since or now
+            if now - self.err_since >= self.unreachable_s:
+                return self._outcome(
+                    "UNREACHABLE", EXIT["UNREACHABLE"], {"id": self.tid},
+                    note="no state from %s for %s (last error: %s). The job may still be running; "
+                         "reattach with: job wait %s %s%s" % (
+                             self.host, _fmt_dur(now - self.err_since), e, self.host, self.tid,
+                             (" --token %s" % self.token) if self.token else ""), tail=False)
+            sys.stderr.write("job: cannot get the state of %s#%s (%s); retrying\n" % (self.host, self.tid, e))
+            return None
+        self.err_since = None
+        if not s.get("found") or s.get("token_mismatch"):
+            why = ("task id %s on %s now belongs to a different job" % (self.tid, self.host)
+                   if s.get("token_mismatch") else
+                   "task %s no longer exists in pueue on %s" % (self.tid, self.host))
+            rec = s.get("record")
+            if rec is not None:  # the job's own exit record survived pueue's cleanup
+                stub = {"id": self.tid, "status": "Done", "end": rec["end"],
+                        "result": "Success" if rec["exit"] == 0 else "Failed", "result_value": rec["exit"]}
+                verdict, code = verdict_of(stub)
+                return self._outcome(verdict, code, stub, tail=False,
+                                     note="%s (its pueue entry was removed); the exit code comes from "
+                                          "the job's own record; the log is gone" % why)
+            return self._outcome("GONE", EXIT["GONE"], {"id": self.tid},
+                                 note="%s; the job left no exit record (removed before it ran, or killed "
+                                      "outright)" % why, tail=False)
+        self.token = self.token or s.get("token")
+        status, size = s.get("status"), s.get("log_size", 0)
+
+        if self.check:
+            if self.offset is None:
+                # first probe: start at the current end unless asked to read it all
+                self.offset = 0 if self.from_start else size
+                if self.offset < size:
+                    return self.AGAIN
+            elif s.get("new_bytes") is not None:
+                data = self.partial + base64.b64decode(s["new_bytes"])
+                self.offset = s["new_offset"]
+                complete = status == "Done" and self.offset >= size
+                cut = max(data.rfind(b"\n"), data.rfind(b"\r"))  # \r ends a progress-bar line
+                if complete or len(data) - (cut + 1) > PARTIAL_MAX:
+                    self.partial = b""
+                else:  # hold back an unfinished last line until it is finished
+                    self.partial, data = data[cut + 1:], data[:cut + 1]
+                if data:
+                    alert = self._run_check(data, s)
+                    if alert:
+                        return alert
+                if self.offset < size:
+                    return self.AGAIN
+            if status == "Done" and self.partial:
+                data, self.partial = self.partial, b""
+                alert = self._run_check(data, s)
+                if alert:
+                    return alert
+
+        if status == "Done":
+            verdict, code = verdict_of(s)
+            return self._outcome(verdict, code, s)
+
+        if status != "Running":  # queued, paused, stashed: not a stall
+            self.samples = []
+            running, limit = s.get("group_running") or 0, s.get("group_parallel") or 0
+            if status == "Queued" and not self.told_queued and limit and running >= limit:
+                self.told_queued = True
+                sys.stderr.write("job: %s#%s is queued behind %s running job(s) in group %s (limit %s); "
+                                 "it starts when one ends\n" % (self.host, self.tid, s.get("group_running"),
+                                                                 s.get("group"), s.get("group_parallel")))
+            return None
+        if not self.token:  # started with plain pueue add: its processes cannot be found
+            if not self.told_notoken:
+                self.told_notoken = True
+                sys.stderr.write("job: %s#%s was not started by job; stall detection is off for it\n"
+                                 % (self.host, self.tid))
+            return None
+        now = time.monotonic()
+        ticks = s.get("cpu_ticks")
+        self.samples.append((now, size, ticks, s.get("runnable") or 0))
+        if self.stall_s <= 0:
+            return None
+        base = None
+        while len(self.samples) > 1 and self.samples[1][0] <= now - self.stall_s:
+            self.samples.pop(0)
+        if self.samples[0][0] <= now - self.stall_s:
+            base = self.samples[0]
+        if base is None or size != base[1]:
+            return None
+        if any(x[3] for x in self.samples):
+            return None  # a process was running or waiting for a CPU: starved, not idle
+        if ticks is None and any(x[2] is not None for x in self.samples):
+            return None  # the processes just went away: the job is ending, or pueue has not noticed yet
+        span = now - base[0]
+        used = max(0, (ticks or 0) - (base[2] or 0)) / float(s.get("clk_tck") or 100)
+        if used / span >= self.stall_cpu:
+            return None
+        what = ("its processes used %.2f%% of one CPU" % (100 * used / span) if ticks is not None
+                else "no live process of the job was found")
+        return self._outcome("STALLED", EXIT["STALLED"], s,
+                             note="for %s the log did not grow and %s; the job was left running"
+                                  % (_fmt_dur(span), what))
+
+
+def wait_all(host, waiters, poll=None, out=sys.stdout):
+    """Wait on one or more jobs on one host. Returns the exit code."""
+    poll = poll if poll is not None else (POLL_REMOTE if HOSTS.get(host) else POLL_LOCAL)
+    pending = list(waiters)
+    done = []
+    while pending:
+        for w in list(pending):
+            for _ in range(10000):
+                o = w.step()
+                if o != Waiter.AGAIN:
+                    break
+            if o is None or o == Waiter.AGAIN:
+                continue
+            pending.remove(w)
+            done.append((w, o))
+            if o["verdict"] in URGENT:
+                return _finish(host, waiters, done, pending, o, out)
+        if pending:
+            time.sleep(poll)
+    return _finish(host, waiters, done, [], None, out)
+
+
+def _finish(host, waiters, done, pending, urgent, out):
+    if len(waiters) == 1:
+        o = done[0][1]
+        report(host, o, out)
+        out.write("job: exit %d\n" % o["code"])
+        out.flush()
+        return o["code"]
+    by_id = sorted(done, key=lambda wo: wo[0].tid)
+    if urgent:
+        code = urgent["code"]
+        out.write("job: %s %s#%s; %d of %d jobs ended, still waiting: %s\n" % (
+            urgent["verdict"], host, urgent["s"].get("id"), len(done), len(waiters),
+            " ".join(str(w.tid) for w in pending) or "none"))
+        report(host, urgent, out)
+        others = [wo for wo in by_id if wo[1] is not urgent]
+    else:
+        bad = [wo for wo in by_id if wo[1]["code"] != 0]
+        code = bad[0][1]["code"] if bad else 0
+        counts = {}
+        for _, o in by_id:
+            counts[o["verdict"]] = counts.get(o["verdict"], 0) + 1
+        out.write("job: ALL ENDED %s: %s\n" % (host, ", ".join("%d %s" % (n, v) for v, n in sorted(counts.items()))))
+        others = by_id
+    for _, o in others:
+        out.write("\n")
+        report(host, o, out)
+    out.write("job: exit %d\n" % code)
+    out.flush()
+    return code
+
+
+QUEUED_HINT = None
+
+
+def _command_from(args):
+    if args.script:
+        if args.command:
+            raise JobError("give either --script FILE or a command after --, not both")
+        with open(args.script, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    cmd = list(args.command or [])
+    if not cmd:
+        raise JobError("no command given; put it after --, or use --script FILE")
+    if len(cmd) == 1:
+        return cmd[0]  # one argument: a shell command line
+    return shlex.join(cmd)
+
+
+def _check_ok(args):
+    if getattr(args, "check", None):
+        if not (os.path.isfile(args.check) and os.access(args.check, os.X_OK)):
+            raise JobError("--check %s: not an executable file" % args.check)
+        args.check = os.path.abspath(args.check)
+
+
+def _waiter(args, tid, token):
+    return Waiter(args.host, tid, token=token, stall_min=args.stall, stall_cpu=args.stall_cpu,
+                  check=args.check, from_start=getattr(args, "from_start", True), tail=args.tail)
+
+
+def cmd_run(args, queue_only=False):
+    command = _command_from(args)
+    if not queue_only:
+        _check_ok(args)
+    sub = submit(args, command)
+    tid, tok = sub["id"], sub["token"]
+    again = "job wait %s %s --token %s" % (args.host, tid, tok)
+    global QUEUED_HINT
+    QUEUED_HINT = "the job %s#%s was queued and keeps running; reattach with: %s" % (args.host, tid, again)
+    if queue_only:
+        print(tid)
+        sys.stderr.write("job: queued %s#%s (%s). Wait on it with: %s\n" % (args.host, tid, args.task, again))
+        return 0
+    sys.stderr.write("job: queued %s#%s (%s); waiting. If this wait is lost, reattach with: %s\n"
+                     % (args.host, tid, args.task, again))
+    sys.stderr.flush()
+    args.from_start = True
+    return wait_all(args.host, [_waiter(args, tid, tok)], poll=args.poll)
+
+
+def cmd_wait(args):
+    _check_ok(args)
+    if args.token and len(args.ids) != 1:
+        raise JobError("--token goes with a single job id")
+    return wait_all(args.host, [_waiter(args, tid, args.token) for tid in args.ids], poll=args.poll)
+
+
+def cmd_ls(args):
+    if args.hosts:
+        hosts = args.hosts
+    else:  # each machine once: a listed name for this machine replaces "local"
+        here = [h for h in LISTED if h != "local" and HOSTS[h] is None]
+        hosts = [h for h in LISTED if not (h == "local" and here)]
+    bad = [h for h in hosts if h not in HOSTS]
+    if bad:
+        raise JobError("unknown host(s) %s; known hosts: %s (add it to %s)" % (
+            ", ".join(bad), ", ".join(HOSTS), HOSTS_FILE))
+    results = {}
+
+    def fetch(h):
+        try:
+            results[h] = call(h, "ls", {}, timeout=60)
+        except (JobError, Unreachable) as e:
+            results[h] = e
+
+    threads = [threading.Thread(target=fetch, args=(h,)) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    rows, unreachable = [], []
+    for h in hosts:
+        r = results.get(h)
+        if isinstance(r, Exception):
+            unreachable.append("%s: UNREACHABLE: %s" % (h, r))
+            continue
+        for s in r["tasks"]:
+            if not args.all and s["status"] == "Done":
+                end = _parse_time(s.get("end"))
+                if end and (dt.datetime.now(end.tzinfo) - end).total_seconds() > args.recent * 3600:
+                    continue
+            state = s["status"]
+            if state == "Done":
+                v, c = verdict_of(s)
+                state = v if v != "FAILED" else "FAILED(%d)" % c
+            rows.append((h, str(s["id"]), s.get("label") or "-", state, _fmt_dur(_runtime(s)),
+                         s.get("group") or "", s.get("session") or "unknown",
+                         (s.get("summary") or s.get("command") or "")[:60]))
+    head = ("HOST", "ID", "TASK", "STATUS", "RUN TIME", "GROUP", "SESSION", "COMMAND")
+    if rows:
+        widths = [max(len(r[i]) for r in rows + [head]) for i in range(len(head))]
+        for r in [head] + rows:
+            print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip())
+    else:
+        print("no jobs on the reachable hosts" + ("" if args.all else
+              " (finished jobs older than %g h hidden; --all shows them)" % args.recent))
+    for u in unreachable:
+        print(u)
+    return EXIT["UNREACHABLE"] if unreachable else 0
+
+
+def cmd_group(args):
+    r = call(args.host, "group", {"name": args.name, "parallel": args.parallel})
+    print("%s: group %s %s, runs %d at a time" % (args.host, r["name"],
+                                                  "created" if r["created"] else "exists", r["parallel"]))
+    return 0
+
+
+def cmd_kill(args):
+    r = call(args.host, "kill", {"id": int(args.id), "token": args.token})
+    print("%s#%s %s" % (args.host, args.id, r["action"]))
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="job", description="Run long jobs under pueue and wait on them correctly.")
+    p.add_argument("--version", action="version", version="job %s" % VERSION)
+    sub = p.add_subparsers(dest="cmd")
+
+    def waitopts(q):
+        q.add_argument("--stall", type=float, default=30.0, metavar="MIN",
+                       help="end with STALLED after MIN minutes in which the log did not grow and the job "
+                            "used less than --stall-cpu of one CPU (default 30; 0 turns it off)")
+        q.add_argument("--stall-cpu", type=float, default=0.5, metavar="PCT",
+                       help="CPU use, in percent of one core, below which the job counts as idle (default 0.5)")
+        q.add_argument("--check", metavar="SCRIPT",
+                       help="run SCRIPT on each new chunk of whole output lines (on stdin); nonzero exit "
+                            "ends the wait with ALERT")
+        q.add_argument("--poll", type=float, default=None, metavar="SEC",
+                       help="seconds between probes (default %g local, %g remote)" % (POLL_LOCAL, POLL_REMOTE))
+        q.add_argument("--tail", type=int, default=40, metavar="N", help="log lines to print at the end (default 40)")
+
+    for name in ("run", "submit"):
+        q = sub.add_parser(name, help="queue a command and wait for it" if name == "run" else "queue a command, print its id")
+        q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
+        q.add_argument("task", help="the task id the job belongs to (becomes the pueue label)")
+        q.add_argument("--group", default=None, help="pueue group (create it with 'job group')")
+        q.add_argument("--cwd", default=None, help="working directory on the host (default: here for local, home for remote)")
+        q.add_argument("--script", default=None, metavar="FILE", help="read the command from FILE instead of after --")
+        q.add_argument("--env", action="append", metavar="NAME[=VALUE]",
+                       help="pass this variable to the job (repeatable); only a small fixed set is passed otherwise")
+        if name == "run":
+            waitopts(q)
+
+    q = sub.add_parser("wait", help="wait on one or more queued or finished jobs on one host")
+    q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
+    q.add_argument("ids", type=int, nargs="+", metavar="id")
+    q.add_argument("--token", default=None, help="the token 'job submit' printed; refuses a reused id")
+    q.add_argument("--from-start", action="store_true",
+                   help="with --check: check the output already written too (default: only new output)")
+    waitopts(q)
+
+    q = sub.add_parser("ls", help="list jobs on all hosts")
+    q.add_argument("hosts", nargs="*", help="hosts to list (default: all)")
+    q.add_argument("--all", action="store_true", help="include finished jobs older than --recent")
+    q.add_argument("--recent", type=float, default=24.0, metavar="H", help="hide finished jobs older than H hours (default 24)")
+
+    q = sub.add_parser("group", help="create a group or set its parallel limit")
+    q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
+    q.add_argument("name")
+    q.add_argument("parallel", type=int)
+
+    q = sub.add_parser("kill", help="kill a running job")
+    q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
+    q.add_argument("id", type=int)
+    q.add_argument("--token", default=None, help="refuse if the id now belongs to another job")
+    return p
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) == 2 and argv[0] == "_host" and argv[1] in HOST_OPS:
+        return host_main(argv[1])
+    command = None
+    if "--" in argv:  # everything after the first -- is the job's command, untouched
+        i = argv.index("--")
+        argv, command = argv[:i], argv[i + 1:]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.command = command
+    if command is not None and args.cmd not in ("run", "submit"):
+        parser.error("only run and submit take a command after --")
+    if not args.cmd:
+        parser.print_help()
+        return EXIT["USAGE"]
+    if getattr(args, "host", None) is not None and args.host not in HOSTS:
+        mine = [n for n in HOSTS if HOSTS[n] is None and n != "local"
+                and n.split(".")[0].lower() == args.host.split(".")[0].lower()]
+        if mine:  # this machine's name in another case, or its full name
+            args.host = mine[0]
+    if getattr(args, "host", None) is not None and args.host not in HOSTS:
+        sys.stdout.write("job: WRAPPER_ERROR unknown host %r; known hosts: %s (add it to %s)\njob: exit %d\n"
+                         % (args.host, ", ".join(HOSTS), HOSTS_FILE, EXIT["WRAPPER_ERROR"]))
+        return EXIT["WRAPPER_ERROR"]
+    handlers = {"run": cmd_run, "submit": lambda a: cmd_run(a, queue_only=True), "wait": cmd_wait,
+                "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill}
+    try:
+        return handlers[args.cmd](args)
+    except JobError as e:
+        sys.stdout.write("job: WRAPPER_ERROR %s\n%sjob: exit %d\n" % (
+            e, ("note: %s\n" % QUEUED_HINT) if QUEUED_HINT else "", EXIT["WRAPPER_ERROR"]))
+        return EXIT["WRAPPER_ERROR"]
+    except Unreachable as e:
+        sys.stdout.write("job: UNREACHABLE %s\njob: exit %d\n" % (e, EXIT["UNREACHABLE"]))
+        return EXIT["UNREACHABLE"]
+    except KeyboardInterrupt:
+        sys.stderr.write("job: interrupted; the job itself keeps running under pueue\n")
+        return 130
+    except Exception as e:  # never exit 1, which would look like the job's own exit 1
+        sys.stdout.write("job: WRAPPER_ERROR internal error %s: %s\n%sjob: exit %d\n"
+                         % (type(e).__name__, e, ("note: %s\n" % QUEUED_HINT) if QUEUED_HINT else "",
+                            EXIT["WRAPPER_ERROR"]))
+        return EXIT["WRAPPER_ERROR"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

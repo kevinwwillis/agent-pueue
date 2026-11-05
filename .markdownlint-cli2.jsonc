@@ -1,0 +1,37 @@
+{
+  // markdownlint-cli2 settings for this repo. Run: markdownlint-cli2
+  // Rules: https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md
+  "globs": ["**/*.md"],
+  "config": {
+    "default": true,
+    // Long lines are fine in prose and tables; agents wrap inconsistently.
+    "MD013": false,
+    // Allow inline HTML (kbd, details, img) in docs.
+    "MD033": false,
+    // Multiple H1s are allowed.
+    "MD025": false,
+    // Duplicate headings are allowed under different parents.
+    "MD024": { "siblings_only": true },
+    // Bare URLs are allowed.
+    "MD034": false,
+    // First line does not have to be a heading (frontmatter, notes).
+    "MD041": false,
+    // Table pipe alignment is not enforced; agents write compact tables.
+    "MD060": false,
+    // Ordered list numbering style is free.
+    "MD029": false
+  },
+  "ignores": [
+    "node_modules/**",
+    ".next/**",
+    ".next-*/**",
+    "dist/**",
+    "build/**",
+    "target/**",
+    ".venv/**",
+    "backlog/**",
+    "docs/archive/**",
+    "test-results/**",
+    "playwright-report/**"
+  ]
+}
