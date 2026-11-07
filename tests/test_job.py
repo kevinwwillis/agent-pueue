@@ -106,6 +106,16 @@ class Base(unittest.TestCase):
     def tearDownClass(cls):
         cls.d.stop()
 
+    @staticmethod
+    def load_job():
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("jobmod", JOB)
+        spec = importlib.util.spec_from_loader("jobmod", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+
     def job(self, *args, timeout=120, **env):
         t0 = time.monotonic()
         p = subprocess.run([sys.executable, JOB] + list(args), capture_output=True, text=True,
@@ -167,6 +177,107 @@ class JobTests(Base):
         self.assertIn("nice=19", p.stdout)
         self.assertIn("idle", p.stdout)
         self.assertIn("path=%s/.local/bin:" % os.path.expanduser("~"), p.stdout)
+
+    def test_default_runner_is_idle_priority(self):
+        job = self.load_job()
+        r = job._runner("/x/s.sh")
+        self.assertTrue(r.startswith("nice -n 19 ionice -c 3 bash "), r)
+        self.assertEqual(r, job._runner("/x/s.sh", False))
+
+    def test_normal_priority_runner_has_no_nice_or_ionice(self):
+        r = self.load_job()._runner("/x/s.sh", True)
+        self.assertNotIn("nice", r)
+        self.assertEqual(r, "bash /x/s.sh")
+
+    def test_normal_priority_job_runs_at_normal_priority(self):
+        # compare with this test process's own niceness so the test also holds under a niced runner
+        base = int(subprocess.run(["nice"], capture_output=True, text=True).stdout)
+        p = self.job("run", "local", "T-norm", "--poll", "0.3", "--normal-priority", "--",
+                     "echo nice=$(nice); ionice -p $$")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("nice=%d" % base, p.stdout)
+        self.assertNotIn("idle", p.stdout)
+
+    def test_submit_accepts_normal_priority(self):
+        tid = self.submit("true", task="T-norm2", extra=("--normal-priority",))
+        st = json.loads(self.d.pueue("status", "--json").stdout)
+        cmd = st["tasks"][str(tid)]["command"]
+        self.assertNotIn("nice", cmd)
+        self.assertNotIn("ionice", cmd)
+
+    def test_request_json_carries_normal_priority(self):
+        import argparse
+        job = self.load_job()
+        seen = []
+        job.call = lambda host, op, req, **kw: seen.append(req) or {"id": 1, "token": req["token"]}
+        for flag in (True, False):
+            a = argparse.Namespace(host="local", task="T", group=None, cwd="/", env=None,
+                                   normal_priority=flag)
+            job.submit(a, "true")
+        self.assertEqual([r["normal_priority"] for r in seen], [True, False])
+
+    def test_host_refuses_non_boolean_normal_priority(self):
+        job = self.load_job()
+        with self.assertRaises(job.JobError):
+            job.host_submit({"command": "true", "task": "T", "normal_priority": "yes"})
+
+    def test_client_sends_protocol_4_only_for_a_priority_submit(self):
+        job = self.load_job()
+        self.assertEqual(job._request_protocol("submit", {"normal_priority": True}), 4)
+        self.assertEqual(job._request_protocol("submit", {"normal_priority": False}), 3)
+        self.assertEqual(job._request_protocol("submit", {}), 3)
+        for op in ("probe", "ls", "group", "kill"):
+            self.assertEqual(job._request_protocol(op, {"normal_priority": True}), 3)
+
+    def _host_call(self, job, op, req):
+        import io
+        old = sys.stdin, sys.stdout
+        sys.stdin, sys.stdout = io.StringIO(json.dumps(req)), io.StringIO()
+        try:
+            job.host_main(op)
+            return json.loads(sys.stdout.getvalue().strip().splitlines()[-1])
+        finally:
+            sys.stdin, sys.stdout = old
+
+    def test_old_host_refuses_a_priority_submit(self):
+        job = self.load_job()
+        job.ACCEPTED_PROTOCOLS = (3,)  # a host that predates the option
+        req = {"command": "true", "task": "T-oldhost", "cwd": "/tmp", "normal_priority": True}
+        reply = self._host_call(job, "submit", dict(req, protocol=job._request_protocol("submit", req)))
+        self.assertFalse(reply["ok"])
+        self.assertTrue(reply["error"].startswith("protocol mismatch"), reply)
+        # the requests an old client sends still pass the protocol check
+        reply = self._host_call(job, "ls", {"protocol": job._request_protocol("ls", {})})
+        self.assertNotIn("protocol mismatch", reply.get("error", ""))
+
+    def test_priority_submit_through_the_host_json_path(self):
+        p = subprocess.run([sys.executable, JOB, "_host", "submit"], capture_output=True, text=True,
+                           input=json.dumps({"protocol": 4, "command": "true", "task": "T-p4",
+                                             "cwd": "/tmp", "normal_priority": True}),
+                           env=self.d.env())
+        reply = json.loads(p.stdout.strip().splitlines()[-1])
+        self.assertTrue(reply["ok"], reply)
+        st = json.loads(self.d.pueue("status", "--json").stdout)
+        cmd = st["tasks"][str(reply["data"]["id"])]["command"]
+        self.assertTrue(cmd.startswith("bash "), cmd)
+
+    def test_request_without_normal_priority_runs_at_default_priority(self):
+        job = self.load_job()
+        self.assertEqual(job.PROTOCOL, 3)
+        self.assertIn(3, job.ACCEPTED_PROTOCOLS)
+        # a request from an older client has no normal_priority field and a matching protocol
+        p = subprocess.run([sys.executable, JOB, "_host", "submit"], capture_output=True, text=True,
+                           input=json.dumps({"protocol": 3, "command": "true", "task": "T-old",
+                                             "cwd": "/tmp"}),
+                           env=self.d.env())
+        reply = json.loads(p.stdout.strip().splitlines()[-1])
+        self.assertTrue(reply["ok"], reply)
+        st = json.loads(self.d.pueue("status", "--json").stdout)
+        cmd = st["tasks"][str(reply["data"]["id"])]["command"]
+        self.assertTrue(cmd.startswith("nice -n 19 ionice -c 3 bash "), cmd)
+        pr = self.job("run", "local", "T-old2", "--poll", "0.3", "--", "echo nice=$(nice); ionice -p $$")
+        self.assertIn("nice=19", pr.stdout)
+        self.assertIn("idle", pr.stdout)
 
     def test_killed_with_pueue_kill(self):
         tid = self.submit("sleep 300", task="T-pkill")

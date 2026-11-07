@@ -35,7 +35,7 @@ never matches processes by name or command line.
 - `job group <host> <name> <n>` creates a queue that runs `n` jobs at a time.
 - `job kill <host> <id>` stops a job.
 - Commands reach remote hosts as a file over ssh stdin, never inside the ssh
-  command line. They run under `nice -n 19 ionice -c 3` and `set -o pipefail`.
+  command line. They run under `nice -n 19 ionice -c 3` (unless `--normal-priority` is given) and `set -o pipefail`.
 - The tool is one standard-library Python file (3.8+), for Linux. It is
   installed on the agent's machine and on every host.
 

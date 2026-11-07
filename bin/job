@@ -27,8 +27,12 @@ import threading
 import time
 import uuid
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 PROTOCOL = 3
+# Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
+# option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
+PROTOCOL_PRIORITY = 4
+ACCEPTED_PROTOCOLS = (PROTOCOL, PROTOCOL_PRIORITY)
 
 
 def _load_hosts():
@@ -272,8 +276,24 @@ def _clean_old_files(state, in_use):
             pass
 
 
+def _request_protocol(op, req):
+    """Protocol number a client sends: 4 only for a submit that asks for normal priority."""
+    if op == "submit" and req.get("normal_priority"):
+        return PROTOCOL_PRIORITY
+    return PROTOCOL
+
+
+def _runner(script, normal_priority=False):
+    """The command pueue runs. Idle priority (nice 19, ionice idle) unless normal priority was asked for."""
+    if normal_priority:
+        return "bash %s" % shlex.quote(script)
+    return "nice -n 19 ionice -c 3 bash %s" % shlex.quote(script)
+
+
 def host_submit(req):
     command = req["command"]
+    if not isinstance(req.get("normal_priority", False), bool):
+        raise JobError("normal_priority must be true or false")
     token = req.get("token") or uuid.uuid4().hex
     if not all(c in "0123456789abcdef" for c in token):
         raise JobError("bad token")
@@ -318,7 +338,7 @@ def host_submit(req):
         f.write("echo $rc > %s\n" % shlex.quote(record))
         f.write("exit $rc\n")
     os.chmod(script, 0o700)
-    runner = "nice -n 19 ionice -c 3 bash %s" % shlex.quote(script)
+    runner = _runner(script, req.get("normal_priority", False))
 
     env = {k: v for k, v in os.environ.items()
            if k in ENV_ALLOW or k.startswith("LC_")}
@@ -467,10 +487,11 @@ def host_main(op):
             os.environ["JOB_PUEUE_CONFIG"] = req["pueue_config"]
             global STATE_DIR
             STATE_DIR = os.path.join(os.path.dirname(req["pueue_config"]), "state")
-        if req.get("protocol") != PROTOCOL:
+        if req.get("protocol") not in ACCEPTED_PROTOCOLS:
             raise JobError("protocol mismatch: client %s, host %s (job %s on %s); install the same "
-                           "version on both (install.sh)" % (req.get("protocol"), PROTOCOL, VERSION,
-                                                             socket.gethostname()))
+                           "version on both (install.sh)" % (req.get("protocol"),
+                                                             "/".join(str(p) for p in ACCEPTED_PROTOCOLS),
+                                                             VERSION, socket.gethostname()))
         reply = {"ok": True, "data": HOST_OPS[op](req)}
     except JobError as e:
         reply = {"ok": False, "error": str(e)}
@@ -492,7 +513,7 @@ def call(host, op, req, timeout=120):
     """Run a host op on `host` and return its data, raising JobError or Unreachable."""
     if host not in HOSTS:
         raise JobError("unknown host %r; known hosts: %s (add it to %s)" % (host, ", ".join(HOSTS), HOSTS_FILE))
-    req = dict(req, protocol=PROTOCOL)
+    req = dict(req, protocol=_request_protocol(op, req))
     dest = HOSTS[host]
     if dest is None:
         try:
@@ -608,7 +629,7 @@ def submit(args, command):
     token = uuid.uuid4().hex
     req = {"command": command, "task": args.task, "group": args.group, "cwd": args.cwd,
            "session": _session(), "from": socket.gethostname(), "token": token,
-           "env": _parse_env(args.env)}
+           "env": _parse_env(args.env), "normal_priority": bool(args.normal_priority)}
     if args.cwd is None and HOSTS.get(args.host) is None:
         req["cwd"] = os.getcwd()
     last = None
@@ -1044,6 +1065,8 @@ def build_parser():
         q.add_argument("--script", default=None, metavar="FILE", help="read the command from FILE instead of after --")
         q.add_argument("--env", action="append", metavar="NAME[=VALUE]",
                        help="pass this variable to the job (repeatable); only a small fixed set is passed otherwise")
+        q.add_argument("--normal-priority", action="store_true",
+                       help="run the job at normal CPU and disk priority instead of nice 19 / ionice idle")
         if name == "run":
             waitopts(q)
 
