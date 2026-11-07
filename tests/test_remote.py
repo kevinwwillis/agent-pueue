@@ -113,6 +113,19 @@ rm -rf -- "${D:?}"
         p = self.job("run", HOST, "T-r-fail", "--poll", "1", "--", "echo x; exit 9")
         self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
 
+    def test_normal_priority(self):
+        p = self.job("run", HOST, "T-r-norm", "--poll", "1", "--normal-priority", "--",
+                     "echo nice=$(nice); ionice -p $$")
+        # an updated host runs it without nice/ionice; a host not yet updated must refuse it
+        # (protocol mismatch, nothing queued), never run it at idle priority
+        if "protocol mismatch" in p.stdout + p.stderr:
+            self.assertNotEqual(p.returncode, 0)
+            self.assertNotIn("nice=19", p.stdout)
+            return
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("idle", p.stdout)
+        self.assertNotIn("nice=19", p.stdout)
+
     def test_long_command_goes_by_stdin(self):
         body = "".join("echo line%04d\n" % i for i in range(3000))  # ~40 KB
         f = os.path.join(os.environ.get("TMPDIR", "/tmp"), "job-remote-long-%d.sh" % os.getpid())

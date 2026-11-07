@@ -13,7 +13,7 @@ my_script.py` loop does when the loop's own command line contains the name.
 ## Setup
 
 **Linux only**, on every machine involved: stall detection reads `/proc`, and
-jobs run under `nice` and `ionice` (util-linux).
+jobs run under `nice` and `ionice` (util-linux) unless `--normal-priority` is given.
 
 On every machine that runs jobs:
 
@@ -38,13 +38,17 @@ gpu2     me@gpu2.example.org
 Then `./install.sh` copies `bin/job` to this machine and every listed host and
 checks that every copy has the repo file's sha256. The client and the hosts
 must run the same protocol version; a mismatch is refused with a message saying
-to reinstall. `normal_priority` is an optional field of the submit request
-(missing means the default priority), so it did not change the protocol version
-and running `job wait` processes keep working across an install. Known
-transition gap: a new client asking for `--normal-priority` against a host that
-has not been updated yet does not know the option and runs the job at the
-default idle priority, without any message; `./install.sh` updates all hosts
-together, so install before relying on the option. `job` also works when run on a host itself: there, `local` and the
+to reinstall.
+
+`--normal-priority` fails closed. A submit that sets it is sent with protocol
+version 4; every other request, `job wait` included, is still sent with
+version 3, and a host accepts both. A host that has not been updated accepts
+only 3, so it refuses the priority submit with the protocol-mismatch error and
+nothing is queued, instead of the job silently running at idle priority.
+Running `job wait` processes keep working across an install. `job ls` does not
+show a job's priority.
+
+`job` also works when run on a host itself: there, `local` and the
 machine's own host name (any case, short or full) both mean that machine. A
 host without its own hosts file knows only `local` and its own name.
 
@@ -74,8 +78,9 @@ job run <host> <task-id> [--cwd DIR] [--group G] [--env NAME[=VALUE]] [--script 
   first line says; to run a Python file, give `-- 'python3 -u file.py'`.
 - `--cwd DIR` is the working directory on the host. Default: the current
   directory for `local`, the home directory for a remote host. Give it for remote hosts.
-- `--normal-priority` (also on `job submit`) runs the job at normal CPU and
-  disk priority instead of the default `nice -n 19 ionice -c 3`. Use it only
+- `--normal-priority` (also on `job submit`) runs the job without `nice` and
+  `ionice`, so it has the CPU and disk priority pueued itself runs at (normally
+  the default) instead of `nice -n 19 ionice -c 3`. Use it only
   when a project's rule says its jobs must not run at idle priority. Without
   the option nothing changes.
 - The command runs in bash with `set -o pipefail`, so `python run.py 2>&1 | tee

@@ -27,8 +27,12 @@ import threading
 import time
 import uuid
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 PROTOCOL = 3
+# Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
+# option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
+PROTOCOL_PRIORITY = 4
+ACCEPTED_PROTOCOLS = (PROTOCOL, PROTOCOL_PRIORITY)
 
 
 def _load_hosts():
@@ -272,6 +276,13 @@ def _clean_old_files(state, in_use):
             pass
 
 
+def _request_protocol(op, req):
+    """Protocol number a client sends: 4 only for a submit that asks for normal priority."""
+    if op == "submit" and req.get("normal_priority"):
+        return PROTOCOL_PRIORITY
+    return PROTOCOL
+
+
 def _runner(script, normal_priority=False):
     """The command pueue runs. Idle priority (nice 19, ionice idle) unless normal priority was asked for."""
     if normal_priority:
@@ -476,10 +487,11 @@ def host_main(op):
             os.environ["JOB_PUEUE_CONFIG"] = req["pueue_config"]
             global STATE_DIR
             STATE_DIR = os.path.join(os.path.dirname(req["pueue_config"]), "state")
-        if req.get("protocol") != PROTOCOL:
+        if req.get("protocol") not in ACCEPTED_PROTOCOLS:
             raise JobError("protocol mismatch: client %s, host %s (job %s on %s); install the same "
-                           "version on both (install.sh)" % (req.get("protocol"), PROTOCOL, VERSION,
-                                                             socket.gethostname()))
+                           "version on both (install.sh)" % (req.get("protocol"),
+                                                             "/".join(str(p) for p in ACCEPTED_PROTOCOLS),
+                                                             VERSION, socket.gethostname()))
         reply = {"ok": True, "data": HOST_OPS[op](req)}
     except JobError as e:
         reply = {"ok": False, "error": str(e)}
@@ -501,7 +513,7 @@ def call(host, op, req, timeout=120):
     """Run a host op on `host` and return its data, raising JobError or Unreachable."""
     if host not in HOSTS:
         raise JobError("unknown host %r; known hosts: %s (add it to %s)" % (host, ", ".join(HOSTS), HOSTS_FILE))
-    req = dict(req, protocol=PROTOCOL)
+    req = dict(req, protocol=_request_protocol(op, req))
     dest = HOSTS[host]
     if dest is None:
         try:

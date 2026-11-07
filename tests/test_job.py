@@ -200,7 +200,10 @@ class JobTests(Base):
 
     def test_submit_accepts_normal_priority(self):
         tid = self.submit("true", task="T-norm2", extra=("--normal-priority",))
-        self.assertGreaterEqual(tid, 0)
+        st = json.loads(self.d.pueue("status", "--json").stdout)
+        cmd = st["tasks"][str(tid)]["command"]
+        self.assertNotIn("nice", cmd)
+        self.assertNotIn("ionice", cmd)
 
     def test_request_json_carries_normal_priority(self):
         import argparse
@@ -218,9 +221,50 @@ class JobTests(Base):
         with self.assertRaises(job.JobError):
             job.host_submit({"command": "true", "task": "T", "normal_priority": "yes"})
 
+    def test_client_sends_protocol_4_only_for_a_priority_submit(self):
+        job = self.load_job()
+        self.assertEqual(job._request_protocol("submit", {"normal_priority": True}), 4)
+        self.assertEqual(job._request_protocol("submit", {"normal_priority": False}), 3)
+        self.assertEqual(job._request_protocol("submit", {}), 3)
+        for op in ("probe", "ls", "group", "kill"):
+            self.assertEqual(job._request_protocol(op, {"normal_priority": True}), 3)
+
+    def _host_call(self, job, op, req):
+        import io
+        old = sys.stdin, sys.stdout
+        sys.stdin, sys.stdout = io.StringIO(json.dumps(req)), io.StringIO()
+        try:
+            job.host_main(op)
+            return json.loads(sys.stdout.getvalue().strip().splitlines()[-1])
+        finally:
+            sys.stdin, sys.stdout = old
+
+    def test_old_host_refuses_a_priority_submit(self):
+        job = self.load_job()
+        job.ACCEPTED_PROTOCOLS = (3,)  # a host that predates the option
+        req = {"command": "true", "task": "T-oldhost", "cwd": "/tmp", "normal_priority": True}
+        reply = self._host_call(job, "submit", dict(req, protocol=job._request_protocol("submit", req)))
+        self.assertFalse(reply["ok"])
+        self.assertTrue(reply["error"].startswith("protocol mismatch"), reply)
+        # the requests an old client sends still pass the protocol check
+        reply = self._host_call(job, "ls", {"protocol": job._request_protocol("ls", {})})
+        self.assertNotIn("protocol mismatch", reply.get("error", ""))
+
+    def test_priority_submit_through_the_host_json_path(self):
+        p = subprocess.run([sys.executable, JOB, "_host", "submit"], capture_output=True, text=True,
+                           input=json.dumps({"protocol": 4, "command": "true", "task": "T-p4",
+                                             "cwd": "/tmp", "normal_priority": True}),
+                           env=self.d.env())
+        reply = json.loads(p.stdout.strip().splitlines()[-1])
+        self.assertTrue(reply["ok"], reply)
+        st = json.loads(self.d.pueue("status", "--json").stdout)
+        cmd = st["tasks"][str(reply["data"]["id"])]["command"]
+        self.assertTrue(cmd.startswith("bash "), cmd)
+
     def test_request_without_normal_priority_runs_at_default_priority(self):
         job = self.load_job()
         self.assertEqual(job.PROTOCOL, 3)
+        self.assertIn(3, job.ACCEPTED_PROTOCOLS)
         # a request from an older client has no normal_priority field and a matching protocol
         p = subprocess.run([sys.executable, JOB, "_host", "submit"], capture_output=True, text=True,
                            input=json.dumps({"protocol": 3, "command": "true", "task": "T-old",
