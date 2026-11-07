@@ -28,7 +28,7 @@ import time
 import uuid
 
 VERSION = "0.4.1"
-PROTOCOL = 3
+PROTOCOL = 4
 
 
 def _load_hosts():
@@ -272,8 +272,17 @@ def _clean_old_files(state, in_use):
             pass
 
 
+def _runner(script, normal_priority=False):
+    """The command pueue runs. Idle priority (nice 19, ionice idle) unless normal priority was asked for."""
+    if normal_priority:
+        return "bash %s" % shlex.quote(script)
+    return "nice -n 19 ionice -c 3 bash %s" % shlex.quote(script)
+
+
 def host_submit(req):
     command = req["command"]
+    if not isinstance(req.get("normal_priority", False), bool):
+        raise JobError("normal_priority must be true or false")
     token = req.get("token") or uuid.uuid4().hex
     if not all(c in "0123456789abcdef" for c in token):
         raise JobError("bad token")
@@ -318,7 +327,7 @@ def host_submit(req):
         f.write("echo $rc > %s\n" % shlex.quote(record))
         f.write("exit $rc\n")
     os.chmod(script, 0o700)
-    runner = "nice -n 19 ionice -c 3 bash %s" % shlex.quote(script)
+    runner = _runner(script, req.get("normal_priority", False))
 
     env = {k: v for k, v in os.environ.items()
            if k in ENV_ALLOW or k.startswith("LC_")}
@@ -608,7 +617,7 @@ def submit(args, command):
     token = uuid.uuid4().hex
     req = {"command": command, "task": args.task, "group": args.group, "cwd": args.cwd,
            "session": _session(), "from": socket.gethostname(), "token": token,
-           "env": _parse_env(args.env)}
+           "env": _parse_env(args.env), "normal_priority": bool(args.normal_priority)}
     if args.cwd is None and HOSTS.get(args.host) is None:
         req["cwd"] = os.getcwd()
     last = None
@@ -1044,6 +1053,8 @@ def build_parser():
         q.add_argument("--script", default=None, metavar="FILE", help="read the command from FILE instead of after --")
         q.add_argument("--env", action="append", metavar="NAME[=VALUE]",
                        help="pass this variable to the job (repeatable); only a small fixed set is passed otherwise")
+        q.add_argument("--normal-priority", action="store_true",
+                       help="run the job at normal CPU and disk priority instead of nice 19 / ionice idle")
         if name == "run":
             waitopts(q)
 

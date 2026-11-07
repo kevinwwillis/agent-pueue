@@ -38,7 +38,8 @@ gpu2     me@gpu2.example.org
 Then `./install.sh` copies `bin/job` to this machine and every listed host and
 checks that every copy has the repo file's sha256. The client and the hosts
 must run the same protocol version; a mismatch is refused with a message saying
-to reinstall. `job` also works when run on a host itself: there, `local` and the
+to reinstall (so a client sending `--normal-priority` to a host with an older
+`job` is refused, never run at the wrong priority). `job` also works when run on a host itself: there, `local` and the
 machine's own host name (any case, short or full) both mean that machine. A
 host without its own hosts file knows only `local` and its own name.
 
@@ -55,7 +56,7 @@ Environment variables:
 
 ```bash
 job run <host> <task-id> [--cwd DIR] [--group G] [--env NAME[=VALUE]] [--script FILE]
-        [--stall MIN] [--stall-cpu PCT] [--check SCRIPT] [--poll SEC] [--tail N] -- <command>
+        [--normal-priority] [--stall MIN] [--stall-cpu PCT] [--check SCRIPT] [--poll SEC] [--tail N] -- <command>
 ```
 
 - `<host>` is `local` or a name from the hosts file.
@@ -68,6 +69,10 @@ job run <host> <task-id> [--cwd DIR] [--group G] [--env NAME[=VALUE]] [--script 
   first line says; to run a Python file, give `-- 'python3 -u file.py'`.
 - `--cwd DIR` is the working directory on the host. Default: the current
   directory for `local`, the home directory for a remote host. Give it for remote hosts.
+- `--normal-priority` (also on `job submit`) runs the job at normal CPU and
+  disk priority instead of the default `nice -n 19 ionice -c 3`. Use it only
+  when a project's rule says its jobs must not run at idle priority. Without
+  the option nothing changes.
 - The command runs in bash with `set -o pipefail`, so `python run.py 2>&1 | tee
   out.log` fails when `python` fails. There is no `set -e`: a multi-line
   command's exit code is its last command's. Chain steps with `&&`, or start
@@ -196,7 +201,7 @@ job run gpu1 TASK-12 --check "$SCRATCH/nan-check.sh" -- 'python train.py'
 
 | Command | What it does |
 |---|---|
-| `job submit <host> <task-id> [--group G] [--cwd DIR] -- <command>` | Queue only. Prints the pueue id on stdout and, on stderr, the exact `job wait ... --token T` to wait on it. |
+| `job submit <host> <task-id> [--group G] [--cwd DIR] [--normal-priority] -- <command>` | Queue only. Prints the pueue id on stdout and, on stderr, the exact `job wait ... --token T` to wait on it. |
 | `job wait <host> <id> [--token T] [--from-start] [--stall MIN] [--check SCRIPT] [--poll SEC] [--tail N]` | Wait on a job queued earlier, or one that already finished; same output and exit code as `job run`. With `--token`, a pueue id that now belongs to another job (pueue reuses ids after `pueue clean`) ends with `GONE` instead of waiting on the wrong job. |
 | `job wait <host> <id> <id> ...` | Wait on several jobs on one host at once. Ends when all have ended (first line `job: ALL ENDED ...`, exit 0 if all succeeded, else the exit code of the lowest-id job that did not), or as soon as one of them is `STALLED`, `ALERT`, `UNREACHABLE` or `GONE` (first line names it and lists the ids still running). |
 | `job ls [host ...] [--all] [--recent H]` | Every job on this machine and every host in the hosts file: host, id, task id, status, run time, group, session, command. Finished jobs older than `--recent` hours (default 24) are hidden unless `--all`. Exits 202 if a host could not be reached (the reachable ones are still listed). |
@@ -250,7 +255,7 @@ Activate conda or virtual environments inside the command itself.
   stdin. Nothing the agent typed goes into the ssh command line.
 - The script starts with `export PATH="$HOME/.local/bin:$PATH"`.
 - pueue runs it as `nice -n 19 ionice -c 3 bash <script>`, on every host,
-  `local` included.
+  `local` included; with `--normal-priority` it runs as `bash <script>`.
 - pueue keeps each job's command and environment in its state file, and `job ls`
   shows the first 60 characters of each command. Do not put secrets in command
   lines; pass them through a file the command reads.
