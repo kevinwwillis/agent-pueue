@@ -28,7 +28,7 @@ import time
 import uuid
 
 VERSION = "0.4.1"
-PROTOCOL = 4
+PROTOCOL = 3
 
 
 def _load_hosts():

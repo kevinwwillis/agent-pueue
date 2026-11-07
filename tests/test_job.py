@@ -218,14 +218,22 @@ class JobTests(Base):
         with self.assertRaises(job.JobError):
             job.host_submit({"command": "true", "task": "T", "normal_priority": "yes"})
 
-    def test_old_protocol_request_is_refused_by_host(self):
-        self.assertGreaterEqual(self.load_job().PROTOCOL, 4)
+    def test_request_without_normal_priority_runs_at_default_priority(self):
+        job = self.load_job()
+        self.assertEqual(job.PROTOCOL, 3)
+        # a request from an older client has no normal_priority field and a matching protocol
         p = subprocess.run([sys.executable, JOB, "_host", "submit"], capture_output=True, text=True,
-                           input=json.dumps({"protocol": 3, "command": "true", "task": "T",
-                                             "normal_priority": True}))
+                           input=json.dumps({"protocol": 3, "command": "true", "task": "T-old",
+                                             "cwd": "/tmp"}),
+                           env=self.d.env())
         reply = json.loads(p.stdout.strip().splitlines()[-1])
-        self.assertFalse(reply["ok"])
-        self.assertIn("protocol mismatch", reply["error"])
+        self.assertTrue(reply["ok"], reply)
+        st = json.loads(self.d.pueue("status", "--json").stdout)
+        cmd = st["tasks"][str(reply["data"]["id"])]["command"]
+        self.assertTrue(cmd.startswith("nice -n 19 ionice -c 3 bash "), cmd)
+        pr = self.job("run", "local", "T-old2", "--poll", "0.3", "--", "echo nice=$(nice); ionice -p $$")
+        self.assertIn("nice=19", pr.stdout)
+        self.assertIn("idle", pr.stdout)
 
     def test_killed_with_pueue_kill(self):
         tid = self.submit("sleep 300", task="T-pkill")

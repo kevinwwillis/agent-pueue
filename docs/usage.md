@@ -38,8 +38,13 @@ gpu2     me@gpu2.example.org
 Then `./install.sh` copies `bin/job` to this machine and every listed host and
 checks that every copy has the repo file's sha256. The client and the hosts
 must run the same protocol version; a mismatch is refused with a message saying
-to reinstall (so a client sending `--normal-priority` to a host with an older
-`job` is refused, never run at the wrong priority). `job` also works when run on a host itself: there, `local` and the
+to reinstall. `normal_priority` is an optional field of the submit request
+(missing means the default priority), so it did not change the protocol version
+and running `job wait` processes keep working across an install. Known
+transition gap: a new client asking for `--normal-priority` against a host that
+has not been updated yet does not know the option and runs the job at the
+default idle priority, without any message; `./install.sh` updates all hosts
+together, so install before relying on the option. `job` also works when run on a host itself: there, `local` and the
 machine's own host name (any case, short or full) both mean that machine. A
 host without its own hosts file knows only `local` and its own name.
 
