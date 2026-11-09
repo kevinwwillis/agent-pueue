@@ -321,13 +321,13 @@ the larger of their size and their current use. A job that ends frees its room a
   over admitted jobs of max(hard limit, current use)`, minus `Σ over RAM holds of max(size, own use)`. A job is
   counted at its hard limit (`ram_hard_factor` times its size, a pilot's counted room), not its size, and fits
   only if its limit fits, so jobs that grow up to their limits together still leave `ram_headroom` free. A RAM
-  hold's own use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or the sum of `Pss_Anon
-  + Pss_Shmem` of `--while-pid` and its descendants. Where a process's `smaps_rollup` can't be read (another
-  user's process, a kernel without `Pss_Anon`), it is a lower bound instead: the larger of that sum and the
-  biggest single process's `RssAnon + RssShmem`, since own use counted too high would give its room out twice. A
-  process or cgroup is the own use of one hold only, the oldest that names it, so two holds on the same or
-  nested processes (a service that registers again before its old hold ends) don't add it back twice. A RAM hold
-  that names no processes is counted at its size and its real use again as outside use. Nothing is released
+  hold's own use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or the sum of
+  `Pss_Anon + Pss_Shmem` of `--while-pid` and its descendants. Where a process's `smaps_rollup` can't be read
+  (another user's process, a kernel without `Pss_Anon`), it is a lower bound instead: the larger of that sum and
+  the biggest single process's `RssAnon + RssShmem`, since own use counted too high would give its room out
+  twice. A process or cgroup is the own use of one hold only, the oldest that names it, so two holds on the same
+  or nested processes (a service that registers again before its old hold ends) don't add it back twice. A RAM
+  hold that names no processes is counted at its size and its real use again as outside use. Nothing is released
   while memory pressure is over `memory_pressure_max_pct`.
 - **CPU, per host** (CPU can be shared by time, so older jobs count at their measured use): `outside` is the
   average over `cpu_window_s` of busy threads minus the admitted jobs' measured threads. A job fits when
