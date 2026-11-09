@@ -974,6 +974,19 @@ class LoopTests(Base):
         finally:
             self.job("kill", "local", str(tid))
 
+    def test_a_hold_without_room_exits_206_and_admission_unavailable_exits_205(self):
+        self.model_card()
+        p = self.hold("--gpu", "0", "--mem", "2G", "--name", "early")  # no snapshot yet: the loop has not run
+        self.assertEqual(p.returncode, 205, p.stdout + p.stderr)
+        self.assertIn("WRAPPER_ERROR", p.stdout)
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        for args in (["--gpu", "0", "--mem", "30G"], ["--ram", "60G"]):
+            p = self.hold("--name", "too-big", *args)
+            self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+            self.assertIn("NO_ROOM", p.stdout)
+
     def test_hold_options_need_gpu_with_mem_or_ram(self):
         self.model_card()
         loop = self.loop()

@@ -385,8 +385,9 @@ hold ends when that process exits), `--unit NAME` or `--cgroup PATH` (a service 
 unit or cgroup, seen before, is gone. Under the queue lock, a hold is granted only if the card has the room:
 the loop writes its snapshot under the same lock after each cycle's releases, and the grant takes from that
 room the holds granted since. In each cycle the loop reads the holds again under the lock before it releases,
-and takes out of its room any hold granted since it measured. A refused hold is refused at once, and the
-service decides what to do. A caller that wants room kept for a later step registers a hold the same way.
+and takes out of its room any hold granted since it measured. A hold the host has no room for is refused at
+once with its own exit status (206, `NO_ROOM`), apart from admission being unavailable, and the service decides
+what to do. A caller that wants room kept for a later step registers a hold the same way.
 Holds and jobs are first come: neither displaces the other. `gpu_headroom` keeps the parties on one card
 apart, so a GPU hold on a card that has no admitted job and no other hold may use it (a model that fills the
 card); jobs admitted after it still keep it. RAM holds always keep `ram_headroom` free.

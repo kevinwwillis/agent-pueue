@@ -93,6 +93,7 @@ EXIT = {
     "DEPENDENCY_FAILED": 203,
     "GONE": 204,
     "WRAPPER_ERROR": 205,
+    "NO_ROOM": 206,
 }
 # Outcomes that end a multi-job wait at once (the agent must look now).
 URGENT = ("STALLED", "ALERT", "UNREACHABLE", "GONE", "WRAPPER_ERROR")
@@ -120,6 +121,10 @@ class JobError(Exception):
 
 class ProtocolError(JobError):
     """Client and host run different versions of job; retrying cannot help."""
+
+
+class NoRoom(JobError):
+    """A hold refused because the host has no room for it now (not because admission is unavailable)."""
 
 
 # --------------------------------------------------------------------------
@@ -2510,7 +2515,7 @@ def host_hold(req):
         if ram:
             free_ram = snap["room"]["ram"]["room"] - sum(h.get("ram") or 0 for h in newer)
             if ram > free_ram:
-                raise JobError("%s has %s of RAM free to hold; the hold needs %s" % (
+                raise NoRoom("%s has %s of RAM free to hold; the hold needs %s" % (
                     socket.gethostname(), _gbs(max(0, free_ram)), _gbs(ram)))
         gid = index = None
         if want_gpu:
@@ -2526,7 +2531,7 @@ def host_hold(req):
                 # the headroom keeps parties on one card apart; a hold alone on its card may use it
                 free += settings["gpu_headroom_mb"] * MB
             if size > free:
-                raise JobError("GPU %d on %s has %s free; the hold needs %s" % (index, socket.gethostname(),
+                raise NoRoom("GPU %d on %s has %s free; the hold needs %s" % (index, socket.gethostname(),
                                                                                _gbs(max(0, free)), _gbs(size)))
         h = {"id": uuid.uuid4().hex[:12], "name": name, "uuid": gid, "index": index, "size": size or 0,
              "ram": ram or 0, "start": time.time(), "unit": req.get("unit"), "cgroup": req.get("cgroup"),
@@ -2739,6 +2744,8 @@ def host_main(op):
                                                              "/".join(str(p) for p in ACCEPTED_PROTOCOLS),
                                                              VERSION, socket.gethostname()))
         reply = {"ok": True, "data": HOST_OPS[op](req)}
+    except NoRoom as e:
+        reply = {"ok": False, "error": str(e), "kind": "no_room"}
     except JobError as e:
         reply = {"ok": False, "error": str(e)}
     except Exception as e:  # report, never hang the client
@@ -2800,6 +2807,8 @@ def call(host, op, req, timeout=120):
         err = reply.get("error") or ""
         if err.startswith("protocol mismatch"):
             raise ProtocolError("%s: %s" % (host, err))
+        if reply.get("kind") == "no_room":
+            raise NoRoom("%s: %s" % (host, err))
         raise JobError("%s: %s" % (host, err))
     return reply["data"]
 
@@ -3818,6 +3827,9 @@ def main(argv=None):
                 "hold": cmd_hold, "release": cmd_release}
     try:
         return handlers[args.cmd](args)
+    except NoRoom as e:  # a hold the host has no room for: the service refuses its load (other errors: its own guard)
+        sys.stdout.write("job: NO_ROOM %s\njob: exit %d\n" % (e, EXIT["NO_ROOM"]))
+        return EXIT["NO_ROOM"]
     except JobError as e:
         sys.stdout.write("job: WRAPPER_ERROR %s\n%sjob: exit %d\n" % (
             e, ("note: %s\n" % QUEUED_HINT) if QUEUED_HINT else "", EXIT["WRAPPER_ERROR"]))
