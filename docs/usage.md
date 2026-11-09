@@ -273,6 +273,13 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   busy), `--stop-at TIME` (stopped then; dropped if still held), `--in-containers`, `--restartable`.
 - A submit without a size, or from an older `job` (protocol 3 or 4), is refused with a message that starts
   `protocol mismatch` or names the size options.
+- A service that uses a GPU outside `job` (a model server) registers its GPU memory before it loads:
+  `job hold HOST --gpu 0 --mem 18G --name NAME` plus `--while-pid PID`, `--unit NAME` or `--cgroup PATH` for
+  its processes, and optionally `--ttl MIN` (renew with `job hold HOST --renew ID`). It prints the hold id;
+  `job release HOST ID` ends it. A hold is granted only if the card has the room now, else refused at once.
+  Holds and jobs are first come.
+- `job admission HOST start|stop|status` installs and starts, stops, or shows the host's admission loop
+  service (`agent-pueue-admit.service`, a systemd user unit).
 
 ## The job's environment
 

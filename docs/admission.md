@@ -2,7 +2,9 @@
 
 Status: spec for TASK-003 (written 2026-11-09 12:05 ET; revised 12:20 and 12:50 ET after two full reviews;
 "Per-job scope" revised 13:10 ET after a code review). Built so far: the per-job scope (job 0.6.0, protocol 5,
-used only by a submit that carries a scope). The loop, the client commands and holds are not built yet.
+used only by a submit that carries a scope), then the loop, held submits, records, the client commands
+(`--cpus/--ram/...`, `job run auto`, `job room`), holds and the loop's service command (all in job 0.6.0, not yet
+released). Not built yet: progress files and projected ends, the RAM-trend alert, cloud hosts.
 
 ## Why
 
@@ -120,7 +122,10 @@ standard-library Python 3.8. An example for a 32-thread host with 256 GB RAM (il
 ## The admission loop
 
 `job _admit` runs on each admission host, one instance (an exclusive lock on `state_dir/loop.lock`). It runs as
-a systemd user service with `Restart=always`. On a host without a systemd user manager (some containers), it can
+a systemd user service with `Restart=always`: `job admission <host> start` writes
+`~/.config/systemd/user/agent-pueue-admit.service`, enables and starts it; `stop` disables and stops it;
+`status` shows the service state, whether the settings are valid, and the heartbeat's age. The user manager
+must outlive logins (`loginctl enable-linger`), as pueued's does. On a host without a systemd user manager (some containers), it can
 run as a pueue task in its own group `admission`, parallel 1; there it dies with pueued and nothing restarts it,
 which the heartbeat makes visible.
 

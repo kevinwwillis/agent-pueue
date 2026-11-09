@@ -568,6 +568,100 @@ class LoopTests(Base):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("held on local", p.stderr)
 
+    # -- holds ---------------------------------------------------------------------------------------------
+
+    def hold(self, *args):
+        return self.job("hold", "local", *args, **self.env())
+
+    def model_card(self, model_used=0):
+        """One 24 GB card; a model server process (pid 4242, cgroup /system.slice/model.service) uses model_used."""
+        os.makedirs(os.path.join(self.host.proc, "4242"), exist_ok=True)
+        with open(os.path.join(self.host.proc, "4242", "cgroup"), "w") as f:
+            f.write("0::/system.slice/model.service\n")
+        used = int(0.4 * GB) + model_used
+        self.host.set(cards=[{"index": 0, "uuid": CARD, "name": "RTX 3090", "total": 24 * GB, "free": 24 * GB - used}],
+                      procs=[{"uuid": CARD, "pid": 4242, "used": model_used}] if model_used else [])
+
+    def test_a_hold_is_granted_only_with_room_and_keeps_jobs_out_until_released(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "30G", "--name", "too-big")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("GPU 0 on", p.stdout + p.stderr)
+        p = self.hold("--gpu", "0", "--mem", "10G", "--name", "model-server", "--cgroup", "/system.slice/model.service")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        hid = p.stdout.strip()
+        r = self.submit_sized("echo gpu-job", cpus=1, ram=100 * MiB, gpus=1, gpu_mem=15 * GB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertEqual(self.status(tid), "Stashed")  # 24 - 0.5 headroom - 0.4 driver - 10 held = 13.1 GB
+        room = self.job("room", "local", **self.env())
+        self.assertIn("hold %s (model-server): 10.0 GB on GPU 0" % hid, room.stdout)
+        self.assertEqual(self.job("release", "local", hid, **self.env()).returncode, 0)
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
+        self.assertIn("gpu-job", self.wait(tid, tok).stdout)
+
+    def test_a_holds_own_use_is_not_counted_twice(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--gpu", CARD, "--mem", "8G", "--name", "model", "--cgroup", "/system.slice/model.service")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.model_card(model_used=6 * GB)  # the model loads into its hold
+        loop.samples = []
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        g = loop.room["gpus"][CARD]
+        self.assertAlmostEqual(g["outside"], 0.4 * GB, delta=1e6)  # only the driver's reserve
+        self.assertAlmostEqual(g["room"], 24 * GB - 0.5 * GB - 0.4 * GB - 8 * GB, delta=1e6)
+
+    def test_a_hold_ends_when_its_time_to_live_runs_out(self):
+        self.model_card()
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "4G", "--name", "short", "--ttl", "5")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(len(loop.holds), 1)
+        now[0] += 301
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(loop.holds, [])
+
+    def test_a_hold_ends_when_its_process_exits(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        d = os.path.join(self.host.proc, "5151")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "stat"), "w") as f:
+            f.write("5151 (model server) S 1 5151 5151 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 777 0 0\n")
+        p = self.hold("--gpu", "0", "--mem", "4G", "--name", "served", "--while-pid", "5151")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(len(loop.holds), 1)
+        with open(os.path.join(d, "stat"), "w") as f:  # the pid reused by another process: a new start time
+            f.write("5151 (other) S 1 5151 5151 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 999 0 0\n")
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(loop.holds, [])
+
+    def test_admission_status(self):
+        p = self.job("admission", "local", "status", **self.env())
+        self.assertIn("settings valid", p.stdout)
+        self.assertIn("admission loop service", p.stdout)
+
     def test_invalid_settings_refuse_every_submit(self):
         with open(self.cfg, "w") as f:
             f.write('{"ram_headroom": 1}')

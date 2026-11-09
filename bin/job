@@ -1422,6 +1422,7 @@ class Admission:
         con.execute("CREATE TABLE IF NOT EXISTS jobs (%s, PRIMARY KEY (token))" % ", ".join(RECORD_FIELDS))
         con.execute("CREATE TABLE IF NOT EXISTS samples (t REAL, kind TEXT, key TEXT, value REAL)")
         con.execute("CREATE INDEX IF NOT EXISTS samples_t ON samples (t)")
+        con.execute("CREATE TABLE IF NOT EXISTS holds (id PRIMARY KEY, name, card, size, start, ended, how)")
         return con
 
     def record(self, con, row):
@@ -1649,10 +1650,11 @@ class Loop:
         self.capacity = _capacity(self.m)
         self.room = self.room_empty = None
         self.peaks = {}
+        self.holds = []
 
     # -- one cycle -----------------------------------------------------------------------------------------------
 
-    def sample(self, now, scopes):
+    def sample(self, now, scopes, holds=()):
         busy, iowait = self.m.cpu(now)
         mem = self.m.meminfo()
         try:
@@ -1663,6 +1665,9 @@ class Loop:
         by_cg = {}
         for tok, path in scopes.items():
             by_cg[path[len(self.m.cg):]] = tok
+        hold_pids = {h["id"]: _pid_tree(self.m.proc, h["while_pid"]) for h in holds if h.get("while_pid")}
+        hold_cgs = {h["id"]: _hold_cgroups(h) for h in holds if h.get("unit") or h.get("cgroup")}
+        held_use = {}
         for c in cards:
             for pid, used in c["procs"].items():
                 cg = self.m.cgroup_of(pid) or ""
@@ -1670,11 +1675,19 @@ class Loop:
                     if (cg == prefix or cg.startswith(prefix + "/")) and tok in jobs:
                         g = jobs[tok].setdefault("gpu", {})
                         g[c["uuid"]] = g.get(c["uuid"], 0) + used
+                        break
+                else:
+                    for hid in [h["id"] for h in holds]:
+                        if pid in hold_pids.get(hid, ()) or any(cg == x or cg.startswith(x + "/")
+                                                                for x in hold_cgs.get(hid, ())):
+                            u = held_use.setdefault(hid, {})
+                            u[c["uuid"]] = u.get(c["uuid"], 0) + used
+                            break
         s = {"t": now, "busy": busy, "iowait": iowait or 0.0, "avail": mem.get("MemAvailable", 0),
              "psi": self.m.memory_pressure(), "disks": self.m.disks(now, set(self.disk_names.values())),
              "gpus": {c["uuid"]: {k: c[k] for k in ("index", "name", "total", "used", "util")} for c in cards},
              "jobs": {tok: {"ram": j["ram"], "cpu": j["cpu"], "gpu": j.get("gpu", {})} for tok, j in jobs.items()},
-             "holds": {}}
+             "holds": held_use}
         self.samples.append(s)
         self.samples = [x for x in self.samples if now - x["t"] <= self.keep_s]
         return s, jobs
@@ -1683,7 +1696,15 @@ class Loop:
         """Measure, account, end, release; returns the seconds to sleep before the next cycle."""
         now = self.clock()
         scopes = self.m.scopes()
-        s, use = self.sample(now, scopes)
+        holds = []
+        for h in _holds(self.adm):
+            alive, why = _hold_alive(h, self.m.proc, now)
+            if alive:
+                holds.append(h)
+            else:
+                _end_hold(self.adm, h, why)
+        self.holds = holds
+        s, use = self.sample(now, scopes, holds)
         try:
             st = _pueue_status()
         except JobError:
@@ -1699,8 +1720,9 @@ class Loop:
                         tasks[tok] = t
                 self.account(con, now, queue, tasks, use, st)
                 inflight = [q for q in queue if q.get("state") == "released"]
-                self.room = compute_room(self.s, self.samples, [self._counted(q) for q in inflight], [], now)
-                self.room_empty = compute_room(self.s, self.samples, [], [], now)  # as if no admitted job ran
+                hl = [{"id": h["id"], "gid": h["uuid"], "size": h["size"]} for h in holds]
+                self.room = compute_room(self.s, self.samples, [self._counted(q) for q in inflight], hl, now)
+                self.room_empty = compute_room(self.s, self.samples, [], hl, now)  # as if no admitted job ran
                 self.release(con, now, queue, tasks, st)
                 self.clean_scopes(scopes, queue, tasks, use)
             con.execute("DELETE FROM samples WHERE t < ?", (now - 7 * 86400,))
@@ -1921,9 +1943,10 @@ class Loop:
                  "size": q["size"], "pilot": q.get("pilot")} for q in queue if q.get("state") == "held"]
         jobs = [{"token": q["token"], "task": q["task"], "size": q["size"], "gpus": q.get("gpus"),
                  "released": q.get("released")} for q in queue if q.get("state") == "released"]
+        holds = [{k: h.get(k) for k in ("id", "name", "index", "uuid", "size", "start", "expires")} for h in self.holds]
         self.adm.write_json(self.adm.path("room.json"), {"t": now, "host": socket.gethostname(), "room": self.room,
                                                          "capacity": self.capacity, "held": held, "jobs": jobs,
-                                                         "pueue_ok": pueue_ok})
+                                                         "holds": holds, "pueue_ok": pueue_ok})
         self.adm.write_json(self.adm.path("heartbeat"), {"t": now, "pid": os.getpid(), "version": VERSION})
 
 
@@ -1964,6 +1987,151 @@ def admit_main(once=False):
             pass
 
 
+def _hold_alive(h, proc="/proc", now=None):
+    """Whether a hold still holds: its process lives (--while-pid) and its time-to-live has not run out."""
+    now = time.time() if now is None else now
+    if h.get("expires") and now >= h["expires"]:
+        return False, "its time to live ran out"
+    pid = h.get("while_pid")
+    if pid:
+        try:
+            with open(os.path.join(proc, str(pid), "stat")) as f:
+                start = f.read().rsplit(")", 1)[1].split()[19]  # field 22, start time: a reused pid differs
+        except (OSError, IndexError):
+            return False, "process %d exited" % pid
+        if h.get("pid_start") and start != h["pid_start"]:
+            return False, "process %d exited" % pid
+    return True, None
+
+
+def _hold_cgroups(h):
+    """The cgroup paths whose processes are the hold's own use."""
+    if h.get("cgroup"):
+        return [h["cgroup"].rstrip("/")]
+    if h.get("unit"):
+        out = []
+        for flag in ("--user", "--system"):
+            env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
+            try:
+                p = subprocess.run(["systemctl", flag, "show", "-p", "ControlGroup", "--value", h["unit"]], env=env,
+                                   capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            cg = p.stdout.strip()
+            if p.returncode == 0 and cg.startswith("/"):
+                out.append(cg.rstrip("/"))
+        return out
+    return []
+
+
+def _pid_tree(proc, root):
+    """root and all its descendants, from /proc."""
+    children = {}
+    for name in os.listdir(proc):
+        if name.isdigit():
+            try:
+                with open(os.path.join(proc, name, "stat")) as f:
+                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, IndexError, ValueError):
+                continue
+            children.setdefault(ppid, []).append(int(name))
+    out, todo = set(), [root]
+    while todo:
+        p = todo.pop()
+        if p not in out:
+            out.add(p)
+            todo += children.get(p, [])
+    return out
+
+
+def host_hold(req):
+    """Register, renew or release a GPU hold on an admission host (docs/admission.md, "Holds")."""
+    settings = _admission_settings()
+    if settings is None:
+        raise JobError("%s is not an admission host" % socket.gethostname())
+    adm = Admission(settings)
+    os.makedirs(adm.path("holds"), mode=0o700, exist_ok=True)
+    fd = adm.lock("queue.lock")
+    try:
+        if req.get("release") or req.get("renew"):
+            hid = str(req.get("release") or req.get("renew"))
+            if not hid.isalnum():
+                raise JobError("bad hold id")
+            h = adm.read_json(adm.path("holds", hid + ".json"))
+            if h is None:
+                raise JobError("no hold %s on %s" % (hid, socket.gethostname()))
+            if req.get("release"):
+                _end_hold(adm, h, "released")
+                return {"id": hid, "action": "released"}
+            if not h.get("ttl_min"):
+                raise JobError("hold %s has no time to live to renew" % hid)
+            h["expires"] = time.time() + 60 * h["ttl_min"]
+            adm.write_json(adm.path("holds", hid + ".json"), h)
+            return {"id": hid, "action": "renewed", "expires": h["expires"]}
+        name, size = req.get("name"), req.get("mem")
+        if not isinstance(name, str) or not name or not isinstance(size, int) or size <= 0:
+            raise JobError("a hold needs --name and --mem")
+        snap = adm.read_json(adm.path("room.json"))
+        age = _heartbeat_age(adm)
+        if not snap or not snap.get("room") or age is None or age > _heartbeat_limit(settings):
+            raise JobError("the admission loop on %s is not running, so no hold can be granted" % socket.gethostname())
+        gpus = snap["room"]["gpus"]
+        want = str(req.get("gpu"))
+        gid = next((u for u, g in gpus.items() if u == want or str(g["index"]) == want), None)
+        if gid is None:
+            raise JobError("no GPU %s on %s" % (want, socket.gethostname()))
+        newer = sum(h["size"] for h in _holds(adm) if h["uuid"] == gid and h["start"] > snap["t"])
+        free = gpus[gid]["room"] - newer
+        if size > free:
+            raise JobError("GPU %d on %s has %s free; the hold needs %s" % (gpus[gid]["index"], socket.gethostname(),
+                                                                           _gbs(max(0, free)), _gbs(size)))
+        h = {"id": uuid.uuid4().hex[:12], "name": name, "uuid": gid, "index": gpus[gid]["index"], "size": size,
+             "start": time.time(), "unit": req.get("unit"), "cgroup": req.get("cgroup"), "ttl_min": req.get("ttl")}
+        if req.get("while_pid"):
+            pid = int(req["while_pid"])
+            try:
+                with open(os.path.join(_measure_from_env().proc, str(pid), "stat")) as f:
+                    h["pid_start"] = f.read().rsplit(")", 1)[1].split()[19]
+            except (OSError, IndexError):
+                raise JobError("no process %d on %s" % (pid, socket.gethostname()))
+            h["while_pid"] = pid
+        if h["ttl_min"]:
+            h["expires"] = h["start"] + 60 * float(h["ttl_min"])
+        adm.write_json(adm.path("holds", h["id"] + ".json"), h)
+        con = adm.db()
+        try:
+            con.execute("INSERT INTO holds (id, name, card, size, start) VALUES (?, ?, ?, ?, ?)",
+                        (h["id"], name, gid, size, h["start"]))
+            con.commit()
+        finally:
+            con.close()
+        return {"id": h["id"], "action": "granted", "gpu": h["index"], "uuid": gid}
+    finally:
+        os.close(fd)
+
+
+def _holds(adm):
+    d = adm.path("holds")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    return [h for h in (adm.read_json(os.path.join(d, n)) for n in names if n.endswith(".json")) if h]
+
+
+def _end_hold(adm, h, how):
+    try:
+        os.remove(adm.path("holds", h["id"] + ".json"))
+    except FileNotFoundError:
+        pass
+    con = adm.db()
+    try:
+        con.execute("UPDATE holds SET ended = ?, how = ? WHERE id = ?", (time.time(), how, h["id"]))
+        con.commit()
+    finally:
+        con.close()
+
+
 def host_room(req):
     """The admission loop's last snapshot and its age; {"admission": false} on other hosts."""
     settings = _admission_settings()
@@ -1978,8 +2146,64 @@ def host_room(req):
     return snap
 
 
+ADMIT_UNIT = "agent-pueue-admit.service"
+ADMIT_UNIT_TEXT = """[Unit]
+Description=agent-pueue admission loop (job _admit): starts held jobs when they fit
+After=pueued.service
+
+[Service]
+ExecStart=%h/.local/bin/job _admit
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def host_admission(req):
+    """Start, stop or report this host's admission loop service (a systemd user service)."""
+    action = req.get("action")
+    env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
+
+    def ctl(*args):
+        p = subprocess.run(["systemctl", "--user"] + list(args), env=env, capture_output=True, text=True, timeout=60)
+        return p.returncode, (p.stdout + p.stderr).strip()
+
+    if action == "start":
+        if _admission_settings() is None:  # raises with the reason when the file is unusable
+            raise JobError("no admission settings at %s; write them first" % ADMISSION_CONFIG)
+        unit_dir = os.path.expanduser("~/.config/systemd/user")
+        os.makedirs(unit_dir, exist_ok=True)
+        with open(os.path.join(unit_dir, ADMIT_UNIT + ".tmp"), "w") as f:
+            f.write(ADMIT_UNIT_TEXT)
+        os.replace(os.path.join(unit_dir, ADMIT_UNIT + ".tmp"), os.path.join(unit_dir, ADMIT_UNIT))
+        for args in (("daemon-reload",), ("enable", "--now", ADMIT_UNIT)):
+            rc, out = ctl(*args)
+            if rc != 0:
+                raise JobError("systemctl --user %s failed: %s" % (" ".join(args), out))
+    elif action == "stop":
+        rc, out = ctl("disable", "--now", ADMIT_UNIT)
+        if rc != 0 and "not loaded" not in out and "does not exist" not in out:
+            raise JobError("systemctl --user disable --now %s failed: %s" % (ADMIT_UNIT, out))
+    elif action != "status":
+        raise JobError("admission action must be start, stop or status")
+    _, active = ctl("is-active", ADMIT_UNIT)
+    out = {"service": active, "hostname": socket.gethostname()}
+    try:
+        settings = _admission_settings()
+        out["settings"] = "none" if settings is None else "valid"
+    except JobError as e:
+        settings, out["settings"] = None, "invalid: %s" % e
+    if settings is not None:
+        out["heartbeat_age"] = _heartbeat_age(Admission(settings))
+    return out
+
+
 HOST_OPS = {"submit": host_submit, "probe": host_probe, "ls": host_ls,
-            "group": host_group, "kill": host_kill, "room": host_room}
+            "group": host_group, "kill": host_kill, "room": host_room, "admission": host_admission,
+            "hold": host_hold}
 
 
 def host_main(op):
@@ -2278,6 +2502,34 @@ def _probe_size(adm):
             "gpu_share": float(adm.get("gpu_share") or 0), "disk_mb_s": 0}
 
 
+def cmd_hold(args):
+    if args.renew:
+        r = call(args.host, "hold", {"renew": args.renew})
+    else:
+        if args.gpu is None or args.mem is None or not args.name:
+            raise JobError("job hold needs --gpu, --mem and --name (or --renew ID)")
+        r = call(args.host, "hold", {"gpu": args.gpu, "mem": args.mem, "name": args.name, "while_pid": args.while_pid,
+                                     "unit": args.unit, "cgroup": args.cgroup, "ttl": args.ttl})
+    print(r["id"])
+    sys.stderr.write("job: hold %s %s on %s%s\n" % (r["id"], r["action"], args.host,
+                                                   " GPU %s" % r["gpu"] if "gpu" in r else ""))
+    return 0
+
+
+def cmd_release(args):
+    r = call(args.host, "hold", {"release": args.hold_id})
+    sys.stderr.write("job: hold %s %s on %s\n" % (r["id"], r["action"], args.host))
+    return 0
+
+
+def cmd_admission(args):
+    r = call(args.host, "admission", {"action": args.action})
+    age = r.get("heartbeat_age")
+    print("%s: admission loop service %s; settings %s; heartbeat %s" % (
+        args.host, r.get("service"), r.get("settings"), "none" if age is None else "%s old" % _fmt_dur(age)))
+    return 0 if (args.action == "stop") == (r.get("service") != "active") else EXIT["WRAPPER_ERROR"]
+
+
 def cmd_room(args):
     hosts = args.hosts or _placement_hosts()
     rooms = _rooms(hosts)
@@ -2313,6 +2565,8 @@ def cmd_room(args):
                                                           _gbs(j["size"]["ram"]),
                                                           ", GPU %s" % ",".join(x[:12] for x in j["gpus"])
                                                           if j.get("gpus") else ""))
+        for h2 in r.get("holds") or []:
+            print("  hold %s (%s): %s on GPU %s" % (h2["id"], h2["name"], _gbs(h2["size"]), h2["index"]))
         for j in r.get("held") or []:
             print("  held %s (%s) for %s: %s" % (j["token"][:8], j["task"], _fmt_dur(j["waited_s"]),
                                                  j.get("reason") or "not checked yet"))
@@ -2840,6 +3094,25 @@ def build_parser():
     q.add_argument("--all", action="store_true", help="include finished jobs older than --recent")
     q.add_argument("--recent", type=float, default=24.0, metavar="H", help="hide finished jobs older than H hours (default 24)")
 
+    q = sub.add_parser("hold", help="hold GPU memory for a service that runs outside job (first come)")
+    q.add_argument("host", help="an admission host")
+    q.add_argument("--gpu", default=None, metavar="INDEX|UUID", help="the card")
+    q.add_argument("--mem", type=_parse_size, default=None, metavar="SIZE", help="GPU memory to hold")
+    q.add_argument("--name", default=None, help="who holds it")
+    q.add_argument("--while-pid", type=int, default=None, metavar="PID", help="the hold ends when PID exits")
+    q.add_argument("--unit", default=None, help="the service whose processes are the hold's own use")
+    q.add_argument("--cgroup", default=None, metavar="PATH", help="the cgroup whose processes are its own use")
+    q.add_argument("--ttl", type=float, default=None, metavar="MIN", help="it ends unless renewed within MIN minutes")
+    q.add_argument("--renew", default=None, metavar="ID", help="renew hold ID's time to live")
+
+    q = sub.add_parser("release", help="end a GPU hold")
+    q.add_argument("host", help="an admission host")
+    q.add_argument("hold_id", metavar="ID")
+
+    q = sub.add_parser("admission", help="start, stop or check a host's admission loop")
+    q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
+    q.add_argument("action", choices=("start", "stop", "status"))
+
     q = sub.add_parser("room", help="free room on admission hosts")
     q.add_argument("hosts", nargs="*", help="hosts to show (default: all)")
     q.add_argument("--json", action="store_true", help="print the hosts' snapshots as JSON")
@@ -2889,7 +3162,8 @@ def main(argv=None):
                          % (args.host, ", ".join(HOSTS), HOSTS_FILE, EXIT["WRAPPER_ERROR"]))
         return EXIT["WRAPPER_ERROR"]
     handlers = {"run": cmd_run, "submit": lambda a: cmd_run(a, queue_only=True), "wait": cmd_wait,
-                "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill, "room": cmd_room}
+                "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill, "room": cmd_room, "admission": cmd_admission,
+                "hold": cmd_hold, "release": cmd_release}
     try:
         return handlers[args.cmd](args)
     except JobError as e:
