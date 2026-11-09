@@ -32,7 +32,7 @@ import time
 import traceback
 import uuid
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 PROTOCOL = 3
 # Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
 # option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
@@ -1422,7 +1422,7 @@ IN_FLIGHT = ("Queued", "Running", "Paused", "Locked")
 RECORD_FIELDS = ("token", "task", "session", "host", "pueue_id", "grp", "submitted", "released", "started", "ended",
                  "exit", "how", "size", "size_source", "like_from", "pilot", "constraints", "gpus", "peak_cpu",
                  "peak_ram", "memory_peak", "peak_gpu_mem", "peaks_final", "peak_samples",
-                 "peak_disk_mb_s", "progress", "projected_end")
+                 "peak_disk_mb_s", "progress", "projected_end", "ram_counted", "gpu_counted", "memory_max")
 PROGRESS_KEEP = 200     # progress points kept per job
 PROGRESS_FIT = 20       # the projected end comes from the rate over the last this many points
 LIKE_MIN_SAMPLES = 3  # a --like source must have been measured at least this many times while it ran
@@ -1988,6 +1988,8 @@ class Loop:
                 q.update({"state": "released", "released": now, "gpus": [], "ram_counted": q["size"]["ram"],
                           "gpu_counted": {}, "reason": None})
                 self.adm.save(q)
+                self.adm.record(con, {"token": q["token"], "released": now, "ram_counted": q["ram_counted"],
+                                      "gpu_counted": {}})
             if q.get("state") == "held":
                 if t is None:  # removed before release, or still being added: give a submit time to finish
                     if now - q["submitted"] > 120:
@@ -2251,7 +2253,9 @@ class Loop:
             # pueue may have acted before it failed, so the job stays counted with its assignment; the next
             # cycle holds it again if its task is still Stashed
             sys.stderr.write("job _admit: pueue enqueue %s failed: %s\n" % (t["id"], e))
-        self.adm.record(con, {"token": q["token"], "released": now, "gpus": got["gpus"], "pueue_id": int(t["id"])})
+        self.adm.record(con, {"token": q["token"], "released": now, "gpus": got["gpus"], "pueue_id": int(t["id"]),
+                              "ram_counted": got["ram_counted"], "gpu_counted": got["gpu_counted"],
+                              "memory_max": memory_max})
         return True
 
     def clean_scopes(self, con, scopes, queue, tasks, use, read_at):
@@ -2601,7 +2605,7 @@ def _scope_probe(env):
 
 HISTORY_FIELDS = ("token", "task", "session", "pueue_id", "submitted", "released", "started", "ended", "exit", "how",
                   "size", "size_source", "like_from", "pilot", "peak_cpu", "peak_ram", "memory_peak", "peak_gpu_mem",
-                  "peak_samples", "peak_disk_mb_s", "projected_end")
+                  "peak_samples", "peak_disk_mb_s", "projected_end", "ram_counted", "gpu_counted", "memory_max")
 
 
 def host_history(req):
@@ -2624,10 +2628,11 @@ def host_history(req):
     jobs = []
     for r in rows:
         j = dict(zip(HISTORY_FIELDS, r))
-        try:
-            j["size"] = json.loads(j["size"]) if j["size"] else None
-        except ValueError:
-            j["size"] = None
+        for k in ("size", "gpu_counted"):
+            try:
+                j[k] = json.loads(j[k]) if j[k] else None
+            except ValueError:
+                j[k] = None
         jobs.append(j)
     return {"admission": True, "hostname": socket.gethostname(), "jobs": jobs}
 
@@ -3462,8 +3467,21 @@ def cmd_history(args):
             continue
         for j in r["jobs"]:
             z = j.get("size") or {}
-            size = "%g CPU, %s%s" % (z.get("cpus") or 0, _gbs(z.get("ram") or 0),
-                                     ", %d GPU %s" % (z["gpus"], _gbs(z.get("gpu_mem") or 0)) if z.get("gpus") else "")
+            # a pilot the loop released was counted at, and limited to, all the free room then, not at a size; one
+            # that started without a release (memory_max not recorded) was counted at its size
+            if j.get("pilot") and (j.get("ram_counted") is None or j.get("memory_max") is not None):
+                gc = [v for v in (j.get("gpu_counted") or {}).values()]
+                if j.get("ram_counted") is None:
+                    size = "%g CPU%s, all the free room at its start" % (
+                        z.get("cpus") or 0, ", %d GPU" % z["gpus"] if z.get("gpus") else "")
+                else:
+                    size = "%g CPU, %s%s (all the free room at its start)" % (
+                        z.get("cpus") or 0, _gbs(j["ram_counted"]),
+                        ", %d GPU %s" % (len(gc), " + ".join(_gbs(v) for v in gc)) if gc else "")
+            else:
+                size = "%g CPU, %s%s" % (z.get("cpus") or 0, _gbs(z.get("ram") or 0),
+                                         ", %d GPU %s" % (z["gpus"], _gbs(z.get("gpu_mem") or 0)) if z.get("gpus")
+                                         else "")
             peaks = "-" if not j.get("peak_samples") else "%.1f CPU, %s%s (%d samples)" % (
                 j.get("peak_cpu") or 0, _gbs(j.get("peak_ram") or 0),
                 ", GPU %s" % _gbs(j["peak_gpu_mem"]) if j.get("peak_gpu_mem") else "", j["peak_samples"])

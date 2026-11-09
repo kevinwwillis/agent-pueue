@@ -1131,6 +1131,31 @@ class LoopTests(Base):
         p = self.job("history", "local", "--json", "--task", "nothing-like-this", **self.env())
         self.assertEqual(json.loads(p.stdout)["local"]["jobs"], [])
 
+    def test_history_shows_what_a_pilot_was_counted_at(self):
+        self.model_card()
+        loop = self.loop()
+        r = self.submit_sized("sleep 60", pilot=True, gpus=1)
+        self.assertTrue(r["ok"], r)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        p = self.job("history", "local", "--task", "T-adm", **self.env())
+        self.assertIn("pilot: 1 CPU, 1 GPU, all the free room at its start", p.stdout)
+        try:
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+            rec = self.record(tok)
+            self.assertGreater(rec["ram_counted"], 4 * GB)  # not the placeholder size
+            self.assertEqual(rec["memory_max"], self.j._whole_pages(rec["ram_counted"]))
+            gpu = json.loads(rec["gpu_counted"])
+            self.assertEqual(list(gpu), [CARD])
+            self.assertGreater(gpu[CARD], 20 * GB)
+            p = self.job("history", "local", "--task", "T-adm", **self.env())
+            self.assertIn("1 GPU %.1f GB (all the free room at its start)" % (gpu[CARD] / GB), p.stdout)
+            p = self.job("history", "local", "--json", "--task", "T-adm", **self.env())
+            j = [x for x in json.loads(p.stdout)["local"]["jobs"] if x["token"] == tok][0]
+            self.assertEqual(j["memory_max"], rec["memory_max"])
+            self.assertEqual(j["gpu_counted"], gpu)
+        finally:
+            self.job("kill", "local", str(tid))
+
     # -- review cycle 2 ----------------------------------------------------------------------------------------
 
     def test_a_hold_granted_during_a_cycle_keeps_that_cycles_release_out(self):
