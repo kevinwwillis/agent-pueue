@@ -216,6 +216,7 @@ job run gpu1 TASK-12 --check "$SCRATCH/nan-check.sh" -- 'python train.py'
 | `job wait <host> <id> <id> ...` | Wait on several jobs on one host at once. Ends when all have ended (first line `job: ALL ENDED ...`, exit 0 if all succeeded, else the exit code of the lowest-id job that did not), or as soon as one of them is `STALLED`, `ALERT`, `UNREACHABLE` or `GONE` (first line names it and lists the ids still running). |
 | `job ls [host ...] [--all] [--recent H]` | Every job on this machine and every host in the hosts file: host, id, task id, status, run time, group, session, command. Finished jobs older than `--recent` hours (default 24) are hidden unless `--all`. Exits 202 if a host could not be reached (the reachable ones are still listed). |
 | `job group <host> <name> <n>` | Create a pueue group (if missing) and let it run `n` jobs at a time. Then `job submit/run ... --group <name>`. |
+| `job room [host ...] [--json]` | Each admission host's room: CPU, RAM, memory pressure, disks, each GPU's free memory and outside use, the jobs running and the jobs held with their reasons. |
 | `job kill <host> <id> [--token T]` | Kill a running job (pueue kill), or take a queued one out of the queue (pueue remove). With `--token`, refuses if the id now belongs to another job. |
 
 ## Queues of jobs
@@ -241,6 +242,37 @@ limit for everyone; don't change it without a reason.
 
 A queued or paused job waits without limit and does not count as stalled;
 `job ls` shows it as `Queued` or `Paused`.
+
+## Admission hosts: jobs start only where they fit
+
+A host with an admission settings file (`~/.config/agent-pueue/admission.json`) runs an admission loop
+(`job _admit`) that measures what is in use, including processes `job` did not start, and starts each job only
+when it fits. The design is [admission.md](admission.md). On such a host:
+
+- **Every job needs a size**, one of:
+  - `--pilot`: a first run to measure the job. It gets all the free RAM (and, with `--gpus N`, all the free
+    memory on those cards) and stops at its time limit (`--max-minutes`, or the host's setting).
+  - `--like TOKEN` (or `HOST#ID`): sized from that earlier job's measured peaks plus margins. Refused when that
+    run was killed or crashed, because its peaks are only a lower bound.
+  - `--cpus N`, `--ram SIZE`, `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or `--small`.
+    Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
+- `job run auto <task-id> ...` lets `job` choose the host: one with room now, else the job waits (is held) on
+  the best host. `--host NAME` (repeatable) limits the choice.
+- A held job's wait prints why every 10 minutes (`held: needs 18.0 GB RAM, 9.4 GB free`); being held is not a
+  verdict. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
+- The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
+  for a pilot its free RAM at release), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
+  `note: it went over its RAM limit of N GB; the whole job was stopped`. Processes it leaves running when its
+  command ends are stopped.
+- GPUs are given by UUID in `CUDA_VISIBLE_DEVICES` (also in `JOB_GPU_UUIDS`); a job without `--gpus` sees none.
+  `--env CUDA_VISIBLE_DEVICES=...` is refused. Code should use devices 0..N-1.
+- `ALERT` (exit 201) can also come from the loop: the job's group is paused, it uses more GPU memory than its
+  size, or the host's loop has stopped while the job is held. The job keeps its place.
+- Without `--group`, admitted jobs run in the group `sched`, so they start as soon as they fit.
+- Other constraints: `--gpu-model TEXT`, `--data PATH` (its disk; heavy-disk jobs wait while that disk is
+  busy), `--stop-at TIME` (stopped then; dropped if still held), `--in-containers`, `--restartable`.
+- A submit without a size, or from an older `job` (protocol 3 or 4), is refused with a message that starts
+  `protocol mismatch` or names the size options.
 
 ## The job's environment
 
