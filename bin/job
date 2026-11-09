@@ -20,6 +20,7 @@ import ctypes
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 import shlex
 import socket
@@ -484,6 +485,7 @@ def _scope_result(token):
         killed = None  # the job ended by itself before `job kill` reached it
     if killed is not None:
         out["how"] = "killed"
+        out["stopped_by"] = killed.get("stopped_by")
         out["memory_max"] = out["memory_max"] or _int_or_none(killed.get("memory_max"))
         _usage(killed, out)
     elif final is not None and final.get("setup_error"):
@@ -521,10 +523,13 @@ def _scope_cgroup(token):
     return "/sys/fs/cgroup" + cg if p.returncode == 0 and cg.startswith("/") else None
 
 
-def _snapshot_kill(token):
+LOOP_STOPS = ("pilot time limit", "stop-at")  # why the admission loop stops a running job
+
+
+def _snapshot_kill(token, by="job kill"):
     """Before `job kill` ends a scoped job, keep its use so far, since its shim dies with it."""
     path = os.path.join(STATE_DIR, "results", token + ".killed")
-    lines = ["stopped_by=job kill"]
+    lines = ["stopped_by=" + by]
     cg = _scope_cgroup(token)
     if cg:
         job = os.path.join(cg, "job")
@@ -739,7 +744,10 @@ def _probe_admission(s, req):
         return
     if settings is None or not s.get("token"):
         return
-    adm = Admission(settings)
+    try:
+        adm = Admission(settings)
+    except OSError:
+        return
     q = adm.read_json(adm.path("queue", s["token"] + ".json"))
     if q is not None:
         s["held"] = q.get("state") == "held"
@@ -803,7 +811,10 @@ def _probe_progress(s):
         return
     if settings is None:
         return
-    q = Admission(settings).read_json(os.path.join(settings["state_dir"], "queue", s["token"] + ".json"))
+    try:
+        q = Admission(settings).read_json(os.path.join(settings["state_dir"], "queue", s["token"] + ".json"))
+    except OSError:
+        return
     if q and q.get("progress"):
         s["progress"] = q["progress"][-1][1:3]
         s["projected_end"] = q.get("projected_end")
@@ -833,8 +844,8 @@ def host_kill(req):
     if status == "Running":
         token = (t.get("envs") or {}).get("JOB_TOKEN")
         scoped = bool(token) and os.path.exists(os.path.join(STATE_DIR, "scripts", token + ".shim"))
-        if scoped:
-            _snapshot_kill(token)  # its shim dies with it, so keep its use so far
+        if scoped:  # its shim dies with it, so keep its use so far
+            _snapshot_kill(token, req.get("stopped_by") if req.get("stopped_by") in LOOP_STOPS else "job kill")
         try:
             _pueue(["kill", str(tid)])
         except JobError:
@@ -888,10 +899,12 @@ GPU_BUSY_WINDOW_S = 60
 
 
 def _num(v, name, lo=0.0, hi=None, whole=False):
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or (whole and not isinstance(v, int)):
-        raise JobError("admission setting %s must be a %s" % (name, "whole number" if whole else "number"))
+    what = name if name.startswith("--") else "admission setting " + name
+    if (isinstance(v, bool) or not isinstance(v, (int, float)) or (whole and not isinstance(v, int))
+            or not math.isfinite(v)):
+        raise JobError("%s must be a %s" % (what, "whole number" if whole else "number"))
     if v < lo or (hi is not None and v > hi):
-        raise JobError("admission setting %s must be from %s to %s" % (name, lo, "any" if hi is None else hi))
+        raise JobError("%s must be from %s to %s" % (what, lo, "any" if hi is None else hi))
     return v
 
 
@@ -970,6 +983,7 @@ class Measure:
         self.gpu_file = gpu_file if gpu_file is not None else os.environ.get("JOB_TEST_GPUS")
         self.uid = os.getuid() if uid is None else uid
         self.nvml = None
+        self.nvml_retry = 0.0
         self.last_cpu = None
         self.last_io = {}
         self.last_disk = None
@@ -1060,13 +1074,14 @@ class Measure:
                 if p["uuid"] in by:
                     by[p["uuid"]]["procs"][int(p["pid"])] = p["used"]
             return cards
-        if self.nvml is None:
+        if self.nvml is None or (self.nvml is False and time.time() >= self.nvml_retry):
             self.nvml = _Nvml.open() or False
+            self.nvml_retry = time.time() + 600  # without NVML, try it again in 10 minutes
         if self.nvml:
             try:
                 return self.nvml.cards()
-            except OSError:
-                self.nvml = False
+            except (OSError, AttributeError):
+                self.nvml, self.nvml_retry = False, time.time() + 600
         return _nvidia_smi_cards()
 
     # -- admitted jobs -----------------------------------------------------------------------------------------
@@ -1291,8 +1306,9 @@ def compute_room(settings, samples, inflight, holds, now):
         paired = [min(a, b) for a, b in zip(series, series[1:])] or series
         gpu_outside = max(paired) if paired else 0
         jobs_on = [j for j in inflight if gid in j["gpus"]]
+        # every admitted job's use on this card, given or not: it was taken out of outside use above
         jobs_counted = sum(max(j["gpu_counted"].get(gid, 0), use.get(j["token"], {}).get("gpu", {}).get(gid, 0))
-                           for j in jobs_on)
+                           for j in inflight)
         held_own = {hid: h.get(gid, 0) for hid, h in last.get("holds", {}).items()}
         holds_counted = sum(max(h["size"], held_own.get(h["id"], 0)) for h in holds if h["gid"] == gid)
         utils = [s["gpus"][gid]["util"] for s in recent if gid in s["gpus"]]
@@ -1357,7 +1373,8 @@ def fits(settings, room, job, data_disk=None):
                 why.append("GPU %d is busy %.0f%%" % (g["index"], g["util"]))
                 continue
             if g["shares"] + (size.get("gpu_share") or 0) > settings["gpu_busy_max_pct"]:
-                why.append("GPU %d time is taken (%.0f%% shared)" % (g["index"], g["shares"]))
+                why.append("GPU %d has %.0f%% of its time left to share, it needs %g%%" % (
+                    g["index"], max(0.0, settings["gpu_busy_max_pct"] - g["shares"]), size.get("gpu_share") or 0))
                 continue
             need = settings["pilot"]["gpu_min_gb"] * GB if pilot else size["gpu_mem"]
             if g["room"] < max(need, 1):
@@ -1378,6 +1395,9 @@ def fits(settings, room, job, data_disk=None):
 def fits_empty(settings, capacity, job):
     """Why a job could not fit this host even with nothing else on it, or None."""
     size = job["size"]
+    if (size.get("gpu_share") or 0) > settings["gpu_busy_max_pct"]:
+        return "needs %g%% of a GPU's time; this host shares out at most %g%% of a card" % (
+            size["gpu_share"], settings["gpu_busy_max_pct"])
     ram_max = capacity["mem_total"] - settings["ram_headroom_gb"] * GB
     if size["ram"] > ram_max:
         return "needs %s RAM; this host has at most %s for jobs" % (_gbs(size["ram"]), _gbs(ram_max))
@@ -1518,10 +1538,13 @@ def _size_from(settings, adm, capacity, req):
     small = settings["small"]
     size = {"cpus": float(small["cpus"]), "ram": int(small["ram_gb"] * GB), "gpus": 0, "gpu_mem": 0,
             "gpu_share": 0.0, "disk_mb_s": 0.0}
-    for k in ("cpus", "gpu_share"):
-        if k in explicit:
-            size[k] = float(_num(explicit[k], "--" + k.replace("_", "-"), lo=0.0))
-    for k in ("ram", "gpus", "gpu_mem"):
+    if "cpus" in explicit:
+        size["cpus"] = float(_num(explicit["cpus"], "--cpus", lo=0.01))
+    if "gpu_share" in explicit:
+        size["gpu_share"] = float(_num(explicit["gpu_share"], "--gpu-share", lo=0.0, hi=100.0))
+    if "ram" in explicit:
+        size["ram"] = int(_num(explicit["ram"], "--ram", lo=SCOPE_MIN_MEMORY, whole=True))
+    for k in ("gpus", "gpu_mem"):
         if k in explicit:
             size[k] = int(_num(explicit[k], "--" + k.replace("_", "-"), lo=0, whole=True))
     if explicit and "ram" not in explicit:
@@ -1535,7 +1558,7 @@ def _size_from(settings, adm, capacity, req):
         if "gpus" in pilot_with:
             size["gpus"] = int(_num(pilot_with["gpus"], "--gpus", lo=0, whole=True))
         if "cpus" in pilot_with:
-            size["cpus"] = float(_num(pilot_with["cpus"], "--cpus", lo=0.0))
+            size["cpus"] = float(_num(pilot_with["cpus"], "--cpus", lo=0.01))
         return size, "pilot", True, None
     if a.get("small"):
         return size, "small", False, None
@@ -1722,6 +1745,9 @@ def host_submit_admitted(req, settings, command):
             raise JobError("bad token")
         for _, t in st.get("tasks", {}).items():
             if (t.get("envs") or {}).get("JOB_TOKEN") == token:  # a retried submit whose first attempt got through
+                if _task_status(t) == "Stashed" and not os.path.exists(adm.path("queue", token + ".json")):
+                    _pueue(["remove", str(int(t["id"]))])  # the first attempt failed after pueue add: start over
+                    break
                 return {"id": int(t["id"]), "token": token, "host": socket.gethostname(), "existing": True}
         group = req.get("group") or SCHED_GROUP
         groups = st.get("groups", {})
@@ -1767,6 +1793,12 @@ def host_submit_admitted(req, settings, command):
                 con.close()
             except sqlite3.Error:
                 pass
+            try:  # pueue may have added the task before the failure: a held task without a queue file never runs
+                for _, t in _pueue_status().get("tasks", {}).items():
+                    if (t.get("envs") or {}).get("JOB_TOKEN") == token and _task_status(t) == "Stashed":
+                        _pueue(["remove", str(int(t["id"]))])
+            except JobError:
+                pass  # a retry with this token removes it
             raise
         q["pueue_id"] = reply["id"]
         try:
@@ -1817,6 +1849,8 @@ class Loop:
         self.room = self.room_empty = None
         self.peaks = {}
         self.holds = []
+        self.hold_present = {}  # hold id -> whether the unit or cgroup it names exists, from the last sample
+        self.alerts_cleaned = 0.0
         self.m.cpu(self.clock())  # so the first cycle has a CPU reading
         con = self.adm.db()
         try:  # the windows carry on from before a restart (an install re-executes the loop)
@@ -1852,6 +1886,7 @@ class Loop:
             by_cg[path[len(self.m.cg):]] = tok
         hold_pids = {h["id"]: _pid_tree(self.m.proc, h["while_pid"]) for h in holds if h.get("while_pid")}
         hold_cgs = {h["id"]: _hold_cgroups(h) for h in holds if h.get("unit") or h.get("cgroup")}
+        self.hold_present = {hid: any(os.path.isdir(self.m.cg + c) for c in cgs) for hid, cgs in hold_cgs.items()}
         held_use = {}
         for c in cards:
             for pid, used in c["procs"].items():
@@ -1881,14 +1916,7 @@ class Loop:
         """Measure, account, end, release; returns the seconds to sleep before the next cycle."""
         now = self.clock()
         scopes = self.m.scopes()
-        holds = []
-        for h in _holds(self.adm):
-            alive, why = _hold_alive(h, self.m.proc, now)
-            if alive:
-                holds.append(h)
-            else:
-                _end_hold(self.adm, h, why)
-        self.holds = holds
+        holds = _holds(self.adm)  # ended or added under the queue lock in release(), which reads them again
         s, use = self.sample(now, scopes, holds)
         read_at = time.time()
         try:
@@ -1916,8 +1944,8 @@ class Loop:
                 else:  # too little history to know the outside use over the windows: release nothing yet
                     self.warming = {"covered_s": covered, "needed_s": self.s["warmup_s"]}
                     self.room = self.room_empty = None
-                self.release(con, now, queue, tasks, st)
-                self.clean_scopes(scopes, tasks, use, read_at)
+                self.release(con, now, queue, tasks, st, holds)
+                self.clean_scopes(con, scopes, queue, tasks, use, read_at)
             con.execute("DELETE FROM recent WHERE t < ?", (now - self.keep_s,))
             con.execute("INSERT INTO recent VALUES (?, ?)", (s["t"], json.dumps(s)))
             con.execute("DELETE FROM samples WHERE t < ?", (now - 7 * 86400,))
@@ -1925,7 +1953,9 @@ class Loop:
             con.commit()
         finally:
             con.close()
-        self.write_snapshot(now, queue, st is not None)
+        if st is not None:  # a cycle that could not read pueue admitted nothing, so it does not renew the heartbeat
+            self.adm.write_json(self.adm.path("heartbeat"), {"t": now, "pid": os.getpid(), "version": VERSION})
+        self.clean_alerts(queue)
         pilots = any(q.get("pilot") and q.get("state") == "released" for q in queue)
         return self.s["pilot_sample_interval_s"] if pilots else self.s["sample_interval_s"]
 
@@ -1952,6 +1982,12 @@ class Loop:
             t = tasks.get(q["token"])
             status = _task_status(t)
             u = use.get(q["token"])
+            if q.get("state") == "held" and t is not None and status not in ("Stashed", "Locked", None):
+                # started though the loop did not release it (an enqueue that failed after pueue acted, or a
+                # person): count it from now, so it holds room and ends with a record
+                q.update({"state": "released", "released": now, "gpus": [], "ram_counted": q["size"]["ram"],
+                          "gpu_counted": {}, "reason": None})
+                self.adm.save(q)
             if q.get("state") == "held":
                 if t is None:  # removed before release, or still being added: give a submit time to finish
                     if now - q["submitted"] > 120:
@@ -1979,6 +2015,10 @@ class Loop:
                 p["disk"] = max(p["disk"], u.get("disk_mb_s") or 0.0)
                 p["ram"] = max(p["ram"], u["ram"])
                 p["gpu"] = max([p["gpu"]] + list(u.get("gpu", {}).values()))
+                stray = sorted(uu for uu, b in u.get("gpu", {}).items() if b and uu not in q.get("gpus", []))
+                if stray:
+                    self.adm.alert(q, "gpu_not_given", "uses GPU memory on a card it was not given (%s); it is counted "
+                                   "there, but a job should use only the GPUs in CUDA_VISIBLE_DEVICES" % ", ".join(stray))
                 over = [uu for uu, b in u.get("gpu", {}).items() if b > q["size"]["gpu_mem"] > 0 and not q.get("pilot")]
                 if over:
                     self.adm.alert(q, "gpu_over_size", "uses %s on a GPU, over its GPU memory size of %s; no new job "
@@ -1998,7 +2038,7 @@ class Loop:
                         limit, reason = at, "stop-at"
                 if limit is not None and now >= limit:
                     try:
-                        host_kill({"id": t["id"], "token": q["token"]})
+                        host_kill({"id": t["id"], "token": q["token"], "stopped_by": reason})
                     except JobError as e:  # tried again next cycle
                         self.adm.alert(q, "stop_failed", "could not stop it at its %s: %s" % (reason, e))
                         self.adm.save(q)
@@ -2083,64 +2123,89 @@ class Loop:
         self.peaks.pop(q["token"], None)
         q["state"] = "ended"
 
-    def release(self, con, now, queue, tasks, st):
-        """Release held jobs that fit, oldest first; once the oldest has waited fairness_wait_min, a younger
-        job is released only if it takes nothing from a resource the oldest is short of."""
-        if self.room is None:
-            if self.warming:
+    def release(self, con, now, queue, tasks, st, counted_holds=()):
+        """Under the queue lock: bring holds up to date, release held jobs that fit (oldest first; once the
+        oldest has waited fairness_wait_min, a younger job is released only if it takes nothing from a resource
+        the oldest is short of), and write the snapshot, so a hold decided after the lock sees these releases."""
+        con.commit()  # lock order is queue.lock, then the records: a submit holds the lock while it writes one
+        fd = self.adm.lock("queue.lock")
+        try:
+            room = json.loads(json.dumps(self.room)) if self.room is not None else None
+            self.update_holds(now, room, {h["id"] for h in counted_holds})
+            if room is not None:
+                self._release(con, now, queue, tasks, st, room)
+                self.room = room  # the snapshot shows the room left after this cycle's releases
+            elif self.warming:
                 for q in queue:
                     if q.get("state") == "held":
                         q["reason"] = "the loop is measuring this host first (%s of %s)" % (
                             _fmt_dur(self.warming["covered_s"]), _fmt_dur(self.warming["needed_s"]))
                         self.adm.save(q)
-            return
-        room = json.loads(json.dumps(self.room))
+            self.write_snapshot(now, queue)
+        finally:
+            try:
+                con.commit()
+            finally:
+                os.close(fd)
+
+    def update_holds(self, now, room, counted):
+        """End holds whose process, time to live, unit or cgroup is gone; take holds this cycle's room did not
+        count (granted since it read them) out of the room."""
+        live = []
+        for h in _holds(self.adm):
+            alive, why = _hold_alive(h, self.m.proc, now)
+            present = self.hold_present.get(h["id"])
+            if alive and present is False and h.get("seen"):
+                alive, why = False, "its unit or cgroup is gone"
+            if not alive:
+                _end_hold(self.adm, h, why)
+                continue
+            if present and not h.get("seen"):
+                h["seen"] = True
+                self.adm.write_json(self.adm.path("holds", h["id"] + ".json"), h)
+            if room is not None and h["id"] not in counted and h["uuid"] in room["gpus"]:
+                room["gpus"][h["uuid"]]["room"] -= h["size"]
+            live.append(h)
+        self.holds = live
+
+    def _release(self, con, now, queue, tasks, st, room):
         groups = st.get("groups", {})
         running = {}
         for t in st.get("tasks", {}).values():
             if _task_status(t) in ("Running", "Queued"):  # an enqueued job takes a slot as soon as one is free
                 running[t.get("group")] = running.get(t.get("group"), 0) + 1
         blocked = None  # the resources the waiting oldest job is short of
-        con.commit()  # lock order is queue.lock, then the records: a submit holds the lock while it writes one
-        fd = self.adm.lock("queue.lock")
-        try:
-            for q in queue:
-                if q.get("state") != "held":
-                    continue
-                t = tasks.get(q["token"])
-                if t is None or _task_status(t) != "Stashed":
-                    continue
-                g = groups.get(q["group"]) or {}
-                if g.get("status") == "Paused":
-                    q["reason"] = "its group %s is paused" % q["group"]
-                    self.adm.alert(q, "group_paused", "held: its pueue group %s is paused; resume it with "
-                                   "'pueue start --group %s'" % (q["group"], q["group"]))
-                    self.adm.save(q)
-                    continue
-                if running.get(q["group"], 0) >= (g.get("parallel_tasks") or 1):
-                    q["reason"] = "its group %s is full" % q["group"]
-                    self.adm.save(q)
-                    continue
-                ok, got = fits(self.s, room, q, q.get("data_disk"))
-                if ok and blocked is not None and blocked & self._resources(q, got):
-                    ok, got = False, "waiting behind an older job that needs the same room"
-                if not ok:
-                    q["reason"] = got
-                    self.adm.save(q)
-                    if (blocked is None and now - q["submitted"] >= 60 * self.s["fairness_wait_min"]
-                            and fits(self.s, self.room_empty, q, q.get("data_disk"))[0]):
-                        # it would fit once admitted jobs end, so younger jobs must not take that room
-                        blocked = self._short_of(room, q)
-                    continue
-                if self.enqueue(con, now, q, t, got):
-                    _take(room, q, got)
-                    running[q["group"]] = running.get(q["group"], 0) + 1
-            self.room = room  # the snapshot shows the room left after this cycle's releases
-        finally:
-            try:
-                con.commit()
-            finally:
-                os.close(fd)
+        for q in queue:
+            if q.get("state") != "held":
+                continue
+            t = tasks.get(q["token"])
+            if t is None or _task_status(t) != "Stashed":
+                continue
+            g = groups.get(q["group"]) or {}
+            if g.get("status") == "Paused":
+                q["reason"] = "its group %s is paused" % q["group"]
+                self.adm.alert(q, "group_paused", "held: its pueue group %s is paused; resume it with "
+                               "'pueue start --group %s'" % (q["group"], q["group"]))
+                self.adm.save(q)
+                continue
+            if running.get(q["group"], 0) >= (g.get("parallel_tasks") or 1):
+                q["reason"] = "its group %s is full" % q["group"]
+                self.adm.save(q)
+                continue
+            ok, got = fits(self.s, room, q, q.get("data_disk"))
+            if ok and blocked is not None and blocked & self._resources(q, got):
+                ok, got = False, "waiting behind an older job that needs the same room"
+            if not ok:
+                q["reason"] = got
+                self.adm.save(q)
+                if (blocked is None and now - q["submitted"] >= 60 * self.s["fairness_wait_min"]
+                        and fits(self.s, self.room_empty, q, q.get("data_disk"))[0]):
+                    # it would fit once admitted jobs end, so younger jobs must not take that room
+                    blocked = self._short_of(room, q)
+                continue
+            if self.enqueue(con, now, q, t, got):
+                _take(room, q, got)
+                running[q["group"]] = running.get(q["group"], 0) + 1
 
     def _resources(self, q, got):
         r = {"ram", "cpu"} if q["size"]["ram"] or q["size"]["cpus"] else set()
@@ -2183,42 +2248,57 @@ class Loop:
         try:
             _pueue(["enqueue", str(int(t["id"]))])
         except JobError as e:
-            q.update({"state": "held", "reason": "release failed: %s" % e})
-            self.adm.save(q)
-            os.remove(path)
-            return False
+            # pueue may have acted before it failed, so the job stays counted with its assignment; the next
+            # cycle holds it again if its task is still Stashed
+            sys.stderr.write("job _admit: pueue enqueue %s failed: %s\n" % (t["id"], e))
         self.adm.record(con, {"token": q["token"], "released": now, "gpus": got["gpus"], "pueue_id": int(t["id"])})
         return True
 
-    def clean_scopes(self, scopes, tasks, use, read_at):
+    def clean_scopes(self, con, scopes, queue, tasks, use, read_at):
         """Stop a job scope that still has processes after its task is Done or gone (the shim was killed, so
         nothing else stops them). Scopes of other names, and of tasks pueue still runs, are never touched."""
+        queued = {q["token"] for q in queue}
         for tok in scopes:
             t = tasks.get(tok)
             if t is not None and _task_status(t) != "Done":
                 continue
             if t is None and not os.path.exists(os.path.join(STATE_DIR, "scripts", tok + ".shim")):
                 continue  # not a job of this host's pueue: leave it alone
+            if tok not in queued and con.execute("SELECT 1 FROM jobs WHERE token = ?", (tok,)).fetchone() is None:
+                continue  # not an admitted job of this host
             try:
                 if os.path.getmtime(os.path.join(STATE_DIR, "results", tok + ".started")) >= read_at:
                     continue  # restarted since pueue's status was read
             except OSError:
-                pass
+                continue  # not started, or starting again: its shim decides
             if use.get(tok, {}).get("populated"):
                 _stop_scope(tok)
 
-    def write_snapshot(self, now, queue, pueue_ok):
+    def write_snapshot(self, now, queue):
         held = [{"token": q["token"], "task": q["task"], "reason": q.get("reason"), "waited_s": now - q["submitted"],
                  "size": q["size"], "pilot": q.get("pilot")} for q in queue if q.get("state") == "held"]
         jobs = [{"token": q["token"], "task": q["task"], "size": q["size"], "gpus": q.get("gpus"),
                  "released": q.get("released"), "progress": (q.get("progress") or [[0, None, None]])[-1][1:3],
                  "projected_end": q.get("projected_end")} for q in queue if q.get("state") == "released"]
         holds = [{k: h.get(k) for k in ("id", "name", "index", "uuid", "size", "start", "expires")} for h in self.holds]
-        self.adm.write_json(self.adm.path("room.json"), {"t": now, "host": socket.gethostname(), "room": self.room,
-                                                         "capacity": self.capacity, "held": held, "jobs": jobs,
-                                                         "holds": holds, "pueue_ok": pueue_ok,
-                                                         "warmup": self.warming})
-        self.adm.write_json(self.adm.path("heartbeat"), {"t": now, "pid": os.getpid(), "version": VERSION})
+        self.adm.write_json(self.adm.path("room.json"), {"t": now, "written": time.time(), "host": socket.gethostname(),
+                                                         "room": self.room, "capacity": self.capacity, "held": held,
+                                                         "jobs": jobs, "holds": holds, "warmup": self.warming})
+
+    def clean_alerts(self, queue):
+        """Once an hour, remove alert files of jobs that left the queue more than SCRIPT_KEEP_DAYS ago."""
+        if time.time() - self.alerts_cleaned < 3600:
+            return
+        self.alerts_cleaned = time.time()
+        keep = {q["token"] for q in queue}
+        d = self.adm.path("alerts")
+        try:
+            for name in os.listdir(d):
+                p = os.path.join(d, name)
+                if name.split(".")[0] not in keep and os.path.getmtime(p) < time.time() - SCRIPT_KEEP_DAYS * 86400:
+                    os.remove(p)
+        except OSError:
+            pass
 
 
 def admit_main(once=False):
@@ -2360,7 +2440,8 @@ def host_hold(req):
         gid = next((u for u, g in gpus.items() if u == want or str(g["index"]) == want), None)
         if gid is None:
             raise JobError("no GPU %s on %s" % (want, socket.gethostname()))
-        newer = sum(h["size"] for h in _holds(adm) if h["uuid"] == gid and h["start"] > snap["t"])
+        # the snapshot is written under this lock after each cycle's releases; holds since then are not in it
+        newer = sum(h["size"] for h in _holds(adm) if h["uuid"] == gid and h["start"] > snap.get("written", snap["t"]))
         free = gpus[gid]["room"] - newer
         if size > free:
             raise JobError("GPU %d on %s has %s free; the hold needs %s" % (gpus[gid]["index"], socket.gethostname(),
@@ -2621,8 +2702,11 @@ def call(host, op, req, timeout=120):
                 reply = None
             break
     if not isinstance(reply, dict):
-        raise JobError("%s: no reply from job on the host (exit %d): %s" % (
-            host, p.returncode, (p.stderr or p.stdout).strip()[-800:]))
+        text = (p.stderr or p.stdout).strip()[-800:]
+        if (p.returncode == 2 and "usage:" in text) or p.returncode == 127:  # refused before it did anything
+            raise JobError("%s: no reply from job on the host (exit %d): %s" % (host, p.returncode, text))
+        raise Unreachable("%s: job on the host gave no reply (exit %d), so whether the request took effect is "
+                          "unknown: %s" % (host, p.returncode, text))
     if not reply.get("ok"):
         err = reply.get("error") or ""
         if err.startswith("protocol mismatch"):
@@ -2928,7 +3012,7 @@ def cmd_room(args):
             continue
         room = r["room"]
         cap = r.get("capacity") or {}
-        print("%s: snapshot %s old; CPU %.1f busy of %s threads, %.1f free to admit; RAM %s free to admit; "
+        print("%s: snapshot %s old; CPU %.1f threads used or committed of %s, %.1f free to admit; RAM %s free to admit; "
               "memory pressure %.1f%%" % (h, _fmt_dur(r.get("heartbeat_age") or 0), room["cpu"]["outside"]
                                            + room["cpu"]["committed"], cap.get("threads", "?"),
                                            max(0.0, room["cpu"]["room"]), _gbs(max(0, room["ram"]["room"])),
@@ -2995,6 +3079,11 @@ def scope_verdict(verdict, code, scope):
     if how == "sigkill":
         return verdict, code, ("it ended with signal 9 and no out-of-memory event, so not by its RAM limit: "
                                "systemd-oomd under memory pressure, a person, or the job itself sent it")
+    if how == "killed" and scope.get("stopped_by") == "pilot time limit":
+        return verdict, code, ("the admission loop stopped this pilot at its time limit, as planned; its peaks are "
+                               "recorded, so size the next run with --like and this job's token")
+    if how == "killed" and scope.get("stopped_by") == "stop-at":
+        return verdict, code, "the admission loop stopped it at its --stop-at time"
     if how == "scope_killed":
         return verdict, code, ("its whole scope was killed from outside, with its bookkeeping, for example by "
                                "systemd-oomd under memory pressure")

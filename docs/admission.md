@@ -37,8 +37,8 @@ job release host2 <hold-id>
   was sent to.
 - Every job submitted to an admission host needs a size, from one of:
   - **`--pilot`**: a first run to measure the job. It is counted at, and limited to, all the RAM room at
-    release, and, with `--gpus N`, all the free memory on the cards it gets, so nothing else can be admitted into
-    room it may grow into. It has a time limit (`pilot.max_minutes`, or `--max-minutes`), so it never holds the
+    release, and, with `--gpus N`, counted at all the free memory on the cards it gets (GPU memory is not
+    capped), so nothing else can be admitted into room it may grow into. It has a time limit (`pilot.max_minutes`, or `--max-minutes`), so it never holds the
     room for long; the limit counts from its start. It takes `--cpus` and `--gpus`, and a GPU pilot needs at
     least `pilot.gpu_min_gb` free on each card. Its use is sampled every `pilot_sample_interval_s`.
   - **`--like TOKEN`** (or `HOST#ID`, the newest job with that id on that host): that job's measured peaks
@@ -123,7 +123,10 @@ standard-library Python 3.8. An example for a 32-thread host with 256 GB RAM (il
 
 - `state_dir` (default `~/.local/state/agent-pueue/admission`, home-expanded, never taken from `XDG_*`, so the
   loop's environment and an ssh session can't disagree) holds the queue files, records and lock. It must be on a
-  local disk, not a network filesystem.
+  local disk, not a network filesystem. The scripts and
+  exit records of every job are under `$XDG_STATE_HOME/agent-pueue` (default `~/.local/state/agent-pueue`), as
+  before admission, so ssh sessions and the user manager must agree on `XDG_STATE_HOME` (both leave it unset on
+  a stock Ubuntu).
 - An unreadable or invalid file stops admission on that host: submits there are refused with the reason. It
   never falls back to admitting without rules.
 - `disks` lists paths; each is resolved to its disk at loop start, and `job room` shows each disk's busy time.
@@ -150,7 +153,7 @@ loop re-executes itself with the new code.
 
 Each cycle it measures, counts room, releases held jobs that fit, and writes samples, records and alerts. An
 error in one cycle is written to the journal and the loop goes on; the heartbeat is renewed only by a cycle that
-completes, so an error that repeats shows as a stale loop.
+completes and could read pueue's status, so an error that repeats, or pueued being down, shows as a stale loop.
 
 Its last samples are kept in `admission.sqlite` (`recent`, the longest window plus a minute), so the windows
 carry on over a restart or an install. The loop releases nothing until it has `warmup_s` of unbroken
@@ -165,9 +168,20 @@ Submits and releases on a host take one short lock (`state_dir/queue.lock`), so 
 room the loop releases into can't race.
 
 - `host_submit` on an admission host, under the lock: creates `sched` if it is missing (parallel 256); checks the
-  token against existing queue files and tasks (a retried submit returns the first one); writes
-  `state_dir/queue/<token>.json` (written to a temporary name, then renamed); then adds the task with
-  `pueue add --stashed`. The loop ignores a stashed task without a queue file and a queue file without a task.
+  token against existing tasks (a retried submit returns the first one, unless that one is a held task without
+  a queue file, left by a submit that failed after `pueue add`: that task is removed and the job queued again);
+  writes `state_dir/queue/<token>.json` (written to a temporary name, then renamed) and the job's first record;
+  then adds the task with `pueue add --stashed`. A submit that fails removes its queue file, its record and, if
+  pueue added it, its held task. The loop ignores a stashed task without a queue file and a queue file without
+  a task.
+- A queue file and pueue can disagree. A job marked released whose task is still held (the loop stopped
+  between the two) is held again; a held job whose task started anyway (a `pueue enqueue` that failed after
+  pueue acted, or a person) is counted as released from then on, and ends with a record. When `pueue enqueue`
+  fails, the job stays counted, since pueue may have acted.
+- The client treats a host's refusal (its JSON reply says so, or `job` there rejects the command line) as
+  definite. Anything else without a reply (ssh failed, `job` there was killed) means the request may or may not
+  have taken effect, so a submit is retried only with the same token, and `auto` never sends it to another
+  host.
 - A submit marked `fit_now` (used by `auto`) is queued only if the job would be released in the next cycle,
   counting the jobs already held ahead of it; otherwise it is refused without queueing, and `auto` tries the next
   host.
@@ -239,23 +253,24 @@ Limits and settings:
   least room that still fits is chosen. `--gpus 2` takes two cards on one host. Code with a hard-coded device
   number other than 0 fails under this; it should use device 0..N-1. The `gpu_env` settings are added unless the
   job's `--env` sets them.
-- **Probe at loop start:** the loop runs a test scope with the same setup as the shim and checks that
-  `memory.max`, `memory.swap.max` and `memory.oom.group` took effect on its `job/` and that `memory.peak` exists. If not, the host runs jobs without scopes: no
-  hard RAM limit, RAM measured as the sum of `RssAnon + RssShmem` over the job's processes (found by token and
-  descendants, as today), and `job room` marks the host `no limits`.
+- **Probe:** `job admission <host> start` runs a test scope with the same setup as the shim and checks that
+  `memory.max`, `memory.swap.max` and `memory.oom.group` took effect on its `job/` and that `memory.peak`
+  exists. If not, it refuses to start the loop, and the host stays without admission: there is no mode
+  without limits.
 
 ### Ending, killing and clean-up
 
 - `job kill` first records the job's use so far (its shim dies with it), then kills the pueue task and every
   process left in the scope with SIGKILL, as `pueue kill` does, so detached processes end at once.
 - Processes a job leaves behind when its command ends are stopped by the shim within two seconds.
-- Each cycle the loop stops any scope named `agent-pueue-job-<32 hex>` that still has processes after its task
-  is Done (the shim was killed, for example by a `pueue kill` outside `job`), or after its task is absent in a
+- Each cycle the loop stops any scope named `agent-pueue-job-<32 hex>` of one of its admitted jobs (in the queue
+  or the records) that has started and still has processes after its task is Done (the shim was killed, for example by a `pueue kill` outside `job`), or after its task is absent in a
   status read that succeeded and this host has the job's shim script, unless the job started again after the
   status was read. A failed or timed-out pueue read never counts as "absent". Scopes with other names, and
   scopes of tasks pueue still runs, are never touched.
 - A pilot past its time limit or a job past `--stop-at` is killed while Running; a paused one is killed once it
-  is resumed. A kill that fails is tried again each cycle, with an ALERT.
+  is resumed. A kill that fails is tried again each cycle, with an ALERT. The wait ends `KILLED` with a note
+  saying the loop stopped it and why (for a pilot: "as planned").
 
 ### Jobs that run containers
 
@@ -272,17 +287,17 @@ work in containers says `--in-containers`. It is counted at its size until its c
 - Per card: total and free memory (`nvmlDeviceGetMemoryInfo`); used means `total − free`, so memory the driver
   reserves counts as outside use. The `nvidia-smi` fallback reads `memory.total` and `memory.free` too, so both
   paths agree. Name, UUID and utilization.
-- Per process: compute and graphics process lists, merged by pid (they overlap). Per-process utilization from
-  `nvmlDeviceGetProcessUtilization`, taken as 0 when it returns NOT_FOUND (an idle card).
+- Per process: compute and graphics process lists, merged by pid (they overlap), with each one's GPU memory.
+  Utilization is the card's, not per process. When NVML fails, the loop reads `nvidia-smi` (compute processes
+  only) and tries NVML again after 10 minutes.
 - Because device and process values come from separate calls, the outside-use value of a sample is the lower of
   two consecutive passes, on both paths.
 - Utilization for the busy rule is the average over the last minute.
 
 **Per admitted job**, from its scope's `job/` cgroup: `memory.current`, `memory.stat`, `cpu.stat`. The RAM size basis is
 `memory.current − active_file − inactive_file` (anonymous, shared and kernel memory; `/dev/shm` included, file
-cache excluded). Per-process GPU values map to a job through `/proc/<pid>/cgroup`. Bytes read and written come
-from `io.stat` where the io controller is delegated, otherwise from `/proc/<pid>/io` summed over the scope's
-processes (a soft value: short-lived children are missed).
+cache excluded). Per-process GPU values map to a job through `/proc/<pid>/cgroup`. The disk rate comes from
+`/proc/<pid>/io` summed over the scope's processes (a soft value: short-lived children are missed).
 
 **Per host:** busy threads from `/proc/stat` deltas; `MemAvailable`; memory pressure (`full avg10`); per-disk
 busy time from `/proc/diskstats` deltas for the devices in `disks`.
@@ -292,9 +307,11 @@ busy time from `/proc/diskstats` deltas for the devices in `disks`.
 For each resource, outside use is measured (what admitted jobs don't account for), and admitted jobs count at
 the larger of their size and their current use. A job that ends frees its room at once.
 
-- **GPU memory, per card:** `total − gpu_headroom − outside − Σ over admitted jobs on the card of max(size,
-  current use) − Σ over holds on the card of max(size, own use)`, where `outside` is the highest over
-  `outside_window_s` of `max(0, used − jobs' use − holds' own use)`. A hold's own use is the GPU memory of the
+- **GPU memory, per card:** `total − gpu_headroom − outside − Σ over admitted jobs of max(size on the card,
+  current use on the card) − Σ over holds on the card of max(size, own use)`, where `outside` is the highest
+  over `outside_window_s` of `max(0, used − jobs' use − holds' own use)`. A job's use counts on every card it
+  uses, including one it was not given (it set `CUDA_VISIBLE_DEVICES` itself, for example), and that gets an
+  ALERT. A hold's own use is the GPU memory of the
   processes it names (`--while-pid` and its descendants, or the cgroup of `--unit`/`--cgroup`); a hold that
   names none is counted at its size and its real use again as outside use (safe, but it wastes room), so
   services should name their processes.
@@ -358,20 +375,25 @@ reaches its hard limit before its `total`.
 A service that uses a GPU outside `job` (a model server, for example) registers a hold before it loads:
 `job hold <host> --gpu <index|uuid> --mem SIZE --name NAME`, naming its processes with `--while-pid PID` (the
 hold ends when that process exits), `--unit NAME` or `--cgroup PATH` (a service or container), and optionally
-`--ttl MIN` (it ends unless renewed with `job hold --renew <id>`). Under the queue lock, a hold is granted only if
-the card has the room now; otherwise it is refused at once, and the service decides what to do. A caller that
-wants room kept for a later step registers a hold the same way. Holds and jobs are first come: neither displaces
-the other.
+`--ttl MIN` (it ends unless renewed with `job hold --renew <id>`). A hold on a unit or cgroup also ends once that
+unit or cgroup, seen before, is gone. Under the queue lock, a hold is granted only if the card has the room:
+the loop writes its snapshot under the same lock after each cycle's releases, and the grant takes from that
+room the holds granted since. In each cycle the loop reads the holds again under the lock before it releases,
+and takes out of its room any hold granted since it measured. A refused hold is refused at once, and the
+service decides what to do. A caller that wants room kept for a later step registers a hold the same way.
+Holds and jobs are first come: neither displaces the other.
 
 ## Placement (client side)
 
 `job run auto` asks every admission host for its room (a new host operation, `room`, which returns the loop's
-snapshot, its age, and the room left after the jobs already held there). It filters hosts by the constraints and
+snapshot, its age, and the room left after that cycle's releases, with the jobs held there listed). It filters hosts by the constraints and
 orders them: hosts with room now, then the host that holds its `--data`, then the one with the fewest held jobs.
 It submits with `fit_now` to each host with room in turn; the host checks under its queue lock, so two callers
-can't both take the last room. If no host accepts, it submits normally to the first host in the order, where the
-job is held. The host is chosen before the submit's retries begin, and retries reuse the token, so a retry can't
-run the job twice. Hosts that don't answer within the timeout, or whose snapshot is stale, are skipped and named
+can't both take the last room. A host that refuses (too small for the job, no record for its `--like`, a
+missing `--needs-path`) is skipped. If no host takes it now, it submits normally to each host in the order until
+one takes it, and the job is held there; a host whose loop is still measuring can hold a job but not start it.
+The host is chosen before the submit's retries begin, and retries reuse the token, so a retry can't run the job
+twice; a host that gives no reply stops the placement, since the job may have been queued there. Hosts that don't answer within the timeout, or whose snapshot is stale, are skipped and named
 in the output.
 
 `job room` prints, per host: snapshot age, busy threads, RAM room, memory pressure, each disk's busy time, and

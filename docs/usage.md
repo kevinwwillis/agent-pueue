@@ -256,8 +256,8 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   - `--like TOKEN` (or `HOST#ID`): sized from that earlier job's measured peaks plus margins, printed as
     `sized like ...`, and run on the host that holds that record. Refused when that run was killed or
     crashed (its peaks are only a lower bound) or was measured fewer than 3 times.
-  - `--ram SIZE` (required) with `--cpus N`, `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or
-    `--small`. Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
+  - `--ram SIZE` (required, at least 16 MiB) with `--cpus N` (more than 0), `--gpus N`, `--gpu-mem SIZE` (per
+    GPU), `--gpu-share PCT`; or `--small`. Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
 - `job run auto <task-id> ...` lets `job` choose the host: one with room now, else the job waits (is held) on
   the first host that takes it. A host that refuses the job (too small, no record for `--like`, a missing
   `--needs-path`) is skipped; an unreachable host stops the placement, since the job may have been queued
@@ -271,7 +271,10 @@ when it fits. The design is [admission.md](admission.md). On such a host:
 - GPUs are given by UUID in `CUDA_VISIBLE_DEVICES` (also in `JOB_GPU_UUIDS`); a job without `--gpus` sees none.
   `--env CUDA_VISIBLE_DEVICES=...` is refused. Code should use devices 0..N-1.
 - `ALERT` (exit 201) can also come from the loop: the job's group is paused, it uses more GPU memory than its
-  size, or the host's loop has stopped while the job is held. The job keeps its place.
+  size or a GPU it was not given, its RAM trend reaches its limit, a stop at its time limit failed, or the
+  host's loop has stopped while the job is held. The job keeps its place.
+- A pilot stopped at its time limit ends `KILLED` with a note saying so ("as planned"); size the next run
+  `--like` its token.
 - Without `--group`, admitted jobs run in the group `sched`, so they start as soon as they fit.
 - Other constraints: `--gpu-model TEXT`, `--needs-path PATH`, `--data PATH` (its disk; heavy-disk jobs wait
   while that disk is busy), `--stop-at TIME` (with its UTC offset; stopped then, dropped if still held),

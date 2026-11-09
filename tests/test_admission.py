@@ -178,6 +178,54 @@ class RoomRules(unittest.TestCase):
         self.assertIsNone(self.j.fits_empty(self.s, cap, held(gpus=1, gpu_mem=7 * GB)))
 
 
+class RoomRulesCycle2(unittest.TestCase):
+    """Room rules from the second review."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.j = load()
+        cls.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        cls.s = settings(cls.j, cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        if cls.tmp.startswith("/tmp/jobt."):
+            shutil.rmtree(cls.tmp)
+
+    def test_gpu_use_on_a_card_the_job_was_not_given_still_counts(self):
+        tok = "d" * 32
+        gp = {CARD: card(10 * GB + 400 * 10 ** 6, index=0), CARD2: card(400 * 10 ** 6, index=1)}
+        jobs = {tok: {"ram": GB, "cpu": 1.0, "gpu": {CARD: 10 * GB}}}
+        samples = [sample(t, gpus=gp, jobs=jobs) for t in (90, 100)]
+        inflight = [{"token": tok, "released": 90, "size": {"cpus": 1, "ram": GB, "gpu_mem": 4 * GB, "gpus": 1},
+                     "gpus": [CARD2], "ram_counted": GB, "gpu_counted": {CARD2: 4 * GB}}]
+        r = self.j.compute_room(self.s, samples, inflight, [], 100)
+        self.assertLessEqual(r["gpus"][CARD]["room"], 24 * GB - 10.4 * GB - 0.5 * GB + 1)
+        self.assertAlmostEqual(r["gpus"][CARD2]["room"], 24 * GB - 0.4 * GB - 0.5 * GB - 4 * GB, delta=1e6)
+
+    def test_a_gpu_share_no_card_can_give_is_refused_at_once(self):
+        job = held(gpus=1, gpu_mem=GB)
+        job["size"]["gpu_share"] = 100.0
+        cap = {"mem_total": 64 * GB, "threads": 8, "gpus": [{"uuid": CARD, "index": 0, "name": "RTX 3090",
+                                                             "total": 24 * GB}]}
+        self.assertIn("of a GPU's time", self.j.fits_empty(self.s, cap, job))
+        job["size"]["gpu_share"] = 60.0
+        r = self.j.compute_room(self.s, [sample(t, gpus={CARD: card(0)}) for t in (90, 100)],
+                                [{"token": "e" * 32, "released": 90, "size": {"cpus": 1, "ram": GB, "gpu_share": 50},
+                                  "gpus": [CARD], "ram_counted": GB, "gpu_counted": {CARD: GB}}], [], 100)
+        ok, why = self.j.fits(self.s, r, job)
+        self.assertFalse(ok)
+        self.assertIn("40% of its time left to share, it needs 60%", why)
+
+    def test_a_setting_that_is_not_a_finite_number_is_refused(self):
+        p = os.path.join(self.tmp, "nan.json")
+        with open(p, "w") as f:
+            f.write('{"state_dir": "%s/x", "ram_headroom_gb": NaN}' % self.tmp)
+        with self.assertRaises(self.j.JobError):
+            self.j._admission_settings(p, nthreads=8)
+
+
 class Settings(unittest.TestCase):
     def setUp(self):
         import tempfile
@@ -314,6 +362,40 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(self.j._ram_at_total([[0, 0, 100, GB], [1, 1, 100, 2 * GB], [2, 2, 100, 3 * GB]]))  # 2%
         flat = [[i, 10.0 * i, 100.0, GB] for i in range(5)]
         self.assertIsNone(self.j._ram_at_total(flat))
+
+    def fake_ssh(self, script):
+        d = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        with open(os.path.join(d, "ssh"), "w") as f:
+            f.write("#!/bin/sh\ncat > /dev/null\n" + script + "\n")
+        os.chmod(os.path.join(d, "ssh"), 0o755)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = d + ":" + old
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", old))
+        import shutil
+        self.addCleanup(shutil.rmtree, d)
+
+    def test_a_host_that_gives_no_reply_is_unreachable_not_a_refusal(self):
+        self.fake_ssh("echo 'Killed' >&2; exit 137")
+        with self.assertRaises(self.j.Unreachable):
+            self.j.call("h1", "submit", {"command": "true"})
+
+    def test_a_host_that_refuses_the_command_line_is_a_refusal(self):
+        self.fake_ssh("echo 'usage: job [-h] ... invalid choice' >&2; exit 2")
+        with self.assertRaises(self.j.JobError) as e:
+            self.j.call("h1", "room", {})
+        self.assertNotIsInstance(e.exception, self.j.Unreachable)
+
+    def test_sizes_of_nothing_are_refused(self):
+        tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        self.addCleanup(__import__("shutil").rmtree, tmp)
+        s = settings(self.j, tmp)
+        adm = self.j.Admission(s)
+        cap = {"mem_total": 64 * GB, "threads": 8, "gpus": []}
+        for a, part in (({"cpus": 0, "ram": GB}, "--cpus"), ({"cpus": 1, "ram": 0}, "--ram")):
+            with self.assertRaises(self.j.JobError) as e:
+                self.j._size_from(s, adm, cap, {"admission": a})
+            self.assertIn(part, str(e.exception))
+            self.assertNotIn("admission setting", str(e.exception))
 
     def test_job_use_measures_the_disk_rate(self):
         root = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
@@ -531,6 +613,7 @@ class LoopTests(Base):
         self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
         rec = self.record(tok)
         self.assertEqual(rec["how"], "pilot time limit")
+        self.assertIn("stopped this pilot at its time limit, as planned", self.wait(tid, tok).stdout)
         self.assertGreaterEqual(rec["peak_ram"], 60 * MiB)
         r2 = self.submit_sized("echo sized", like=tok)
         self.assertTrue(r2["ok"], r2)
@@ -849,7 +932,7 @@ class LoopTests(Base):
         loop = self.loop()
         r = self.submit_sized("python3 -c 'import time; b = bytearray(120 * 1024 * 1024); time.sleep(3); del b; "
                               "time.sleep(5)'", cpus=1, ram=400 * MiB)
-        tid, tok = r["data"]["id"], r["data"]["token"]
+        tok = r["data"]["token"]
         self.assertTrue(self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= 100 * MiB, n=40))
         first = self.record(tok)["peak_ram"]
         time.sleep(3)
@@ -860,7 +943,7 @@ class LoopTests(Base):
     def test_like_refuses_a_run_measured_too_few_times(self):
         loop = self.loop()
         r = self.submit_sized("true", cpus=1, ram=100 * MiB)
-        tid, tok = r["data"]["id"], r["data"]["token"]
+        tok = r["data"]["token"]
         self.assertTrue(self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None))
         r2 = self.submit_sized("true", like=tok)
         self.assertFalse(r2["ok"])
@@ -1039,7 +1122,7 @@ class LoopTests(Base):
     def test_history_lists_records_with_their_tokens(self):
         loop = self.loop()
         r = self.submit_sized("echo hist", cpus=1, ram=100 * MiB)
-        tid, tok = r["data"]["id"], r["data"]["token"]
+        tok = r["data"]["token"]
         self.assertTrue(self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None))
         p = self.job("history", "local", "--task", "T-adm", **self.env())
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -1047,6 +1130,132 @@ class LoopTests(Base):
         self.assertIn("explicit: 1 CPU, 0.1 GB", p.stdout)
         p = self.job("history", "local", "--json", "--task", "nothing-like-this", **self.env())
         self.assertEqual(json.loads(p.stdout)["local"]["jobs"], [])
+
+    # -- review cycle 2 ----------------------------------------------------------------------------------------
+
+    def test_a_hold_granted_during_a_cycle_keeps_that_cycles_release_out(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        r = self.submit_sized("echo gpu-job", cpus=1, ram=100 * MiB, gpus=1, gpu_mem=15 * GB)
+        tid = r["data"]["id"]
+        orig, got = loop.sample, {}
+
+        def sample_then_hold(*a, **k):
+            out = orig(*a, **k)
+            got["hold"] = self.hold("--gpu", "0", "--mem", "15G", "--name", "svc", "--cgroup",
+                                    "/system.slice/model.service")
+            return out
+        loop.sample = sample_then_hold
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(got["hold"].returncode, 0, got["hold"].stderr)
+        self.assertEqual(self.status(tid), "Stashed")  # 15 GB hold + 15 GB job do not fit a 24 GB card
+
+    def test_a_hold_after_a_release_sees_the_released_job(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        r = self.submit_sized("sleep 20", cpus=1, ram=100 * MiB, gpus=1, gpu_mem=15 * GB)
+        self.host.tick()
+        loop.cycle()
+        try:
+            self.assertNotEqual(self.status(r["data"]["id"]), "Stashed")
+            p = self.hold("--gpu", "0", "--mem", "15G", "--name", "late")
+            self.assertNotEqual(p.returncode, 0)  # the job got the room first
+        finally:
+            self.job("kill", "local", str(r["data"]["id"]))
+
+    def test_an_enqueue_that_fails_after_pueue_acted_keeps_the_job_counted_and_recorded(self):
+        loop = self.loop()
+        r = self.submit_sized("sleep 2; echo ran-once", cpus=1, ram=100 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        real = self.j._pueue
+
+        def flaky(args, **kw):
+            p = real(args, **kw)
+            if args[:1] == ["enqueue"]:
+                raise self.j.JobError("pueue enqueue did not answer within 60 s")
+            return p
+        self.j._pueue = flaky
+        try:
+            self.host.tick()
+            loop.cycle()
+        finally:
+            self.j._pueue = real
+        self.assertTrue(self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=60))
+        self.assertEqual(self.record(tok)["how"], "exit")
+        self.assertIn("ran-once", self.wait(tid, tok).stdout)
+
+    def test_a_held_task_started_by_hand_is_counted_and_recorded(self):
+        self.host.set(avail=2 * GB)  # 1 GB room: the job does not fit
+        loop = self.loop()
+        r = self.submit_sized("sleep 1", cpus=1, ram=int(1.5 * GB))
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.host.tick()
+        loop.cycle()
+        self.d.pueue("enqueue", str(tid))  # a person releases it
+        self.assertTrue(self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=60))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "queue", tok + ".json")))
+
+    def test_a_retry_after_pueue_add_failed_late_runs_the_job(self):
+        tok = "ab" * 16
+        req = {"protocol": 5, "command": "echo ran-after-retry", "task": "T-adm", "cwd": self.d.dir, "session": "t",
+               "from": "t", "env": {}, "token": tok, "admission": {"cpus": 1, "ram": 100 * MiB}}
+        real = self.j._pueue
+
+        def late(args, **kw):
+            p = real(args, **kw)
+            if args[:1] == ["add"]:
+                raise self.j.JobError("pueue add did not answer within 60 s")  # it did add the task
+            return p
+        self.j._pueue = late
+        try:
+            with self.assertRaises(self.j.JobError):
+                self.j.host_submit(req)
+        finally:
+            self.j._pueue = real
+        r = self.j.host_submit(req)  # the client's retry, same token
+        self.assertFalse(r.get("existing"))
+        loop = self.loop()
+        self.assertTrue(self.cycles(loop, lambda: self.status(r["id"]) == "Done"))
+        self.assertIn("ran-after-retry", self.wait(r["id"], tok).stdout)
+        stashed = [t for t in json.loads(self.d.pueue("status", "--json").stdout)["tasks"].values()
+                   if (t.get("envs") or {}).get("JOB_TOKEN") == tok and "Stashed" in t["status"]]
+        self.assertEqual(stashed, [])
+
+    def test_a_hold_on_a_cgroup_ends_when_the_cgroup_goes(self):
+        import uuid as _uuid
+        env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
+        unit = "agent-pueue-probe-%s.scope" % _uuid.uuid4().hex[:12]
+        svc = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit, "sleep", "30"],
+                               env=env)
+        try:
+            for _ in range(50):
+                cg = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit], env=env,
+                                    capture_output=True, text=True).stdout.strip()
+                if cg:
+                    break
+                time.sleep(0.1)
+            self.model_card()
+            loop = self.loop()
+            self.host.tick()
+            loop.cycle()
+            p = self.hold("--gpu", "0", "--mem", "2G", "--name", "svc", "--cgroup", cg)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.host.tick()
+            loop.cycle()
+            self.assertEqual(len(loop.holds), 1)
+            svc.kill()
+            svc.wait()
+            subprocess.run(["systemctl", "--user", "stop", unit], env=env, capture_output=True)
+            self.assertTrue(self.cycles(loop, lambda: loop.holds == [], n=20))
+        finally:
+            if svc.poll() is None:
+                svc.kill()
+            subprocess.run(["systemctl", "--user", "reset-failed", unit], env=env, capture_output=True)
 
     def test_admission_status(self):
         p = self.job("admission", "local", "status", **self.env())
