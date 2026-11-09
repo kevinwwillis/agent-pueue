@@ -422,6 +422,23 @@ class ClientTests(unittest.TestCase):
             import shutil
             shutil.rmtree(root)
 
+    def test_a_ram_hold_on_a_host_that_predates_it_is_released_and_refused(self):
+        import argparse
+        calls = []
+
+        def old_host(host, op, req, timeout=120):
+            calls.append(req)
+            if req.get("release"):
+                return {"id": req["release"], "action": "released"}
+            return {"id": "abc123", "action": "granted", "gpu": 0, "uuid": CARD}  # no "ram": it was ignored
+        self.j.call = old_host
+        a = argparse.Namespace(host="h1", renew=None, name="svc", gpu="0", mem=GB, ram=GB, while_pid=None, unit=None,
+                               cgroup=None, ttl=None)
+        with self.assertRaises(self.j.JobError) as e:
+            self.j.cmd_hold(a)
+        self.assertIn("predates RAM holds", str(e.exception))
+        self.assertEqual(calls[-1], {"release": "abc123"})
+
     def test_history_size_text(self):
         hs = self.j._history_size
         pilot = {"cpus": 1, "ram": 4 * GB, "gpus": 2, "gpu_mem": 0}
@@ -986,6 +1003,105 @@ class LoopTests(Base):
             p = self.hold("--name", "too-big", *args)
             self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
             self.assertIn("NO_ROOM", p.stdout)
+
+    def test_a_ram_only_hold_does_not_hide_its_services_gpu_use(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "20G", "--name", "model", "--cgroup", "/system.slice/model.service")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.model_card(model_used=10 * GB)  # the service also loads 10 GB onto the card
+        loop.samples = []
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertAlmostEqual(loop.room["gpus"][CARD]["room"], 24 * GB - 0.5 * GB - 10.4 * GB, delta=1e6)
+
+    def test_a_hold_beside_a_job_released_this_cycle_keeps_the_headroom(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        r = self.submit_sized("sleep 30", cpus=1, ram=100 * MiB, gpus=1, gpu_mem=1 * GB)
+        tid = r["data"]["id"]
+        try:
+            self.host.tick()
+            loop.cycle()  # releases it; the snapshot is written in the same cycle
+            self.assertNotEqual(self.status(tid), "Stashed")
+            p = self.hold("--gpu", "0", "--mem", "22.5G", "--name", "beside-a-job")  # 22.1 GB with the headroom kept
+            self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+        finally:
+            self.job("kill", "local", str(tid))
+
+    def test_the_headroom_stays_for_another_hold_or_another_gpu_user(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "5G", "--name", "first")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        p = self.hold("--gpu", "0", "--mem", "18.5G", "--name", "second")  # 18.1 GB left with the headroom kept
+        self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+        self.model_card(model_used=2 * GB)  # a process no hold or job names uses the card
+        loop.samples = []
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        for h in list(loop.holds):
+            self.job("release", "local", h["id"], **self.env())
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "21.3G", "--name", "beside-a-user")  # 21.1 GB with the headroom kept
+        self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+
+    def test_jobs_after_a_lone_hold_keep_the_headroom(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "23.5G", "--name", "fills-the-card")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        r = self.submit_sized("echo late", cpus=1, ram=100 * MiB, gpus=1, gpu_mem=int(0.05 * GB))
+        tid = r["data"]["id"]
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertEqual(self.status(tid), "Stashed")
+
+    def test_a_ram_hold_on_a_process_ends_with_it(self):
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        svc = subprocess.Popen(["sleep", "60"])
+        try:
+            os.makedirs(os.path.join(self.host.proc, str(svc.pid)), exist_ok=True)
+            with open(os.path.join(self.host.proc, str(svc.pid), "stat"), "w") as f:
+                with open("/proc/%d/stat" % svc.pid) as real:
+                    f.write(real.read())
+            p = self.hold("--ram", "30G", "--name", "svc", "--while-pid", str(svc.pid))
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.host.tick()
+            loop.cycle()
+            self.assertAlmostEqual(loop.room["ram"]["room"], 19 * GB, delta=2 * MiB)
+            os.remove(os.path.join(self.host.proc, str(svc.pid), "stat"))  # the process has exited
+            for _ in range(2):
+                self.host.tick()
+                loop.cycle()
+            self.assertEqual(loop.holds, [])
+            self.assertAlmostEqual(loop.room["ram"]["room"], 49 * GB, delta=2 * MiB)
+        finally:
+            svc.kill()
+            svc.wait()
+
+    def test_a_hold_cgroup_must_be_absolute(self):
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "1G", "--name", "svc", "--cgroup", "system.slice/model.service")
+        self.assertEqual(p.returncode, 205, p.stdout + p.stderr)
+        self.assertIn("starting with /", p.stdout)
 
     def test_hold_options_need_gpu_with_mem_or_ram(self):
         self.model_card()

@@ -390,7 +390,11 @@ once with its own exit status (206, `NO_ROOM`), apart from admission being unava
 what to do. A caller that wants room kept for a later step registers a hold the same way.
 Holds and jobs are first come: neither displaces the other. `gpu_headroom` keeps the parties on one card
 apart, so a GPU hold on a card that has no admitted job and no other hold may use it (a model that fills the
-card); jobs admitted after it still keep it. RAM holds always keep `ram_headroom` free.
+card): no admitted job, no other hold and no other process on the card. Jobs admitted after it still keep it.
+RAM holds always keep `ram_headroom` free. A hold's own GPU use is its processes' use on its own card; their use
+on any other card counts as outside use. A service registers its hold before it loads (one registered while
+loaded is counted twice until the window passes, which only wastes room), and its cgroup must not contain
+`job`'s own scopes, whose RAM would then count twice.
 
 ## Placement (client side)
 

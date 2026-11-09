@@ -1155,9 +1155,18 @@ class Measure:
         return max(0, cur - int(stat.get("active_file", 0)) - int(stat.get("inactive_file", 0)))
 
     def pids_ram(self, pids):
-        """RssAnon + RssShmem summed over pids (file-backed pages excluded, as for a job)."""
+        """Anonymous and shared memory of pids, file-backed pages excluded (as for a job): Pss_Anon + Pss_Shmem from
+        smaps_rollup, so memory shared between them counts once; RssAnon + RssShmem where the kernel has no Pss_Anon."""
         total = 0
         for pid in pids:
+            try:
+                f = dict(ln.split(":", 1) for ln in self._read(self.proc, str(pid), "smaps_rollup").splitlines()
+                         if ":" in ln)
+                if "Pss_Anon" in f:
+                    total += sum(int(f[k].split()[0]) * 1024 for k in ("Pss_Anon", "Pss_Shmem") if k in f)
+                    continue
+            except (OSError, ValueError, IndexError):
+                pass
             try:
                 f = dict(ln.split(":", 1) for ln in self._read(self.proc, str(pid), "status").splitlines() if ":" in ln)
                 total += sum(int(f[k].split()[0]) * 1024 for k in ("RssAnon", "RssShmem") if k in f)
@@ -1347,6 +1356,7 @@ def compute_room(settings, samples, inflight, holds, now):
         out["gpus"][gid] = {
             "index": card["index"], "name": card["name"], "total": card["total"], "outside": gpu_outside,
             "jobs": jobs_counted, "holds": holds_counted, "util": util, "shares": shares,
+            "others": card.get("others", 0),
             "room": card["total"] - settings["gpu_headroom_mb"] * MB - gpu_outside - jobs_counted - holds_counted}
 
     # disks: busy time over the last minute
@@ -1735,6 +1745,7 @@ def _take(room, job, got):
     for gid in got["gpus"]:
         g = room["gpus"][gid]
         g["room"] -= got["gpu_counted"][gid]
+        g["jobs"] = g.get("jobs", 0) + got["gpu_counted"][gid]
         g["shares"] += job["size"].get("gpu_share") or 0
 
 
@@ -1931,7 +1942,7 @@ class Loop:
         hold_pids = {h["id"]: _pid_tree(self.m.proc, h["while_pid"]) for h in holds if h.get("while_pid")}
         hold_cgs = {h["id"]: _hold_cgroups(h) for h in holds if h.get("unit") or h.get("cgroup")}
         self.hold_present = {hid: any(os.path.isdir(self.m.cg + c) for c in cgs) for hid, cgs in hold_cgs.items()}
-        held_use = {}
+        held_use, others = {}, {}
         for c in cards:
             for pid, used in c["procs"].items():
                 cg = self.m.cgroup_of(pid) or ""
@@ -1941,12 +1952,17 @@ class Loop:
                         g[c["uuid"]] = g.get(c["uuid"], 0) + used
                         break
                 else:
-                    for hid in [h["id"] for h in holds]:
-                        if pid in hold_pids.get(hid, ()) or any(cg == x or cg.startswith(x + "/")
-                                                                for x in hold_cgs.get(hid, ())):
+                    # a hold's own use is its processes' use on its own card; on another card (or for a RAM-only
+                    # hold) their GPU memory is outside use, so it is never taken out of the room uncounted
+                    for h in holds:
+                        hid = h["id"]
+                        if h.get("uuid") == c["uuid"] and (pid in hold_pids.get(hid, ()) or any(
+                                cg == x or cg.startswith(x + "/") for x in hold_cgs.get(hid, ()))):
                             u = held_use.setdefault(hid, {})
                             u[c["uuid"]] = u.get(c["uuid"], 0) + used
                             break
+                    else:
+                        others[c["uuid"]] = others.get(c["uuid"], 0) + 1
         hold_ram = {}
         for h in holds:
             if not h.get("ram"):
@@ -1958,7 +1974,8 @@ class Loop:
                 hold_ram[h["id"]] = self.m.pids_ram(hold_pids[h["id"]])
         s = {"t": now, "busy": busy, "iowait": iowait or 0.0, "avail": mem.get("MemAvailable", 0),
              "psi": self.m.memory_pressure(), "disks": self.m.disks(now, set(self.disk_names.values())),
-             "gpus": {c["uuid"]: {k: c[k] for k in ("index", "name", "total", "used", "util")} for c in cards},
+             "gpus": {c["uuid"]: dict({k: c[k] for k in ("index", "name", "total", "used", "util")},
+                                     others=others.get(c["uuid"], 0)) for c in cards},
              "jobs": {tok: {"ram": j["ram"], "cpu": j["cpu"], "gpu": j.get("gpu", {})} for tok, j in jobs.items()},
              "holds": held_use, "hold_ram": hold_ram}
         self.samples.append(s)
@@ -2499,6 +2516,8 @@ def host_hold(req):
             return {"id": hid, "action": "renewed", "expires": h["expires"]}
         name, size, ram = req.get("name"), req.get("mem"), req.get("ram")
         want_gpu = req.get("gpu") is not None
+        if req.get("cgroup") is not None and not (isinstance(req["cgroup"], str) and req["cgroup"].startswith("/")):
+            raise JobError("--cgroup is a path from the cgroup root, starting with /")
         if (not isinstance(name, str) or not name or (want_gpu and (not isinstance(size, int) or size <= 0))
                 or (ram is not None and (not isinstance(ram, int) or ram <= 0)) or (not want_gpu and ram is None)
                 or (size is not None and not want_gpu)):
@@ -2527,8 +2546,9 @@ def host_hold(req):
             g, index = gpus[gid], gpus[gid]["index"]
             on_card = [h for h in newer if h.get("uuid") == gid]
             free = g["room"] - sum(h.get("size") or 0 for h in on_card)
-            if not g.get("jobs") and not g.get("holds") and not on_card:
-                # the headroom keeps parties on one card apart; a hold alone on its card may use it
+            if not g.get("jobs") and not g.get("holds") and not g.get("others", 1) and not on_card:
+                # the headroom keeps parties on one card apart; a hold alone on its card may use it (a snapshot
+                # from before the loop counted other users gives no headroom)
                 free += settings["gpu_headroom_mb"] * MB
             if size > free:
                 raise NoRoom("GPU %d on %s has %s free; the hold needs %s" % (index, socket.gethostname(),
@@ -3066,6 +3086,9 @@ def cmd_hold(args):
         r = call(args.host, "hold", {"gpu": args.gpu, "mem": args.mem, "ram": args.ram, "name": args.name,
                                      "while_pid": args.while_pid, "unit": args.unit, "cgroup": args.cgroup,
                                      "ttl": args.ttl})
+    if not args.renew and args.ram and not r.get("ram"):  # a host that predates RAM holds ignored --ram
+        call(args.host, "hold", {"release": r["id"]})
+        raise JobError("%s's job predates RAM holds (update it with install.sh); the hold was not kept" % args.host)
     print(r["id"])
     sys.stderr.write("job: hold %s %s on %s%s%s\n" % (r["id"], r["action"], args.host,
                                                      " GPU %s" % r["gpu"] if "gpu" in r else "",
