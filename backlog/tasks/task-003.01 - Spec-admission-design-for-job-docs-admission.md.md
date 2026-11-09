@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-11-09T17:00:00Z'
-updated_date: '2026-11-09T17:04:00Z'
+updated_date: '2026-11-09T17:19:00Z'
 labels: []
 dependencies: []
 parent_task_id: TASK-003
@@ -30,4 +30,6 @@ The admission work needs one written design before any code: the commands, how r
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-11-09 12:05 ET: spec written to docs/admission.md on branch feat/admission (935996f, pushed). Full review by Claude Sonnet 5.5 (sonnet) at high running.
+
+2026-11-09 12:20 ET: first full review (Claude Sonnet 5.5, sonnet, high) found 20 defects; spec rewritten (9ba8671). Set aside: moving held jobs between hosts (dropped from v1: it broke reattach and could run a job twice), --progress-from (ran caller text in the loop), --not-after (needed a total nobody supplies; replaced by --stop-at), --hold-gpu-free (replaced by job hold). Second and final review running.
 <!-- SECTION:NOTES:END -->
