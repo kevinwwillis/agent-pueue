@@ -32,7 +32,12 @@ PROTOCOL = 3
 # Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
 # option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
 PROTOCOL_PRIORITY = 4
-ACCEPTED_PROTOCOLS = (PROTOCOL, PROTOCOL_PRIORITY)
+# Protocol 5 (a superset of 4) is sent by a submit that runs the job in its own systemd scope with a memory
+# limit (admission, docs/admission.md). A host that predates it refuses such a request instead of running the
+# job without its limit.
+PROTOCOL_ADMISSION = 5
+ACCEPTED_PROTOCOLS = (PROTOCOL, PROTOCOL_PRIORITY, PROTOCOL_ADMISSION)
+SCOPE_PREFIX = "agent-pueue-job-"   # systemd scope unit of an admitted job: SCOPE_PREFIX + token + ".scope"
 
 
 def _load_hosts():
@@ -277,7 +282,9 @@ def _clean_old_files(state, in_use):
 
 
 def _request_protocol(op, req):
-    """Protocol number a client sends: 4 only for a submit that asks for normal priority."""
+    """Protocol number a client sends: 5 for a submit with a scope, 4 for one asking for normal priority."""
+    if op == "submit" and req.get("scope") is not None:
+        return PROTOCOL_ADMISSION
     if op == "submit" and req.get("normal_priority"):
         return PROTOCOL_PRIORITY
     return PROTOCOL
@@ -290,10 +297,148 @@ def _runner(script, normal_priority=False):
     return "nice -n 19 ionice -c 3 bash %s" % shlex.quote(script)
 
 
+def _check_scope(scope):
+    """Validate a scope request; return it normalized. See docs/admission.md, "Per-job scope"."""
+    if not isinstance(scope, dict):
+        raise JobError("scope must be an object")
+    mem = scope.get("memory_max")
+    if not isinstance(mem, int) or isinstance(mem, bool) or mem < (1 << 20):
+        raise JobError("scope.memory_max must be a whole number of bytes, at least 1 MiB")
+    gpus = scope.get("gpus")
+    if gpus is not None:
+        if not isinstance(gpus, list) or not all(
+                isinstance(g, str) and g and all(c.isalnum() or c in "-_:" for c in g) for g in gpus):
+            raise JobError("scope.gpus must be null or a list of GPU UUIDs")
+    gpu_env = scope.get("gpu_env") or {}
+    if not isinstance(gpu_env, dict) or not all(
+            isinstance(k, str) and k and (k[0].isalpha() or k[0] == "_") and all(c.isalnum() or c == "_" for c in k)
+            and isinstance(v, str) for k, v in gpu_env.items()):
+        raise JobError("scope.gpu_env must map variable names to strings")
+    adj = scope.get("oom_score_adj", 0)
+    if not isinstance(adj, int) or isinstance(adj, bool) or not 0 <= adj <= 1000:
+        raise JobError("scope.oom_score_adj must be a whole number from 0 to 1000")
+    return {"memory_max": mem, "gpus": gpus, "gpu_env": gpu_env, "oom_score_adj": adj}
+
+
+def _scope_scripts(token, body, record, scope):
+    """The wrapper (pueue's child, outside the scope) and the shim (inside it) of a scoped job."""
+    results = os.path.dirname(record)
+    q = shlex.quote
+    started, final, result = (os.path.join(results, token + ext) for ext in (".started", ".final", ".scope"))
+    shim_path = os.path.join(os.path.dirname(body), token + ".shim")
+    unit = SCOPE_PREFIX + token
+    systemd_run = os.environ.get("JOB_SYSTEMD_RUN") or "systemd-run"  # tests point this at a failing command
+    shim = "\n".join([
+        "#!/bin/bash",
+        "# job %s: runs inside the scope; records that the scope started and the job's final usage" % VERSION,
+        ": > %s" % q(started),
+        ("echo %d > /proc/self/oom_score_adj 2>/dev/null" % scope["oom_score_adj"]) if scope["oom_score_adj"]
+        else ":",
+        'cg="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"',
+        "bash -o pipefail %s" % q(body),
+        "rc=$?",
+        "{",
+        '  echo "cgroup=$cg"',
+        '  for f in memory.peak memory.current memory.max; do echo "$f=$(cat "$cg/$f" 2>/dev/null)"; done',
+        '  for f in memory.stat memory.events cpu.stat; do sed "s/^/$f./;s/ /=/" "$cg/$f" 2>/dev/null; done',
+        "} > %s.tmp && mv %s.tmp %s" % (q(final), q(final), q(final)),
+        "exit $rc",
+        ""])
+    wrapper = "\n".join([
+        "#!/bin/bash",
+        "# job %s: runs the job in its own systemd scope and records how it ended" % VERSION,
+        'export PATH="$HOME/.local/bin:$PATH"',
+        'export XDG_RUNTIME_DIR="/run/user/$(id -u)"',
+        "rm -f %s %s %s" % (q(started), q(final), q(result)),
+        "%s --user --scope --quiet --unit=%s -p MemoryMax=%d -p MemorySwapMax=0 -p OOMPolicy=kill -- bash %s"
+        % (q(systemd_run), q(unit), scope["memory_max"], q(shim_path)),
+        "rc=$?",
+        "{",
+        '  echo "rc=$rc"',
+        '  echo "memory_max=%d"' % scope["memory_max"],
+        "  [ -e %s ] && echo started=1 || echo started=0" % q(started),
+        "  [ -e %s ] && echo final=1 || echo final=0" % q(final),
+        "  systemctl --user show %s -p Result -p MemoryPeak -p LoadState 2>/dev/null" % q(unit + ".scope"),
+        "} > %s.tmp && mv %s.tmp %s" % (q(result), q(result), q(result)),
+        "systemctl --user reset-failed %s >/dev/null 2>&1" % q(unit + ".scope"),
+        "echo $rc > %s" % q(record),
+        "exit $rc",
+        ""])
+    return wrapper, shim_path, shim
+
+
+def _read_kv(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                k, sep, v = line.rstrip("\n").partition("=")
+                if sep:
+                    out[k] = v
+    except OSError:
+        return None
+    return out
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scope_result(token):
+    """How a scoped job ended, from the files its wrapper and shim wrote; None if it has not ended in a scope."""
+    if not token:
+        return None
+    results = os.path.join(STATE_DIR, "results")
+    kv = _read_kv(os.path.join(results, token + ".scope"))
+    if kv is None:
+        return None
+    final = _read_kv(os.path.join(results, token + ".final")) if kv.get("final") == "1" else None
+    mem_max = _int_or_none(kv.get("memory_max"))
+    peak = _int_or_none(kv.get("MemoryPeak"))  # systemd 256 and later; "[not set]" otherwise
+    out = {"rc": _int_or_none(kv.get("rc")), "memory_max": mem_max, "scope_result": kv.get("Result")}
+    if kv.get("started") != "1":
+        out["how"] = "wrapper_error"
+    elif final is not None:
+        out["how"] = "exit"
+        out["memory_peak"] = _int_or_none(final.get("memory.peak"))
+        out["memory_events"] = {k.split(".", 2)[2]: _int_or_none(v) for k, v in final.items()
+                                if k.startswith("memory.events.")}
+        out["cpu_usage_usec"] = _int_or_none(final.get("cpu.stat.usage_usec"))
+    elif kv.get("Result") == "oom-kill":
+        out["how"] = "oom"
+        out["memory_peak"] = peak
+        if peak is not None and mem_max:
+            out["hit_limit"] = peak >= mem_max * 0.98
+    else:
+        out["how"] = "killed"
+    return out
+
+
+def _stop_scope(token):
+    """Stop a job's scope (its leftover processes) and forget a failed one; errors are ignored."""
+    unit = SCOPE_PREFIX + token + ".scope"
+    env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
+    for args in (["stop", unit], ["reset-failed", unit]):
+        try:
+            subprocess.run(["systemctl", "--user"] + args, env=env, capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def host_submit(req):
     command = req["command"]
     if not isinstance(req.get("normal_priority", False), bool):
         raise JobError("normal_priority must be true or false")
+    scope = req.get("scope")
+    if scope is not None:
+        if req.get("protocol", PROTOCOL_ADMISSION) != PROTOCOL_ADMISSION:
+            raise JobError("protocol mismatch: a job with a scope needs protocol %d" % PROTOCOL_ADMISSION)
+        scope = _check_scope(scope)
+        if scope["gpus"] is not None and "CUDA_VISIBLE_DEVICES" in (req.get("env") or {}):
+            raise JobError("CUDA_VISIBLE_DEVICES is set by admission; do not pass it with --env")
     token = req.get("token") or uuid.uuid4().hex
     if not all(c in "0123456789abcdef" for c in token):
         raise JobError("bad token")
@@ -326,23 +471,40 @@ def host_submit(req):
         f.write(command)
         if not command.endswith("\n"):
             f.write("\n")
+    shim_path = None
+    if scope is not None:
+        wrapper, shim_path, shim = _scope_scripts(token, body, record, scope)
+        with open(shim_path, "w", encoding="utf-8") as f:
+            f.write(shim)
+        os.chmod(shim_path, 0o700)
     with open(script, "w", encoding="utf-8") as f:
-        f.write("#!/bin/bash\n")
-        f.write("# written by job %s for task %s at %s\n" % (
-            VERSION, req.get("task", "?"), dt.datetime.now().astimezone().isoformat()))
-        f.write('export PATH="$HOME/.local/bin:$PATH"\n')
-        # the command runs in its own bash; its exit code is recorded here, so the record
-        # survives pueue's cleanup and cannot be undone by a trap in the command
-        f.write("bash -o pipefail %s\n" % shlex.quote(body))
-        f.write("rc=$?\n")
-        f.write("echo $rc > %s\n" % shlex.quote(record))
-        f.write("exit $rc\n")
+        if scope is not None:
+            f.write(wrapper)
+        else:
+            f.write("#!/bin/bash\n")
+            f.write("# written by job %s for task %s at %s\n" % (
+                VERSION, req.get("task", "?"), dt.datetime.now().astimezone().isoformat()))
+            f.write('export PATH="$HOME/.local/bin:$PATH"\n')
+            # the command runs in its own bash; its exit code is recorded here, so the record
+            # survives pueue's cleanup and cannot be undone by a trap in the command
+            f.write("bash -o pipefail %s\n" % shlex.quote(body))
+            f.write("rc=$?\n")
+            f.write("echo $rc > %s\n" % shlex.quote(record))
+            f.write("exit $rc\n")
     os.chmod(script, 0o700)
     runner = _runner(script, req.get("normal_priority", False))
 
     env = {k: v for k, v in os.environ.items()
            if k in ENV_ALLOW or k.startswith("LC_")}
     env["PATH"] = _with_local_bin(env.get("PATH"))
+    if scope is not None:
+        # the GPUs admission assigned, by UUID so CUDA's own device order does not matter;
+        # an empty list hides every GPU from a job that did not ask for one
+        if scope["gpus"] is not None:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(scope["gpus"])
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            env["JOB_GPU_UUIDS"] = ",".join(scope["gpus"])
+        env.update(scope["gpu_env"])
     env.update(req.get("env") or {})
     env.update({
         "JOB_TOKEN": token,
@@ -356,8 +518,9 @@ def host_submit(req):
     try:
         p = _pueue(args, env=env)
     except JobError:
-        os.remove(script)
-        os.remove(body)
+        for path in (script, body, shim_path):
+            if path:
+                os.remove(path)
         raise
     try:
         task_id = int(p.stdout.strip().splitlines()[-1])
@@ -380,12 +543,15 @@ def host_probe(req):
                     code = int(f.read().strip())
                 out["record"] = {"exit": code, "end": dt.datetime.fromtimestamp(
                     os.path.getmtime(rec)).astimezone().isoformat()}
+                out["record"]["scope"] = _scope_result(want_token)
             except (OSError, ValueError):
                 pass
         return out
     s = _summarize_task(t)
     s["found"] = True
     s["token_mismatch"] = False
+    if s["status"] == "Done":
+        s["scope"] = _scope_result(s["token"])
     g = st.get("groups", {}).get(s["group"]) or {}
     s["group_parallel"] = g.get("parallel_tasks")
     s["group_running"] = sum(1 for x in st.get("tasks", {}).values()
@@ -469,6 +635,9 @@ def host_kill(req):
     status = next(iter(t.get("status") or {"?": 0}))
     if status == "Running":
         _pueue(["kill", str(tid)])
+        token = (t.get("envs") or {}).get("JOB_TOKEN")
+        if token and os.path.exists(os.path.join(STATE_DIR, "scripts", token + ".shim")):
+            _stop_scope(token)  # processes the job left behind (setsid, nohup) end with it
         return {"id": tid, "action": "killed"}
     if status in ("Queued", "Stashed", "Locked"):
         _pueue(["remove", str(tid)])
@@ -663,6 +832,33 @@ def verdict_of(s):
     return "ERRORED", EXIT["ERRORED"]
 
 
+def _gb(n):
+    return "%.2f GB" % (n / 1e9)
+
+
+def scope_verdict(verdict, code, scope):
+    """Adjust a finished job's verdict with how its scope ended. Returns (verdict, code, note or None)."""
+    if not scope:
+        return verdict, code, None
+    how = scope.get("how")
+    if how == "wrapper_error":
+        return ("WRAPPER_ERROR", EXIT["WRAPPER_ERROR"],
+                "the job's systemd scope could not be started (systemd-run exit %s), so the job never ran; "
+                "the log shows why" % scope.get("rc"))
+    if how == "oom":
+        limit = scope.get("memory_max")
+        if scope.get("hit_limit") is True:
+            why = "it went over its RAM limit of %s" % _gb(limit)
+        elif scope.get("hit_limit") is False:
+            why = ("it was killed for memory by the host's out-of-memory killer (peak %s, below its RAM limit "
+                   "of %s)" % (_gb(scope["memory_peak"]), _gb(limit)))
+        else:
+            why = ("it was killed for memory: it went over its RAM limit of %s, or the host ran out of memory"
+                   % _gb(limit))
+        return verdict, code, "%s; the whole job was stopped" % why
+    return verdict, code, None
+
+
 def report(host, o, out):
     s, verdict, code = o["s"], o["verdict"], o["code"]
     label = s.get("label") or "-"
@@ -780,9 +976,11 @@ class Waiter:
                 stub = {"id": self.tid, "status": "Done", "end": rec["end"],
                         "result": "Success" if rec["exit"] == 0 else "Failed", "result_value": rec["exit"]}
                 verdict, code = verdict_of(stub)
+                verdict, code, why_scope = scope_verdict(verdict, code, rec.get("scope"))
+                note = ("%s (its pueue entry was removed); the exit code comes from the job's own record; "
+                        "the log is gone" % why)
                 return self._outcome(verdict, code, stub, tail=False,
-                                     note="%s (its pueue entry was removed); the exit code comes from "
-                                          "the job's own record; the log is gone" % why)
+                                     note=(why_scope + ". " + note) if why_scope else note)
             return self._outcome("GONE", EXIT["GONE"], {"id": self.tid},
                                  note="%s; the job left no exit record (removed before it ran, or killed "
                                       "outright)" % why, tail=False)
@@ -818,7 +1016,8 @@ class Waiter:
 
         if status == "Done":
             verdict, code = verdict_of(s)
-            return self._outcome(verdict, code, s)
+            verdict, code, note = scope_verdict(verdict, code, s.get("scope"))
+            return self._outcome(verdict, code, s, note=note)
 
         if status != "Running":  # queued, paused, stashed: not a stall
             self.samples = []
