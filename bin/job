@@ -2518,9 +2518,42 @@ def _scope_probe(env):
     return None
 
 
+HISTORY_FIELDS = ("token", "task", "session", "pueue_id", "submitted", "released", "started", "ended", "exit", "how",
+                  "size", "size_source", "like_from", "pilot", "peak_cpu", "peak_ram", "memory_peak", "peak_gpu_mem",
+                  "peak_samples", "peak_disk_mb_s", "projected_end")
+
+
+def host_history(req):
+    """This host's admission records, newest first, optionally for one task or session."""
+    settings = _admission_settings()
+    if settings is None:
+        return {"admission": False, "hostname": socket.gethostname(), "jobs": []}
+    where, vals = [], []
+    for k in ("task", "session", "token"):
+        if isinstance(req.get(k), str) and req[k]:
+            where.append("%s = ?" % k)
+            vals.append(req[k])
+    limit = req.get("limit") if isinstance(req.get("limit"), int) and 0 < req["limit"] <= 10000 else 50
+    con = Admission(settings).db()
+    try:
+        rows = con.execute("SELECT %s FROM jobs%s ORDER BY submitted DESC LIMIT %d" % (
+            ", ".join(HISTORY_FIELDS), (" WHERE " + " AND ".join(where)) if where else "", limit), vals).fetchall()
+    finally:
+        con.close()
+    jobs = []
+    for r in rows:
+        j = dict(zip(HISTORY_FIELDS, r))
+        try:
+            j["size"] = json.loads(j["size"]) if j["size"] else None
+        except ValueError:
+            j["size"] = None
+        jobs.append(j)
+    return {"admission": True, "hostname": socket.gethostname(), "jobs": jobs}
+
+
 HOST_OPS = {"submit": host_submit, "probe": host_probe, "ls": host_ls,
             "group": host_group, "kill": host_kill, "room": host_room, "admission": host_admission,
-            "hold": host_hold}
+            "hold": host_hold, "history": host_history}
 
 
 def host_main(op):
@@ -3309,6 +3342,58 @@ def cmd_wait(args):
     return wait_all(args.host, [_waiter(args, tid, args.token) for tid in args.ids], poll=args.poll)
 
 
+def cmd_history(args):
+    hosts = args.hosts or _placement_hosts()
+    req = {k: getattr(args, k) for k in ("task", "session", "token") if getattr(args, k)}
+    req["limit"] = args.limit
+    out = {}
+
+    def fetch(h):
+        try:
+            out[h] = call(h, "history", req, timeout=60)
+        except (JobError, Unreachable) as e:
+            text = str(e)
+            out[h] = "its job predates admission" if ("invalid choice" in text or "usage:" in text) else text
+    threads = [threading.Thread(target=fetch, args=(h,)) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if args.json:
+        print(json.dumps(out, indent=1, default=str))
+        return 0
+
+    def when(t):
+        return dt.datetime.fromtimestamp(t).astimezone().strftime("%m-%d %H:%M") if t else "-"
+    rows = []
+    for h in hosts:
+        r = out.get(h)
+        if not isinstance(r, dict):
+            sys.stderr.write("job: %s: %s\n" % (h, r))
+            continue
+        for j in r["jobs"]:
+            z = j.get("size") or {}
+            size = "%g CPU, %s%s" % (z.get("cpus") or 0, _gbs(z.get("ram") or 0),
+                                     ", %d GPU %s" % (z["gpus"], _gbs(z.get("gpu_mem") or 0)) if z.get("gpus") else "")
+            peaks = "-" if not j.get("peak_samples") else "%.1f CPU, %s%s (%d samples)" % (
+                j.get("peak_cpu") or 0, _gbs(j.get("peak_ram") or 0),
+                ", GPU %s" % _gbs(j["peak_gpu_mem"]) if j.get("peak_gpu_mem") else "", j["peak_samples"])
+            state = j.get("how") or ("running" if j.get("started") else "held" if not j.get("released") else "released")
+            if j.get("exit") not in (None, 0):
+                state += " (exit %s)" % j["exit"]
+            rows.append((h, str(j.get("pueue_id") or "-"), j.get("task") or "-", when(j.get("ended") or
+                         j.get("started") or j.get("submitted")), state, "%s: %s" % (j.get("size_source"), size),
+                         peaks, j.get("token") or ""))
+    head = ("HOST", "ID", "TASK", "WHEN", "ENDED BY", "SIZE", "PEAKS", "TOKEN")
+    if not rows:
+        print("no records on the admission hosts asked")
+        return 0
+    widths = [max(len(r[i]) for r in rows + [head]) for i in range(len(head))]
+    for r in [head] + rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip())
+    return 0
+
+
 def cmd_ls(args):
     if args.hosts:
         hosts = args.hosts
@@ -3465,6 +3550,14 @@ def build_parser():
     q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
     q.add_argument("action", choices=("start", "stop", "status"))
 
+    q = sub.add_parser("history", help="admission records: sizes, peaks and how each job ended (newest first)")
+    q.add_argument("hosts", nargs="*", help="hosts to ask (default: all)")
+    q.add_argument("--task", default=None, help="only this task id")
+    q.add_argument("--session", default=None, help="only this session")
+    q.add_argument("--token", default=None, help="only this job")
+    q.add_argument("--limit", type=int, default=50, help="records per host (default 50)")
+    q.add_argument("--json", action="store_true", help="print the records as JSON")
+
     q = sub.add_parser("room", help="free room on admission hosts")
     q.add_argument("hosts", nargs="*", help="hosts to show (default: all)")
     q.add_argument("--json", action="store_true", help="print the hosts' snapshots as JSON")
@@ -3514,7 +3607,7 @@ def main(argv=None):
                          % (args.host, ", ".join(HOSTS), HOSTS_FILE, EXIT["WRAPPER_ERROR"]))
         return EXIT["WRAPPER_ERROR"]
     handlers = {"run": cmd_run, "submit": lambda a: cmd_run(a, queue_only=True), "wait": cmd_wait,
-                "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill, "room": cmd_room, "admission": cmd_admission,
+                "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill, "room": cmd_room, "admission": cmd_admission, "history": cmd_history,
                 "hold": cmd_hold, "release": cmd_release}
     try:
         return handlers[args.cmd](args)

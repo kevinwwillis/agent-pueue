@@ -1036,6 +1036,18 @@ class LoopTests(Base):
         finally:
             self.job("kill", "local", str(tid))
 
+    def test_history_lists_records_with_their_tokens(self):
+        loop = self.loop()
+        r = self.submit_sized("echo hist", cpus=1, ram=100 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.assertTrue(self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None))
+        p = self.job("history", "local", "--task", "T-adm", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(tok, p.stdout)
+        self.assertIn("explicit: 1 CPU, 0.1 GB", p.stdout)
+        p = self.job("history", "local", "--json", "--task", "nothing-like-this", **self.env())
+        self.assertEqual(json.loads(p.stdout)["local"]["jobs"], [])
+
     def test_admission_status(self):
         p = self.job("admission", "local", "status", **self.env())
         self.assertIn("settings valid", p.stdout)

@@ -4,7 +4,7 @@ Status: spec for TASK-003 (written 2026-11-09 12:05 ET; revised 12:20 and 12:50 
 "Per-job scope" revised 13:10 ET after a code review). Built so far: the per-job scope (job 0.6.0, protocol 5,
 used only by a submit that carries a scope), then the loop, held submits, records, the client commands
 (`--cpus/--ram/...`, `job run auto`, `job room`), holds and the loop's service command (all in job 0.6.0, not yet
-released), and progress files with projected ends and the RAM-trend alert. Not built yet: `job history`, and
+released), progress files with projected ends and the RAM-trend alert, and `job history`. Not built yet:
 rented machines as hosts (`hosts.d`).
 
 ## Why
@@ -341,7 +341,9 @@ commits before it takes the lock.
 - `samples`: per-resource values, kept 7 days; `recent`: the loop's last samples in full.
 - `holds`: id, name, card, size, start, end, and how it ended.
 
-Peaks are kept for good. `job history` reads every host's records over the same ssh channel as `job ls`.
+Peaks are kept for good. `job history [HOST ...] [--task T] [--session S] [--token X]` reads every admission
+host's records over the same ssh channel as `job ls`: newest first, each with its size, peaks, how it ended
+and its token (for `--like`).
 
 ### Alerts
 
@@ -390,7 +392,7 @@ Not built yet: rented machines appear as hosts when a deployment's tooling write
   clients report it as a version problem) and says to update `job` on the submitting machine. The check is in
   `host_submit` itself, so it also applies to `local`, which skips `host_main`.
 - Probes stay at protocol 3; an admission host adds held reasons and alerts to the reply.
-- New operations (`room`, `hold`, `admission`) on a host that predates them fail with a usage error (exit 2,
+- New operations (`room`, `hold`, `admission`, `history`) on a host that predates them fail with a usage error (exit 2,
   no JSON); `job room` shows that host as `its job predates admission`.
 - Rollout: install the new `bin/job` on every machine first. No host has a settings file yet, so nothing changes.
   Then turn admission on one host at a time: add the settings file, start the loop, check it, then the next. No
