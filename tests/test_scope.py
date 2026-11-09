@@ -112,19 +112,52 @@ class ScopeTests(Base):
         tid, token = self.submitted(
             'cg="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; '
             'echo "max=$(cat $cg/memory.max) swap=$(cat $cg/memory.swap.max) group=$(cat $cg/memory.oom.group) '
-            'adj=$(cat /proc/self/oom_score_adj) nice=$(cut -d" " -f19 /proc/self/stat) at=$(basename $(dirname $cg))/$(basename $cg)"',
+            'adj=$(cat /proc/self/oom_score_adj) nice=$(cut -d" " -f19 /proc/self/stat) at=$(basename $(dirname $cg))/$(basename $cg) '
+            'weight=$(cat $(dirname $cg)/cpu.weight)"',
             memory_max=200 * MiB)
         p = self.wait(tid, token)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("max=%d swap=0 group=1 adj=500 nice=19 at=agent-pueue-job-%s.scope/job" % (200 * MiB, token),
-                      p.stdout)
+        self.assertIn("max=%d swap=0 group=1 adj=500 nice=19 at=agent-pueue-job-%s.scope/job weight=1"
+                      % (200 * MiB, token), p.stdout)
+
+    def test_a_limit_off_the_page_size_still_runs(self):
+        tid, token = self.submitted("echo ran", memory_max=100 * MiB + 1)
+        p = self.wait(tid, token)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("ran", p.stdout)
+
+    def test_ls_shows_the_same_verdict_as_wait(self):
+        tid, token = self.submitted("true", proc_env={"HOME": self.fake_home("exit 1")})
+        self.assertEqual(self.wait(tid, token).returncode, 205)
+        p = self.job("ls", "local")
+        line = [x for x in p.stdout.splitlines() if x.split()[1:2] == [str(tid)]]
+        self.assertTrue(line and "WRAPPER_ERROR" in line[0], p.stdout)
+
+    def test_a_kill_record_after_the_job_ended_is_ignored(self):
+        tid, token = self.submitted("python3 -c 'b = bytearray(300 * 1024 * 1024)'", memory_max=100 * MiB)
+        self.wait(tid, token)
+        jobmod = self.load_job()
+        jobmod.STATE_DIR = os.path.join(self.d.dir, "state", "agent-pueue")
+        time.sleep(0.05)
+        jobmod._snapshot_kill(token)  # a job kill that arrived just after the job ended on its own
+        self.assertEqual(jobmod._scope_result(token)["how"], "memory_limit")
+
+    def test_late_memory_kill_after_a_clean_exit_keeps_success(self):
+        tid, token = self.submitted(
+            "setsid python3 -c 'import time; time.sleep(0.3); b = bytearray(300 * 1024 * 1024)' & echo done",
+            memory_max=100 * MiB)
+        p = self.wait(tid, token)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("job: SUCCESS", p.stdout)
+        self.assertNotIn("went over its RAM limit", p.stdout)
 
     def test_normal_priority_scoped_job_runs_at_nice_0(self):
-        reply = self.host_submit("cut -d' ' -f19 /proc/self/stat", extra={"normal_priority": True})
+        reply = self.host_submit('echo "nice=$(cut -d" " -f19 /proc/self/stat) weight=$(cat /sys/fs/cgroup$(sed -n '
+                                 '"s/^0:://p" /proc/self/cgroup)/../cpu.weight)"', extra={"normal_priority": True})
         self.assertTrue(reply["ok"], reply)
         p = self.wait(reply["data"]["id"], reply["data"]["token"])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertRegex(p.stdout, r"(?m)^\s*0$")
+        self.assertIn("nice=0 weight=100", p.stdout)
 
     def test_host_out_of_memory_is_told_apart_from_the_jobs_limit(self):
         jobmod = self.load_job()

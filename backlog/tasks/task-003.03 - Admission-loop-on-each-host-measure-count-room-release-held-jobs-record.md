@@ -1,10 +1,11 @@
 ---
 id: TASK-003.03
 title: 'Admission loop on each host: measure, count room, release held jobs, record'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-11-09T17:00:00Z'
-updated_date: '2026-11-09T17:49:00Z'
+updated_date: '2026-11-09T18:35:00Z'
 labels: []
 dependencies:
   - TASK-003.01
@@ -33,4 +34,6 @@ One loop per host is the only thing that starts admitted jobs, so two jobs canno
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-11-09 12:50 ET, two spec changes for the loop (my calls, from writing the first deployment's settings): (1) 'disks' becomes a list of paths; the loop finds each path's block device at start (mountinfo major:minor to /sys/dev/block), because sdX names change between boots. (2) New setting iowait_max_pct (host iowait, the measure that deployment's dial uses). A heavy-disk job (earlier run over disk_heavy_mb_s) waits while its data's disk is busier than disk_busy_max_pct, or while host iowait is over iowait_max_pct and its disk is the busiest listed disk, so jobs on quiet disks still start. Update docs/admission.md 'Host settings file' and 'Room' with the loop code.
+
+2026-11-09 13:35 ET: first version written in bin/job: settings file (validated, unknown keys refused, invalid file refuses every submit), Measure (/proc stat, meminfo, memory PSI, diskstats; GPUs through NVML via ctypes with nvidia-smi fallback; job scopes found under the user manager; RAM basis memory.current minus file cache; GPU processes mapped to jobs by cgroup), compute_room and fits (RAM at the window low, CPU outside use with older jobs at measured use, GPU outside use as the lower of two passes, best-fit card, GPU busy, disk and iowait rule, memory pressure), fits_empty refusal at submit, held submits (queue file, pueue add --stashed, group sched), fit_now, release under the queue lock with an assignment file the wrapper reads (RAM limit, GPU UUIDs), fairness (an older job short of room that would fit once admitted jobs end blocks younger ones that take that room), pilots (all the RAM room, stopped at their time limit), --like from records (refuses lower-bound runs), --stop-at, records in sqlite with peaks, alerts (group paused, GPU over size), room snapshot, heartbeat, leftover scope clean-up, job _admit with re-exec on install. My calls: GPUs and pilot RAM are decided at release, so the wrapper reads an assignment file the loop writes before pueue enqueue; --like is resolved on the host from its records. Found by tests: the kernel rounds memory.max to pages. 29 admission tests pass. Not yet: holds, the systemd unit, client flags (TASK-003.04), a test on a real server.
 <!-- SECTION:NOTES:END -->
