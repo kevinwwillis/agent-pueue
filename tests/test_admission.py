@@ -9,6 +9,8 @@ Run: python3 -m unittest discover -s tests -v
 
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -419,6 +421,57 @@ class ClientTests(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(root)
+
+    def test_history_size_text(self):
+        hs = self.j._history_size
+        pilot = {"cpus": 1, "ram": 4 * GB, "gpus": 2, "gpu_mem": 0}
+        self.assertEqual(hs({"pilot": 0, "size": {"cpus": 2, "ram": 8 * GB, "gpus": 1, "gpu_mem": 3 * GB}}),
+                         "2 CPU, 8.0 GB, 1 GPU 3.0 GB")
+        self.assertEqual(hs({"pilot": 1, "size": pilot}), "1 CPU, 2 GPU, to be counted at the free room at its release")
+        released = {"pilot": 1, "size": pilot, "released": 1.0, "ram_counted": 50 * GB, "memory_max": 50 * GB,
+                    "gpu_counted": {CARD: 10 * GB, CARD2: 20 * GB}}
+        self.assertEqual(hs(released), "1 CPU, 50.0 GB, 2 GPU (10.0 GB, 20.0 GB) (the free room at its release)")
+        self.assertEqual(hs(dict(released, gpu_counted=None)), "1 CPU, 50.0 GB, 2 GPU (the free room at its release)")
+        by_hand = {"pilot": 1, "size": pilot, "released": 1.0, "ram_counted": 4 * GB, "memory_max": None,
+                   "gpu_counted": {}}
+        self.assertEqual(hs(by_hand), "1 CPU, 2 GPU, not released by the loop")
+        old = {"pilot": 1, "size": pilot, "released": 1.0, "started": 2.0}  # a record from before these fields
+        self.assertEqual(hs(old), "1 CPU, 2 GPU, room counted not recorded")
+
+
+class RecordsFile(unittest.TestCase):
+    """The records database, opened by the loop and by host operations at the same time."""
+
+    def test_two_processes_upgrading_an_old_records_file_both_succeed(self):
+        j = load()
+        old = [f for f in j.RECORD_FIELDS if f not in ("ram_counted", "gpu_counted", "memory_max")]
+        opener = ("import importlib.machinery, importlib.util, os, sys\n"
+                  "loader = importlib.machinery.SourceFileLoader('jobmod', sys.argv[1])\n"
+                  "spec = importlib.util.spec_from_loader('jobmod', loader)\n"
+                  "m = importlib.util.module_from_spec(spec); loader.exec_module(m)\n"
+                  "a = m.Admission.__new__(m.Admission); a.path = lambda *p: os.path.join(sys.argv[2], *p)\n"
+                  "while not os.path.exists(os.path.join(sys.argv[2], 'go')): pass\n"
+                  "a.db().close()\n")
+        for _ in range(8):
+            d = tempfile.mkdtemp()
+            try:
+                c = sqlite3.connect(os.path.join(d, "admission.sqlite"))
+                c.execute("CREATE TABLE jobs (%s, PRIMARY KEY (token))" % ", ".join(old))
+                c.commit()
+                c.close()
+                ps = [subprocess.Popen([sys.executable, "-c", opener, JOB, d], stderr=subprocess.PIPE, text=True)
+                      for _ in range(2)]
+                time.sleep(0.5)  # both loaded and waiting
+                open(os.path.join(d, "go"), "w").close()
+                for p in ps:
+                    _, err = p.communicate(timeout=60)
+                    self.assertEqual(p.returncode, 0, err)
+                c = sqlite3.connect(os.path.join(d, "admission.sqlite"))
+                have = {r[1] for r in c.execute("PRAGMA table_info(jobs)")}
+                c.close()
+                self.assertEqual(have, set(j.RECORD_FIELDS))
+            finally:
+                shutil.rmtree(d)
 
 
 class FakeHost:
@@ -1128,8 +1181,23 @@ class LoopTests(Base):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn(tok, p.stdout)
         self.assertIn("explicit: 1 CPU, 0.1 GB", p.stdout)
+        rec = self.record(tok)
+        self.assertEqual(rec["ram_counted"], 100 * MiB)  # a sized job is counted at its size
+        self.assertEqual(rec["memory_max"], self.j._whole_pages(max(int(100 * MiB * 1.5), self.j.SCOPE_MIN_MEMORY)))
         p = self.job("history", "local", "--json", "--task", "nothing-like-this", **self.env())
         self.assertEqual(json.loads(p.stdout)["local"]["jobs"], [])
+
+    def test_the_first_cycle_after_a_start_has_disk_readings(self):
+        # without them a disk-heavy job could be released past a busy disk in the first cycle after a restart
+        self.write_settings(disks=["/"])
+        with open(os.path.join(self.host.proc, "diskstats"), "w") as f:
+            f.write("   8       0 sda 1 0 0 0 1 0 0 0 0 1000 1000 0 0 0 0 0 0\n")
+        m = self.j.Measure(proc=self.host.proc, gpu_file=self.host.gpu_file)
+        m.disk_of = lambda path: "sda"
+        loop = self.j.Loop(self.settings, measure=m)
+        self.host.tick()
+        loop.cycle()
+        self.assertIn("sda", loop.samples[-1]["disks"])
 
     def test_history_shows_what_a_pilot_was_counted_at(self):
         self.model_card()
@@ -1138,23 +1206,70 @@ class LoopTests(Base):
         self.assertTrue(r["ok"], r)
         tid, tok = r["data"]["id"], r["data"]["token"]
         p = self.job("history", "local", "--task", "T-adm", **self.env())
-        self.assertIn("pilot: 1 CPU, 1 GPU, all the free room at its start", p.stdout)
+        self.assertIn("pilot: 1 CPU, 1 GPU, to be counted at the free room at its release", p.stdout)
         try:
             self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
             rec = self.record(tok)
-            self.assertGreater(rec["ram_counted"], 4 * GB)  # not the placeholder size
-            self.assertEqual(rec["memory_max"], self.j._whole_pages(rec["ram_counted"]))
+            # the fake host has 50 GB available and a 1 GB reserve; the card 24 GB, 0.4 GB in use, 0.5 GB reserve
+            self.assertAlmostEqual(rec["ram_counted"], 49 * GB, delta=MiB)
+            with open(os.path.join(self.state, "assign", tok + ".env")) as f:
+                applied = dict(line.strip().split("=", 1) for line in f if "=" in line)
+            self.assertEqual(rec["memory_max"], int(applied["JOB_MEMORY_MAX"]))  # the limit the job was given
             gpu = json.loads(rec["gpu_counted"])
             self.assertEqual(list(gpu), [CARD])
-            self.assertGreater(gpu[CARD], 20 * GB)
+            self.assertAlmostEqual(gpu[CARD], 24 * GB - int(0.4 * GB) - 500 * 10 ** 6, delta=MiB)
             p = self.job("history", "local", "--task", "T-adm", **self.env())
-            self.assertIn("1 GPU %.1f GB (all the free room at its start)" % (gpu[CARD] / GB), p.stdout)
+            self.assertIn("pilot: 1 CPU, %s, 1 GPU (%s) (the free room at its release)" % (
+                self.j._gbs(rec["ram_counted"]), self.j._gbs(gpu[CARD])), p.stdout)
             p = self.job("history", "local", "--json", "--task", "T-adm", **self.env())
             j = [x for x in json.loads(p.stdout)["local"]["jobs"] if x["token"] == tok][0]
             self.assertEqual(j["memory_max"], rec["memory_max"])
             self.assertEqual(j["gpu_counted"], gpu)
+            # a record write lost at release (or a release by a loop before these fields) is filled in next cycle
+            con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"))
+            con.execute("UPDATE jobs SET ram_counted = NULL, gpu_counted = NULL, memory_max = NULL WHERE token = ?",
+                        (tok,))
+            con.commit()
+            con.close()
+            self.host.tick()
+            loop.cycle()
+            self.assertEqual(self.record(tok)["memory_max"], rec["memory_max"])
+            self.assertEqual(self.record(tok)["gpu_counted"], rec["gpu_counted"])
         finally:
             self.job("kill", "local", str(tid))
+
+    def test_a_job_held_again_loses_its_release_in_the_record(self):
+        self.host.set(avail=2 * GB)  # 1 GB room: the job does not fit, so it stays held once held again
+        loop = self.loop()
+        r = self.submit_sized("sleep 1", cpus=1, ram=int(1.5 * GB))
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        qpath = os.path.join(self.state, "queue", tok + ".json")
+        with open(qpath) as f:
+            q = json.load(f)
+        q.update(state="released", released=time.time(), gpus=[], ram_counted=q["size"]["ram"], gpu_counted={},
+                 memory_max=3 * GB)
+        with open(qpath, "w") as f:  # what a loop stopped between saving and pueue enqueue leaves
+            json.dump(q, f)
+        con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"))
+        con.execute("UPDATE jobs SET released = ?, ram_counted = ?, memory_max = ? WHERE token = ?",
+                    (q["released"], q["ram_counted"], 3 * GB, tok))
+        con.commit()
+        con.close()
+        self.host.tick()
+        loop.cycle()
+        rec = self.record(tok)
+        self.assertEqual(self.status(tid), "Stashed")
+        self.assertIsNone(rec["released"])
+        self.assertIsNone(rec["memory_max"])
+        self.assertIsNone(rec["ram_counted"])
+        p = self.job("history", "local", "--task", "T-adm", **self.env())
+        self.assertIn(" held ", p.stdout)
+        self.d.pueue("enqueue", str(tid))  # a person starts it: with no assignment its wrapper ends it at once
+        self.assertTrue(self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=60))
+        rec = self.record(tok)
+        self.assertEqual(rec["exit"], 205)
+        self.assertIsNone(rec["memory_max"])
+        self.assertEqual(rec["ram_counted"], int(1.5 * GB))
 
     # -- review cycle 2 ----------------------------------------------------------------------------------------
 

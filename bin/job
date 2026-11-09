@@ -1488,10 +1488,19 @@ class Admission:
     def db(self):
         con = sqlite3.connect(self.path("admission.sqlite"), timeout=30)
         con.execute("CREATE TABLE IF NOT EXISTS jobs (%s, PRIMARY KEY (token))" % ", ".join(RECORD_FIELDS))
-        have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
-        for col in RECORD_FIELDS:
-            if col not in have:  # a records file from an older job
-                con.execute("ALTER TABLE jobs ADD COLUMN %s" % col)
+        if set(RECORD_FIELDS) - {r[1] for r in con.execute("PRAGMA table_info(jobs)")}:
+            # a records file from an older job: add the missing columns under the write lock, read again inside
+            # it, so two processes upgrading the file at once do not both add the same column
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
+                for col in RECORD_FIELDS:
+                    if col not in have:
+                        con.execute("ALTER TABLE jobs ADD COLUMN %s" % col)
+                con.commit()
+            except BaseException:
+                con.close()
+                raise
         con.execute("CREATE TABLE IF NOT EXISTS samples (t REAL, kind TEXT, key TEXT, value REAL)")
         con.execute("CREATE TABLE IF NOT EXISTS recent (t REAL, sample TEXT)")  # the loop's windows, kept over restarts
         con.execute("CREATE INDEX IF NOT EXISTS samples_t ON samples (t)")
@@ -1851,7 +1860,8 @@ class Loop:
         self.holds = []
         self.hold_present = {}  # hold id -> whether the unit or cgroup it names exists, from the last sample
         self.alerts_cleaned = 0.0
-        self.m.cpu(self.clock())  # so the first cycle has a CPU reading
+        self.m.cpu(self.clock())  # so the first cycle has CPU and disk readings
+        self.m.disks(self.clock(), set(self.disk_names.values()))
         con = self.adm.db()
         try:  # the windows carry on from before a restart (an install re-executes the loop)
             rows = con.execute("SELECT sample FROM recent WHERE t >= ? ORDER BY t", (self.clock() - self.keep_s,))
@@ -1983,13 +1993,13 @@ class Loop:
             status = _task_status(t)
             u = use.get(q["token"])
             if q.get("state") == "held" and t is not None and status not in ("Stashed", "Locked", None):
-                # started though the loop did not release it (an enqueue that failed after pueue acted, or a
-                # person): count it from now, so it holds room and ends with a record
+                # started though the loop did not release it (a person enqueued it): it has no assignment, so its
+                # wrapper ends it at once; count it at its size until then, with no RAM limit and no GPUs recorded
                 q.update({"state": "released", "released": now, "gpus": [], "ram_counted": q["size"]["ram"],
-                          "gpu_counted": {}, "reason": None})
+                          "gpu_counted": {}, "memory_max": None, "reason": None})
                 self.adm.save(q)
-                self.adm.record(con, {"token": q["token"], "released": now, "ram_counted": q["ram_counted"],
-                                      "gpu_counted": {}})
+                self.adm.record(con, {"token": q["token"], "released": now, "gpus": [], "ram_counted": q["ram_counted"],
+                                      "gpu_counted": {}, "memory_max": None})
             if q.get("state") == "held":
                 if t is None:  # removed before release, or still being added: give a submit time to finish
                     if now - q["submitted"] > 120:
@@ -2000,8 +2010,12 @@ class Loop:
                 continue
             # released
             if status == "Stashed":  # marked released, but the loop stopped before pueue enqueue: hold it again
-                q.update({"state": "held", "reason": None})
+                q.update({"state": "held", "reason": None, "released": None})
+                for k in ("gpus", "ram_counted", "gpu_counted", "memory_max"):
+                    q.pop(k, None)
                 self.adm.save(q)
+                self.adm.record(con, {"token": q["token"], "released": None, "gpus": [], "ram_counted": None,
+                                      "gpu_counted": None, "memory_max": None})
                 try:
                     os.remove(self.adm.assign_path(q["token"]))
                 except FileNotFoundError:
@@ -2088,11 +2102,14 @@ class Loop:
 
     def record_peaks(self, con, q, final):
         p = self.peaks.get(q["token"]) or self._stored_peaks(con, q["token"])
-        self.adm.record(con, {"token": q["token"], "released": q.get("released"), "started": q.get("started"),
-                              "gpus": q.get("gpus", []), "peak_cpu": p["cpu"], "peak_ram": p["ram"],
-                              "peak_gpu_mem": p["gpu"], "peak_samples": p["n"], "peak_disk_mb_s": p["disk"],
-                              "peaks_final": int(final), "progress": q.get("progress"),
-                              "projected_end": q.get("projected_end")})
+        row = {"token": q["token"], "released": q.get("released"), "started": q.get("started"),
+               "gpus": q.get("gpus", []), "peak_cpu": p["cpu"], "peak_ram": p["ram"],
+               "peak_gpu_mem": p["gpu"], "peak_samples": p["n"], "peak_disk_mb_s": p["disk"],
+               "peaks_final": int(final), "progress": q.get("progress"), "projected_end": q.get("projected_end")}
+        for k in ("ram_counted", "gpu_counted", "memory_max"):  # also written at release; a write lost there
+            if k in q:                                           # (or a loop before records kept them) is filled in
+                row[k] = q[k]
+        self.adm.record(con, row)
 
     def end(self, con, q, now, how, t):
         """A job ended (or left the queue): write its final record and forget it."""
@@ -3436,6 +3453,27 @@ def cmd_wait(args):
     return wait_all(args.host, [_waiter(args, tid, args.token) for tid in args.ids], poll=args.poll)
 
 
+def _history_size(j):
+    """The SIZE text of a record in job history. A pilot is counted at, and limited to, the free room at its
+    release, not at its size (which holds only its CPUs and GPU count; its RAM and GPU memory are placeholders)."""
+    z = j.get("size") or {}
+    cpus, ngpu = z.get("cpus") or 0, z.get("gpus") or 0
+    if not j.get("pilot"):
+        return "%g CPU, %s%s" % (cpus, _gbs(z.get("ram") or 0),
+                                 ", %d GPU %s" % (ngpu, _gbs(z.get("gpu_mem") or 0)) if ngpu else "")
+    base = "%g CPU%s" % (cpus, ", %d GPU" % ngpu if ngpu else "")
+    if j.get("memory_max") is not None:  # released by the loop
+        gc = list((j.get("gpu_counted") or {}).values())
+        gpus = (", %d GPU (%s)" % (len(gc), ", ".join(_gbs(v) for v in gc)) if gc
+                else ", %d GPU" % ngpu if ngpu else "")
+        return "%g CPU, %s%s (the free room at its release)" % (cpus, _gbs(j.get("ram_counted") or 0), gpus)
+    if j.get("ram_counted") is not None:
+        return base + ", not released by the loop"
+    if not j.get("released") and not j.get("started"):
+        return base + ", to be counted at the free room at its release"
+    return base + ", room counted not recorded"
+
+
 def cmd_history(args):
     hosts = args.hosts or _placement_hosts()
     req = {k: getattr(args, k) for k in ("task", "session", "token") if getattr(args, k)}
@@ -3466,22 +3504,7 @@ def cmd_history(args):
             sys.stderr.write("job: %s: %s\n" % (h, r))
             continue
         for j in r["jobs"]:
-            z = j.get("size") or {}
-            # a pilot the loop released was counted at, and limited to, all the free room then, not at a size; one
-            # that started without a release (memory_max not recorded) was counted at its size
-            if j.get("pilot") and (j.get("ram_counted") is None or j.get("memory_max") is not None):
-                gc = [v for v in (j.get("gpu_counted") or {}).values()]
-                if j.get("ram_counted") is None:
-                    size = "%g CPU%s, all the free room at its start" % (
-                        z.get("cpus") or 0, ", %d GPU" % z["gpus"] if z.get("gpus") else "")
-                else:
-                    size = "%g CPU, %s%s (all the free room at its start)" % (
-                        z.get("cpus") or 0, _gbs(j["ram_counted"]),
-                        ", %d GPU %s" % (len(gc), " + ".join(_gbs(v) for v in gc)) if gc else "")
-            else:
-                size = "%g CPU, %s%s" % (z.get("cpus") or 0, _gbs(z.get("ram") or 0),
-                                         ", %d GPU %s" % (z["gpus"], _gbs(z.get("gpu_mem") or 0)) if z.get("gpus")
-                                         else "")
+            size = _history_size(j)
             peaks = "-" if not j.get("peak_samples") else "%.1f CPU, %s%s (%d samples)" % (
                 j.get("peak_cpu") or 0, _gbs(j.get("peak_ram") or 0),
                 ", GPU %s" % _gbs(j["peak_gpu_mem"]) if j.get("peak_gpu_mem") else "", j["peak_samples"])
