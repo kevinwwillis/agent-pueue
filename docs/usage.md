@@ -278,6 +278,9 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   `--in-containers`, `--restartable`.
 - After the loop starts with no recent history (a reboot, a long stop), it measures the host for `warmup_s`
   (10 minutes by default) before it starts anything; `job room` shows `measuring the host first`.
+- A job may append `done total` lines (for example `120 6264`) to the file in `$JOB_PROGRESS`. It then gets a
+  projected end (`job ls` shows `[120 of 6264, ends about ...]`), and an early `ALERT` if its RAM grows with
+  its progress fast enough to reach its RAM limit before the end.
 - Restarting an admitted job in place (`pueue restart --in-place`) ends it `WRAPPER_ERROR` (its assignment is
   gone); submit it again instead.
 - A submit without a size, or from an older `job` (protocol 3 or 4), is refused with a message that starts

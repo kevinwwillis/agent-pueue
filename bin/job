@@ -354,6 +354,7 @@ def _scope_scripts(token, body, record, scope, assign):
     results = os.path.dirname(record)
     q = shlex.quote
     started, final, result = (os.path.join(results, token + ext) for ext in (".started", ".final", ".scope"))
+    progress = os.path.join(results, token + ".progress")
     shim_path = os.path.join(os.path.dirname(body), token + ".shim")
     unit = SCOPE_PREFIX + token + ".scope"
     sysd = "timeout 30 systemctl --user"
@@ -405,6 +406,7 @@ def _scope_scripts(token, body, record, scope, assign):
         "#!/bin/bash",
         "# job %s: runs the job in its own systemd scope and records how it ended" % VERSION,
         'export PATH="$HOME/.local/bin:$PATH"',
+        "export JOB_PROGRESS=%s" % q(progress),
         'export XDG_RUNTIME_DIR="/run/user/$(id -u)"',
         "rm -f %s %s %s %s" % (q(started), q(final), q(result), q(os.path.join(results, token + ".killed"))),
         "# a restarted job reuses its token, so end any scope an earlier run of it left",
@@ -605,6 +607,7 @@ def host_submit(req, _admission_checked=False):
     script = os.path.join(scripts, token + ".sh")
     body = os.path.join(scripts, token + ".cmd")
     record = os.path.join(results, token + ".exit")
+    progress = os.path.join(results, token + ".progress")  # JOB_PROGRESS: where the job may write `done total`
     with open(body, "w", encoding="utf-8") as f:
         f.write(command)
         if not command.endswith("\n"):
@@ -633,6 +636,7 @@ def host_submit(req, _admission_checked=False):
             f.write("# written by job %s for task %s at %s\n" % (
                 VERSION, req.get("task", "?"), dt.datetime.now().astimezone().isoformat()))
             f.write('export PATH="$HOME/.local/bin:$PATH"\n')
+            f.write("export JOB_PROGRESS=%s\n" % shlex.quote(progress))
             # the command runs in its own bash; its exit code is recorded here, so the record
             # survives pueue's cleanup and cannot be undone by a trap in the command
             f.write("bash -o pipefail %s\n" % shlex.quote(body))
@@ -786,7 +790,23 @@ def host_ls(req):
             s["scope"] = _scope_result(s["token"])
         elif s["status"] == "Stashed" and s.get("token"):
             _probe_admission(s, {})
+        elif s["status"] == "Running" and s.get("token"):
+            _probe_progress(s)
     return {"tasks": out, "groups": st.get("groups", {}), "hostname": socket.gethostname()}
+
+
+def _probe_progress(s):
+    """A running admitted job's latest progress and projected end, from its queue entry."""
+    try:
+        settings = _admission_settings()
+    except JobError:
+        return
+    if settings is None:
+        return
+    q = Admission(settings).read_json(os.path.join(settings["state_dir"], "queue", s["token"] + ".json"))
+    if q and q.get("progress"):
+        s["progress"] = q["progress"][-1][1:3]
+        s["projected_end"] = q.get("projected_end")
 
 
 def host_group(req):
@@ -1382,7 +1402,9 @@ IN_FLIGHT = ("Queued", "Running", "Paused", "Locked")
 RECORD_FIELDS = ("token", "task", "session", "host", "pueue_id", "grp", "submitted", "released", "started", "ended",
                  "exit", "how", "size", "size_source", "like_from", "pilot", "constraints", "gpus", "peak_cpu",
                  "peak_ram", "memory_peak", "peak_gpu_mem", "peaks_final", "peak_samples",
-                 "peak_disk_mb_s")
+                 "peak_disk_mb_s", "progress", "projected_end")
+PROGRESS_KEEP = 200     # progress points kept per job
+PROGRESS_FIT = 20       # the projected end comes from the rate over the last this many points
 LIKE_MIN_SAMPLES = 3  # a --like source must have been measured at least this many times while it ran
 
 
@@ -1543,6 +1565,59 @@ def _size_from(settings, adm, capacity, req):
         size["disk_mb_s"] = float(r.get("peak_disk_mb_s") or 0.0)
         return size, "like", False, r["token"]
     return size, "explicit", False, None
+
+
+def _read_progress(token):
+    """The last valid `done total` line of a job's progress file, or None."""
+    try:
+        with open(os.path.join(STATE_DIR, "results", token + ".progress"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4096))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            done, total = float(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        if total > 0 and 0 <= done <= total:
+            return done, total
+    return None
+
+
+def _slope(xs, ys):
+    """Least-squares slope of ys on xs, or None when xs do not vary."""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    return None if sxx <= 0 else sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+
+
+def _projected_end(points):
+    """When a job will reach its total at its recent rate: points are [t, done, total, ram]."""
+    recent = points[-PROGRESS_FIT:]
+    if len(recent) < 2:
+        return None
+    rate = _slope([p[0] for p in recent], [p[1] for p in recent])
+    if not rate or rate <= 0:
+        return None
+    t, done, total = recent[-1][0], recent[-1][1], recent[-1][2]
+    return t + (total - done) / rate
+
+
+def _ram_at_total(points):
+    """The RAM a job will have at its total if RAM keeps growing with done as it has, or None."""
+    pts = [p for p in points if p[3]]
+    if len(pts) < 3 or pts[-1][1] - pts[0][1] < 0.05 * pts[-1][2]:
+        return None
+    b = _slope([p[1] for p in pts], [p[3] for p in pts])
+    if not b or b <= 0:
+        return None
+    return pts[-1][3] + b * (pts[-1][2] - pts[-1][1])
 
 
 def _capacity(measure):
@@ -1933,12 +2008,33 @@ class Loop:
                         continue
             running = status in IN_FLIGHT or (u is not None and u["populated"])
             if running:
+                self.track_progress(q, now, u)
                 self.record_peaks(con, q, final=False)
                 self.adm.save(q)
                 continue
             if t is None and st is None:
                 continue  # never end a job on a failed pueue read
             self.end(con, q, now, None, t)
+
+    def track_progress(self, q, now, u):
+        """Add the job's newest progress line; project its end; ALERT when its RAM trend passes its limit."""
+        got = _read_progress(q["token"])
+        if got is None:
+            return
+        pts = q.setdefault("progress", [])
+        if pts and pts[-1][1] == got[0] and pts[-1][2] == got[1]:
+            return
+        if pts and got[1] != pts[-1][2]:
+            del pts[:]  # a new total starts a new series
+        pts.append([now, got[0], got[1], (u or {}).get("ram", 0)])
+        del pts[:-PROGRESS_KEEP]
+        q["projected_end"] = _projected_end(pts)
+        limit = q.get("memory_max")
+        ram = _ram_at_total(pts)
+        if limit and ram is not None and ram > limit:
+            self.adm.alert(q, "ram_trend", "its RAM grows with its progress: %s at %g of %g, on course for %s at the "
+                           "end, over its RAM limit of %s, where it would be stopped" % (
+                               _gbs(pts[-1][3]), pts[-1][1], pts[-1][2], _gbs(ram), _gbs(limit)))
 
     def _stored_peaks(self, con, token):
         """The peaks recorded so far (by this loop or one before a restart), so a restart never lowers them."""
@@ -1953,7 +2049,8 @@ class Loop:
         self.adm.record(con, {"token": q["token"], "released": q.get("released"), "started": q.get("started"),
                               "gpus": q.get("gpus", []), "peak_cpu": p["cpu"], "peak_ram": p["ram"],
                               "peak_gpu_mem": p["gpu"], "peak_samples": p["n"], "peak_disk_mb_s": p["disk"],
-                              "peaks_final": int(final)})
+                              "peaks_final": int(final), "progress": q.get("progress"),
+                              "projected_end": q.get("projected_end")})
 
     def end(self, con, q, now, how, t):
         """A job ended (or left the queue): write its final record and forget it."""
@@ -2114,7 +2211,8 @@ class Loop:
         held = [{"token": q["token"], "task": q["task"], "reason": q.get("reason"), "waited_s": now - q["submitted"],
                  "size": q["size"], "pilot": q.get("pilot")} for q in queue if q.get("state") == "held"]
         jobs = [{"token": q["token"], "task": q["task"], "size": q["size"], "gpus": q.get("gpus"),
-                 "released": q.get("released")} for q in queue if q.get("state") == "released"]
+                 "released": q.get("released"), "progress": (q.get("progress") or [[0, None, None]])[-1][1:3],
+                 "projected_end": q.get("projected_end")} for q in queue if q.get("state") == "released"]
         holds = [{k: h.get(k) for k in ("id", "name", "index", "uuid", "size", "start", "expires")} for h in self.holds]
         self.adm.write_json(self.adm.path("room.json"), {"t": now, "host": socket.gethostname(), "room": self.room,
                                                          "capacity": self.capacity, "held": held, "jobs": jobs,
@@ -2808,10 +2906,11 @@ def cmd_room(args):
             print("  GPU %d %s: %s free to admit of %s; outside use %s; busy %.0f%%" % (
                 g["index"], g["name"], _gbs(max(0, g["room"])), _gbs(g["total"]), _gbs(g["outside"]), g["util"]))
         for j in r.get("jobs") or []:
-            print("  running %s (%s): %g CPU, %s RAM%s" % (j["token"][:8], j["task"], j["size"]["cpus"],
-                                                          _gbs(j["size"]["ram"]),
-                                                          ", GPU %s" % ",".join(x[:12] for x in j["gpus"])
-                                                          if j.get("gpus") else ""))
+            end = j.get("projected_end")
+            print("  running %s (%s): %g CPU, %s RAM%s%s" % (
+                j["token"][:8], j["task"], j["size"]["cpus"], _gbs(j["size"]["ram"]),
+                ", GPU %s" % ",".join(x[:12] for x in j["gpus"]) if j.get("gpus") else "",
+                "; ends about %s" % dt.datetime.fromtimestamp(end).astimezone().strftime("%H:%M %Z") if end else ""))
         for h2 in r.get("holds") or []:
             print("  hold %s (%s): %s on GPU %s" % (h2["id"], h2["name"], _gbs(h2["size"]), h2["index"]))
         for j in r.get("held") or []:
@@ -3251,6 +3350,10 @@ def cmd_ls(args):
             what = (s.get("summary") or s.get("command") or "")[:60]
             if s.get("held"):
                 state, what = "Held", "[%s] %s" % (s.get("held_reason") or "not checked yet", what)
+            elif s.get("progress"):
+                end = s.get("projected_end")
+                what = "[%g of %g%s] %s" % (s["progress"][0], s["progress"][1], ", ends about %s" % dt.datetime.fromtimestamp(
+                    end).astimezone().strftime("%Y-%m-%d %H:%M %Z") if end else "", what)
             rows.append((h, str(s["id"]), s.get("label") or "-", state, _fmt_dur(_runtime(s)),
                          s.get("group") or "", s.get("session") or "unknown", what))
     head = ("HOST", "ID", "TASK", "STATUS", "RUN TIME", "GROUP", "SESSION", "COMMAND")

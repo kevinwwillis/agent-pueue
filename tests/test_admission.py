@@ -306,6 +306,15 @@ class ClientTests(unittest.TestCase):
         self.j.call = call
         self.assertEqual(self.j._rooms(["h1"])["h1"], "its job predates admission")
 
+    def test_projected_end_and_ram_trend(self):
+        pts = [[100.0 + 10 * i, 5.0 * i, 100.0, (1 + i) * GB] for i in range(5)]  # 0.5 per second, +1 GB per 5
+        self.assertAlmostEqual(self.j._projected_end(pts), 140.0 + 80 / 0.5)
+        self.assertAlmostEqual(self.j._ram_at_total(pts), 5 * GB + 0.2 * GB * 80)
+        self.assertIsNone(self.j._projected_end(pts[:1]))
+        self.assertIsNone(self.j._ram_at_total([[0, 0, 100, GB], [1, 1, 100, 2 * GB], [2, 2, 100, 3 * GB]]))  # 2%
+        flat = [[i, 10.0 * i, 100.0, GB] for i in range(5)]
+        self.assertIsNone(self.j._ram_at_total(flat))
+
     def test_job_use_measures_the_disk_rate(self):
         root = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
         try:
@@ -1006,6 +1015,26 @@ class LoopTests(Base):
 
     def test_the_scope_probe_passes_here(self):
         self.assertIsNone(self.j._scope_probe(dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())))
+
+    def test_progress_gives_a_projected_end_and_an_early_ram_alert(self):
+        loop = self.loop()
+        cmd = ("python3 -c 'import os, time\nb = []\nfor i in range(1, 9):\n    b.append(bytearray(12 * 1024 * 1024))\n"
+               "    open(os.environ[\"JOB_PROGRESS\"], \"a\").write(\"%d 100\\n\" % i)\n    time.sleep(0.6)\n"
+               "time.sleep(30)'")
+        r = self.submit_sized(cmd, cpus=1, ram=100 * MiB)  # limit 150 MiB; on course for about 1.2 GB at 100
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        alerts = os.path.join(self.state, "alerts", tok + ".jsonl")
+        try:
+            self.assertTrue(self.cycles(loop, lambda: os.path.exists(alerts), n=80), "no RAM-trend alert")
+            with open(alerts) as f:
+                self.assertIn("on course for", f.read())
+            with open(os.path.join(self.state, "room.json")) as f:
+                j = json.load(f)["jobs"][0]
+            self.assertIsNotNone(j["projected_end"])
+            self.assertEqual(j["progress"][1], 100)
+            self.assertIn("of 100, ends about", self.job("ls", "local", **self.env()).stdout)
+        finally:
+            self.job("kill", "local", str(tid))
 
     def test_admission_status(self):
         p = self.job("admission", "local", "status", **self.env())

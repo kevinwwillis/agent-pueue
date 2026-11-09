@@ -4,8 +4,8 @@ Status: spec for TASK-003 (written 2026-11-09 12:05 ET; revised 12:20 and 12:50 
 "Per-job scope" revised 13:10 ET after a code review). Built so far: the per-job scope (job 0.6.0, protocol 5,
 used only by a submit that carries a scope), then the loop, held submits, records, the client commands
 (`--cpus/--ram/...`, `job run auto`, `job room`), holds and the loop's service command (all in job 0.6.0, not yet
-released). Not built yet: progress files and projected ends, the RAM-trend alert, `job history`, and rented
-machines as hosts (`hosts.d`).
+released), and progress files with projected ends and the RAM-trend alert. Not built yet: `job history`, and
+rented machines as hosts (`hosts.d`).
 
 ## Why
 
@@ -78,10 +78,12 @@ job release host2 <hold-id>
 
 ### Progress
 
-The runner sets `JOB_PROGRESS` to a file path. A job that writes lines `done total` there (for example
-`120 6264`) gets a projected end time from its own rate. A job without progress has no projected end. The loop
-also records the RAM size basis at each progress line: if a running job's RAM is still growing with `done`, and
-the trend reaches its size before `total`, the owner gets ALERT early, before the kernel would stop it.
+The runner sets `JOB_PROGRESS` to a file path for every job. A job that appends lines `done total` there (for
+example `120 6264`) gets a projected end time on an admission host: the loop notes the time of each new line
+and projects from the rate over the last 20 lines; `job ls` and `job room` show it. A job without progress has
+no projected end. A new `total` starts a new series. The loop also records the RAM size basis at each progress
+line: once there are 3 lines covering at least 5% of `total`, if RAM grows with `done` and the trend reaches the
+job's RAM limit before `total`, the owner gets ALERT early, before the kernel would stop it.
 Projections are shown by `job ls`, `job room` and `job history`. Deployments may use them (for example, to warn
 before a rented machine's budget runs out).
 
@@ -334,7 +336,8 @@ commits before it takes the lock.
   (exit, killed, memory limit, host out of memory, stop-at, pilot time limit, wrapper error), size and where it
   came from (pilot, like, explicit, small), whether the peaks are final or sampled, constraints, GPU UUIDs, peaks
   (CPU, RAM basis, `memory.peak`, GPU memory, peak disk rate) and how many samples they come from, and the
-  earlier job a `--like` size came from. Not built yet: progress series and projected end.
+  earlier job a `--like` size came from, the progress series (time, done, total, RAM; last 200 lines) and the
+  projected end.
 - `samples`: per-resource values, kept 7 days; `recent`: the loop's last samples in full.
 - `holds`: id, name, card, size, start, end, and how it ended.
 
