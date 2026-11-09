@@ -263,8 +263,8 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   the first host that takes it. A host that refuses the job (too small, no record for `--like`, a missing
   `--needs-path`) is skipped; an unreachable host stops the placement, since the job may have been queued
   there. `--host NAME` (repeatable) limits the choice.
-- A held job's wait prints why every 10 minutes (`held: needs 18.0 GB RAM, 9.4 GB free`); being held is not a
-  verdict. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
+- A held job's wait prints why every 10 minutes (`held: needs 22.5 GB RAM (its limit, 1.25 times its size), 9.4 GB
+  free`); being held is not a verdict. A job needs room for its hard RAM limit, not just its size. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
 - The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
   for a pilot its free RAM at release), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
   `note: it went over its RAM limit of N GB; the whole job was stopped`. Processes it leaves running when its

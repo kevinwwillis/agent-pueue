@@ -75,11 +75,14 @@ class RoomRules(unittest.TestCase):
         return self.j.compute_room(self.s, samples, list(inflight), [], now or samples[-1]["t"])
 
     def test_ram_fit_and_no_fit(self):
-        r = self.room([sample(100, avail=11 * GB)])
-        self.assertTrue(self.j.fits(self.s, r, held(ram=9 * GB))[0])
-        ok, why = self.j.fits(self.s, r, held(ram=11 * GB))
+        r = self.room([sample(100, avail=11 * GB)])  # 10 GB of room; a job counts at its limit, 1.5 times its size
+        ok, got = self.j.fits(self.s, r, held(ram=6 * GB))
+        self.assertTrue(ok)
+        self.assertEqual(got["ram_counted"], self.j.ram_limit(self.s, 6 * GB))
+        self.assertAlmostEqual(got["ram_counted"], 9 * GB, delta=4096)
+        ok, why = self.j.fits(self.s, r, held(ram=7 * GB))
         self.assertFalse(ok)
-        self.assertIn("needs 11.0 GB RAM, 10.0 GB free", why)
+        self.assertIn("needs 10.5 GB RAM (its limit, 1.5 times its size), 10.0 GB free", why)
 
     def test_outside_ram_counts_at_its_highest_in_the_window(self):
         # someone else's process took 20 GB 30 s ago and let it go: the room stays down for the window
@@ -643,7 +646,7 @@ class LoopTests(Base):
         self.assertEqual(self.status(tid), "Stashed")
         with open(os.path.join(self.settings["state_dir"], "room.json")) as f:
             snap = json.load(f)
-        self.assertIn("needs 4.0 GB RAM, 2.0 GB free", snap["held"][0]["reason"])
+        self.assertIn("needs 6.0 GB RAM (its limit, 1.5 times its size), 2.0 GB free", snap["held"][0]["reason"])
         self.host.set(avail=8 * GB)
         loop.samples = []  # the old low readings leave the window
         self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
@@ -741,12 +744,12 @@ class LoopTests(Base):
         now = [time.time()]
         self.host.set(avail=12 * GB)
         loop = self.loop(clock=lambda: now[0])
-        first = self.submit_sized("sleep 60", cpus=1, ram=6 * GB)  # runs, and is counted at 6 GB
+        first = self.submit_sized("sleep 60", cpus=1, ram=4 * GB)  # runs, and is counted at its 6 GB limit
         self.assertTrue(self.cycles(loop, lambda: self.status(first["data"]["id"]) == "Running"))
-        big = self.submit_sized("echo big", cpus=1, ram=8 * GB)    # 5 GB free: short, but fits once first ends
+        big = self.submit_sized("echo big", cpus=1, ram=4 * GB)    # 5 GB free: short, but fits once first ends
         self.assertTrue(big["ok"], big)
         now[0] += 120  # past the one-minute fairness wait
-        small = self.submit_sized("echo small", cpus=1, ram=2 * GB)  # fits, but takes RAM the big one needs
+        small = self.submit_sized("echo small", cpus=1, ram=2 * GB)  # fits (3 GB), but takes RAM the big one needs
         for _ in range(3):
             self.host.tick()
             loop.cycle()
@@ -801,10 +804,10 @@ class LoopTests(Base):
         loop.cycle()
         room = self.job("room", "local", **self.env())
         self.assertIn("held", room.stdout)
-        self.assertIn("needs 4.0 GB RAM, 2.0 GB free", room.stdout)
+        self.assertIn("needs 6.0 GB RAM (its limit, 1.5 times its size), 2.0 GB free", room.stdout)
         ls = self.job("ls", "local", **self.env())
         row = [x for x in ls.stdout.splitlines() if x.split()[1:2] == [str(tid)]]
-        self.assertTrue(row and "Held" in row[0] and "needs 4.0 GB RAM" in row[0], ls.stdout)
+        self.assertTrue(row and "Held" in row[0] and "needs 6.0 GB RAM" in row[0], ls.stdout)
         w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(tid), "--poll", "0.3"], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=self.d.env(**self.env()))
         time.sleep(1.5)
@@ -813,7 +816,7 @@ class LoopTests(Base):
         self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
         out, err = w.communicate(timeout=60)
         self.assertEqual(w.returncode, 0, out + err)
-        self.assertIn("held: needs 4.0 GB RAM", err)
+        self.assertIn("held: needs 6.0 GB RAM", err)
         self.assertIn("cli-ran", out)
 
     def test_an_admission_alert_ends_the_wait(self):
@@ -1095,6 +1098,14 @@ class LoopTests(Base):
             svc.kill()
             svc.wait()
 
+    def test_a_job_released_before_limits_were_counted_counts_at_its_limit(self):
+        loop = self.loop()
+        q = {"token": "t" * 32, "released": time.time(), "size": {"cpus": 1.0, "ram": 4 * GB, "gpus": 0, "gpu_mem": 0},
+             "gpus": [], "ram_counted": 4 * GB, "gpu_counted": {}, "memory_max": 6 * GB}
+        self.assertEqual(loop._counted(q, time.time())["ram_counted"], 6 * GB)
+        q.pop("memory_max")
+        self.assertEqual(loop._counted(q, time.time())["ram_counted"], 4 * GB)
+
     def test_a_hold_cgroup_must_be_absolute(self):
         loop = self.loop()
         self.host.tick()
@@ -1302,14 +1313,14 @@ class LoopTests(Base):
         loop = self.loop()
         self.host.tick()
         loop.cycle()
-        a = self.submit_sized("sleep 20", cpus=1, ram=4 * GB)
+        a = self.submit_sized("sleep 20", cpus=1, ram=3 * GB)  # counted at its 4.5 GB limit
         self.host.tick()
         loop.cycle()
         self.assertNotEqual(self.status(a["data"]["id"]), "Stashed")
         try:
             with open(os.path.join(self.state, "room.json")) as f:
-                self.assertLess(json.load(f)["room"]["ram"]["room"], 1.1 * GB)
-            b = self.submit_sized("true", cpus=1, ram=4 * GB, fit_now=True)
+                self.assertLess(json.load(f)["room"]["ram"]["room"], 0.6 * GB)
+            b = self.submit_sized("true", cpus=1, ram=3 * GB, fit_now=True)
             self.assertFalse(b["ok"])
         finally:
             self.job("kill", "local", str(a["data"]["id"]))
@@ -1415,7 +1426,7 @@ class LoopTests(Base):
         self.assertIn(tok, p.stdout)
         self.assertIn("explicit: 1 CPU, 0.1 GB", p.stdout)
         rec = self.record(tok)
-        self.assertEqual(rec["ram_counted"], 100 * MiB)  # a sized job is counted at its size
+        self.assertEqual(rec["ram_counted"], self.j.ram_limit(self.settings, 100 * MiB))  # a job counts at its limit
         self.assertEqual(rec["memory_max"], self.j._whole_pages(max(int(100 * MiB * 1.5), self.j.SCOPE_MIN_MEMORY)))
         p = self.job("history", "local", "--json", "--task", "nothing-like-this", **self.env())
         self.assertEqual(json.loads(p.stdout)["local"]["jobs"], [])

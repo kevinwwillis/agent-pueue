@@ -317,9 +317,11 @@ the larger of their size and their current use. A job that ends frees its room a
   services should name their processes.
 - **RAM, per host:** the lowest over `outside_window_s` of `MemAvailable + Σ admitted jobs' current use + Σ RAM
   holds' own use` (what would be free with no admitted jobs and no RAM holds), minus `ram_headroom`, minus `Σ
-  over admitted jobs of max(size, current use)`, minus `Σ over RAM holds of max(size, own use)`. A RAM hold's own
-  use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or `RssAnon + RssShmem` of
-  `--while-pid` and its descendants; a RAM hold that names no processes is counted at its size and its real use
+  over admitted jobs of max(hard limit, current use)`, minus `Σ over RAM holds of max(size, own use)`. A job is
+  counted at its hard limit (`ram_hard_factor` times its size, a pilot's counted room), not its size, and fits
+  only if its limit fits, so jobs that grow up to their limits together still leave `ram_headroom` free. A RAM
+  hold's own use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or `Pss_Anon +
+  Pss_Shmem` (`RssAnon + RssShmem` on kernels without them) of `--while-pid` and its descendants; a RAM hold that names no processes is counted at its size and its real use
   again as outside use. Nothing is released while memory pressure is over `memory_pressure_max_pct`.
 - **CPU, per host** (CPU can be shared by time, so older jobs count at their measured use): `outside` is the
   average over `cpu_window_s` of busy threads minus the admitted jobs' measured threads. A job fits when

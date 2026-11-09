@@ -1367,6 +1367,12 @@ def compute_room(settings, samples, inflight, holds, now):
     return out
 
 
+def ram_limit(settings, ram):
+    """The hard RAM limit of a job sized `ram`. A job is counted at it, not at its size, so jobs that grow up to their
+    limits together still leave ram_headroom free."""
+    return _whole_pages(max(int(ram * settings["ram_hard_factor"]), SCOPE_MIN_MEMORY))
+
+
 def fits(settings, room, job, data_disk=None):
     """Whether a held job fits the room now. Returns (True, {gpus, ram_counted, gpu_counted}) or (False, reason).
 
@@ -1384,9 +1390,10 @@ def fits(settings, room, job, data_disk=None):
             return False, "a pilot needs RAM room; %s free" % _gbs(max(0, ram_room))
         ram_counted = ram_room
     else:
-        if size["ram"] > ram_room:
-            return False, "needs %s RAM, %s free" % (_gbs(size["ram"]), _gbs(max(0, ram_room)))
-        ram_counted = size["ram"]
+        ram_counted = ram_limit(settings, size["ram"])
+        if ram_counted > ram_room:
+            return False, "needs %s RAM (its limit, %g times its size), %s free" % (
+                _gbs(ram_counted), settings["ram_hard_factor"], _gbs(max(0, ram_room)))
     cpu = room["cpu"]
     if size["cpus"] > cpu["room"] + 1e-9:
         return False, "needs %g CPU threads, %.1f free" % (size["cpus"], max(0.0, cpu["room"]))
@@ -2040,7 +2047,9 @@ class Loop:
 
     def _counted(self, q, now):
         c = {"token": q["token"], "released": q["released"], "size": q["size"], "gpus": q.get("gpus", []),
-             "ram_counted": q.get("ram_counted", q["size"]["ram"]), "gpu_counted": q.get("gpu_counted", {})}
+             # a job is counted at its RAM limit; one released before limits were counted carries memory_max
+             "ram_counted": max(q.get("ram_counted") or q["size"]["ram"], q.get("memory_max") or 0),
+             "gpu_counted": q.get("gpu_counted", {})}
         if ((q.get("constraints") or {}).get("in_containers") and q.get("started")
                 and now - q["started"] >= self.s["outside_window_s"]):
             # its containers' use now shows as outside use; counting its size too would count it twice
@@ -2303,7 +2312,7 @@ class Loop:
         """What a held job lacks now; an empty set when it is held for some other reason."""
         short = set()
         size = q["size"]
-        if size["ram"] > room["ram"]["room"] or q.get("pilot"):
+        if ram_limit(self.s, size["ram"]) > room["ram"]["room"] or q.get("pilot"):
             short.add("ram")
         if size["cpus"] > room["cpu"]["room"]:
             short.add("cpu")
@@ -2319,8 +2328,8 @@ class Loop:
 
     def enqueue(self, con, now, q, t, got):
         """Release one job: write its assignment, then pueue enqueue <id> (never without an id)."""
-        memory_max = int(got["ram_counted"] if q.get("pilot") else q["size"]["ram"] * self.s["ram_hard_factor"])
-        memory_max = _whole_pages(max(memory_max, SCOPE_MIN_MEMORY))
+        memory_max = (_whole_pages(max(int(got["ram_counted"]), SCOPE_MIN_MEMORY)) if q.get("pilot")
+                      else ram_limit(self.s, q["size"]["ram"]))
         lines = ["JOB_MEMORY_MAX=%d" % memory_max, "CUDA_VISIBLE_DEVICES=%s" % ",".join(got["gpus"]),
                  "JOB_GPU_UUIDS=%s" % ",".join(got["gpus"])]
         path = self.adm.assign_path(q["token"])
