@@ -1,11 +1,11 @@
 ---
 id: TASK-003.02
 title: 'Per-job cgroup scope: memory limit without swap, whole-job kill, GPU by UUID'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-11-09T17:00:00Z'
-updated_date: '2026-11-09T18:35:00Z'
+updated_date: '2026-11-09T19:24:00Z'
 labels: []
 dependencies:
   - TASK-003.01
@@ -22,11 +22,11 @@ Admitted jobs need hard RAM limits and exact per-job measurement. Running each j
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Each admitted job runs in its own systemd user scope with a memory limit, no swap and whole-job kill on out-of-memory
-- [ ] #2 A job over its memory limit is stopped whole and job reports why
-- [ ] #3 The GPU a job gets is set by UUID
-- [ ] #4 Stall detection still works for jobs in scopes
-- [ ] #5 Tests cover a job that goes over its memory limit
+- [x] #1 Each admitted job runs in its own systemd user scope with a memory limit, no swap and whole-job kill on out-of-memory
+- [x] #2 A job over its memory limit is stopped whole and job reports why
+- [x] #3 The GPU a job gets is set by UUID
+- [x] #4 Stall detection still works for jobs in scopes
+- [x] #5 Tests cover a job that goes over its memory limit
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -48,4 +48,6 @@ Admitted jobs need hard RAM limits and exact per-job measurement. Running each j
 2026-11-09 13:10 ET: first full review (Claude Sonnet 5.5, sonnet, high) found 8 groups of defects. Root cause of most: the shim shared the job's cgroup, so a memory kill took the bookkeeping with it. Redesign (my call): the scope is delegated (Delegate=yes, OOMPolicy=continue) and the shim splits it into shim/ and job/; job/ carries memory.max, swap 0, oom.group 1; the shim survives, reads job/ memory.events and tells own limit (oom>0) from host OOM (oom_kill>0, oom 0) from outside SIGKILL, on systemd 255 too (verified on sttp1 and this PC). Fixed: limits read back, fail closed (1); job kill SIGKILLs the scope at once and keeps a usage snapshot (2); peak renamed memory_peak_incl_cache, not used for verdicts (3); attribution per spec (4); bookkeeping outside the limit (5); leftovers stopped at end, restart clears an old scope (6); VERSION 0.6.0, spec and usage.md updated (7); gpus default [] (fail closed), GPU variables refused in gpu_env and --env, MIG names, systemctl timeouts, test hook JOB_SYSTEMD_RUN removed (fake HOME instead), skip unless memory is delegated, tests for GONE path, normal priority, protocol 5 (8). Added: the shim refuses to touch any cgroup that is not its own scope. Set aside: TasksMax (not in the spec; a fork runaway is bounded by the user slice's TasksMax, and a per-job limit could break wide worker pools). 78 local tests pass. Second and final review next.
 
 2026-11-09 13:35 ET: second and final full review (Claude Sonnet 5.5, sonnet, high). Fixed: a limit not on a page boundary failed the setup check (the kernel stores whole pages; limits are now rounded and the check allows one page); each scoped job is its own cgroup, so nice no longer ranked jobs against each other (scope CPUWeight 1 for idle priority, 100 for normal); a kill record written just after the job ended hid its real verdict (mtime check; removed when pueue kill fails); notes for exit 137, scope killed and a memory kill after a clean exit; job ls now shows the same verdict as wait; shorter bash Killed line. Set aside: a job can raise its own limit (it runs as the user owning the scope, so no setting can stop a deliberate escape; the spec says the limits guard against accidents); detached processes after a raw pueue kill (the admission loop stops such scopes); unchecked oom_score_adj write (best effort); page cache and /dev/shm count in memory.max (by design: /dev/shm is part of a job's size). 82 scope and job tests pass.
+
+2026-11-09 14:24 ET: all criteria verified by tests/test_scope.py here (systemd 259) and on sttp1 (systemd 255, Python 3.12: 148 admission, scope and job tests pass, sttp1#569). Two full reviews; repairs in 852090d and 3caeea6.
 <!-- SECTION:NOTES:END -->

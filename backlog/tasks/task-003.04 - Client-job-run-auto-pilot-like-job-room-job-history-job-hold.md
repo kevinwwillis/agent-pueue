@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-11-09T17:00:00Z'
-updated_date: '2026-11-09T18:42:00Z'
+updated_date: '2026-11-09T19:13:00Z'
 labels: []
 dependencies:
   - TASK-003.01
@@ -37,4 +37,6 @@ Callers need one command that places a job without choosing a host, sizes it fro
 2026-11-09 13:36 ET: description and criterion 2 brought in line with docs/admission.md (no moving held jobs between hosts; set aside in the spec's second review). The host side of fit_now, room and records exists (TASK-003.03); this task adds the client flags, auto placement, job room, job hold/release, progress and ALERT relay.
 
 2026-11-09 13:43 ET: client written: size and constraint flags on run and submit (--pilot, --max-minutes, --like, --small, --cpus, --ram, --gpus, --gpu-mem, --gpu-share, --gpu-model, --data, --stop-at, --in-containers, --restartable, --host for auto); sizes as 20G (10^9) or 512Mi (2^20); job run auto (asks every host's room in parallel, orders hosts with room first, then the host that has --data, then fewest held; fit_now to each; else held on the first); job room (text and --json); wait prints why a job is held every 10 minutes, relays the loop's alerts as ALERT, and ALERTs once when the loop of a held job's host is not running; job ls shows Held with the reason. Not yet: holds (job hold/release), progress file and projected end. Tests: 33 admission tests pass here and on sttp1 (systemd 255); measurement checked on sttp1 (NVML and nvidia-smi agree on both cards; disks by path).
+
+2026-11-09 14:13 ET: client repairs from review cycle 1 in 477d1be: auto tries the next host on a refusal (never after Unreachable), HOST#ID only to HOST, sized-like line printed, --needs-path, old hosts shown as predating admission in job room, this machine asked once. Holds and job admission start|stop|status built in 581a9ca.
 <!-- SECTION:NOTES:END -->
