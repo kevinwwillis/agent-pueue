@@ -1,9 +1,11 @@
 ---
 id: TASK-003.01
 title: 'Spec: admission design for job (docs/admission.md)'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-11-09T17:00:00Z'
+updated_date: '2026-11-09T17:04:00Z'
 labels: []
 dependencies: []
 parent_task_id: TASK-003
@@ -23,3 +25,9 @@ The admission work needs one written design before any code: the commands, how r
 - [ ] #2 The spec names no machine, user or path of any one deployment
 - [ ] #3 A full review ran on the spec and each finding is fixed or set aside with its reason
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-11-09 12:05 ET: spec written to docs/admission.md on branch feat/admission (935996f, pushed). Full review by Claude Sonnet 5.5 (sonnet) at high running.
+<!-- SECTION:NOTES:END -->

@@ -1,9 +1,10 @@
 ---
 id: TASK-003
 title: 'Admission: start jobs only where they fit, sized by measurement'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-09T17:00:00Z'
+updated_date: '2026-11-09T17:01:00Z'
 labels: []
 dependencies: []
 priority: high
