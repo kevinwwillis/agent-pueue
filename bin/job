@@ -1139,6 +1139,27 @@ class Measure:
         self.last_io = io_seen
         return out
 
+    def cgroup_ram(self, path):
+        """RAM of a cgroup (a path under the cgroup root) on a job's basis: memory.current less file cache; None
+        when it cannot be read."""
+        try:
+            cur = int(self._read(self.cg + path, "memory.current"))
+            stat = dict((ln.split() + ["0"])[:2] for ln in self._read(self.cg + path, "memory.stat").splitlines() if ln)
+        except (OSError, ValueError):
+            return None
+        return max(0, cur - int(stat.get("active_file", 0)) - int(stat.get("inactive_file", 0)))
+
+    def pids_ram(self, pids):
+        """RssAnon + RssShmem summed over pids (file-backed pages excluded, as for a job)."""
+        total = 0
+        for pid in pids:
+            try:
+                f = dict(ln.split(":", 1) for ln in self._read(self.proc, str(pid), "status").splitlines() if ":" in ln)
+                total += sum(int(f[k].split()[0]) * 1024 for k in ("RssAnon", "RssShmem") if k in f)
+            except (OSError, ValueError, IndexError):
+                continue
+        return total
+
     def _io_bytes(self, pid):
         try:
             f = dict(ln.split(": ", 1) for ln in self._read(self.proc, str(pid), "io").splitlines() if ": " in ln)
@@ -1255,10 +1276,11 @@ def compute_room(settings, samples, inflight, holds, now):
 
     samples: oldest first, each {t, busy, iowait, avail, psi, disks: {name: pct},
       gpus: {gid: {index, name, total, used, util}}, jobs: {token: {ram, cpu, gpu: {gid: bytes}}},
-      holds: {hold_id: {gid: bytes}}}.
+      holds: {hold_id: {gid: bytes}}, hold_ram: {hold_id: bytes}}.
     inflight: [{token, released, size: {cpus, ram, gpu_mem, gpu_share}, gpus: [gid], ram_counted,
       gpu_counted: {gid: bytes}}].
-    holds: [{id, gid, size}]. Returns None until there is a sample to count from.
+    holds: [{id, gid (None for a RAM-only hold), size (GPU bytes), ram (bytes)}]. Returns None until there is a
+    sample to count from.
     """
     if not samples:
         return None
@@ -1268,10 +1290,13 @@ def compute_room(settings, samples, inflight, holds, now):
 
     # RAM: what would be available with no admitted job, at its lowest over the window
     win = _in_window(samples, now, settings["outside_window_s"])
-    free_no_jobs = min(s["avail"] + sum(j["ram"] for j in s["jobs"].values()) for s in win)
+    free_no_jobs = min(s["avail"] + sum(j["ram"] for j in s["jobs"].values()) + sum(s.get("hold_ram", {}).values())
+                       for s in win)
     counted = sum(max(j["ram_counted"], use.get(j["token"], {}).get("ram", 0)) for j in inflight)
-    out["ram"] = {"free_no_jobs": free_no_jobs, "counted": counted,
-                  "room": free_no_jobs - settings["ram_headroom_gb"] * GB - counted}
+    own_ram = last.get("hold_ram", {})
+    held_ram = sum(max(h.get("ram") or 0, own_ram.get(h["id"], 0)) for h in holds if h.get("ram"))
+    out["ram"] = {"free_no_jobs": free_no_jobs, "counted": counted, "holds": held_ram,
+                  "room": free_no_jobs - settings["ram_headroom_gb"] * GB - counted - held_ram}
 
     # CPU: outside use averaged over the window; older jobs count at their measured use
     cwin = [s for s in _in_window(samples, now, settings["cpu_window_s"]) if s["busy"] is not None]
@@ -1310,7 +1335,7 @@ def compute_room(settings, samples, inflight, holds, now):
         jobs_counted = sum(max(j["gpu_counted"].get(gid, 0), use.get(j["token"], {}).get("gpu", {}).get(gid, 0))
                            for j in inflight)
         held_own = {hid: h.get(gid, 0) for hid, h in last.get("holds", {}).items()}
-        holds_counted = sum(max(h["size"], held_own.get(h["id"], 0)) for h in holds if h["gid"] == gid)
+        holds_counted = sum(max(h["size"], held_own.get(h["id"], 0)) for h in holds if h.get("gid") == gid)
         utils = [s["gpus"][gid]["util"] for s in recent if gid in s["gpus"]]
         util = sum(utils) / len(utils) if utils else 0.0
         shares = sum(j["size"].get("gpu_share") or 0 for j in jobs_on)
@@ -1423,6 +1448,7 @@ RECORD_FIELDS = ("token", "task", "session", "host", "pueue_id", "grp", "submitt
                  "exit", "how", "size", "size_source", "like_from", "pilot", "constraints", "gpus", "peak_cpu",
                  "peak_ram", "memory_peak", "peak_gpu_mem", "peaks_final", "peak_samples",
                  "peak_disk_mb_s", "progress", "projected_end", "ram_counted", "gpu_counted", "memory_max")
+HOLD_FIELDS = ("id", "name", "card", "size", "start", "ended", "how", "ram")
 PROGRESS_KEEP = 200     # progress points kept per job
 PROGRESS_FIT = 20       # the projected end comes from the rate over the last this many points
 LIKE_MIN_SAMPLES = 3  # a --like source must have been measured at least this many times while it ran
@@ -1489,19 +1515,22 @@ class Admission:
         con = sqlite3.connect(self.path("admission.sqlite"), timeout=30)
         try:
             con.execute("CREATE TABLE IF NOT EXISTS jobs (%s, PRIMARY KEY (token))" % ", ".join(RECORD_FIELDS))
-            if set(RECORD_FIELDS) - {r[1] for r in con.execute("PRAGMA table_info(jobs)")}:
+            con.execute("CREATE TABLE IF NOT EXISTS holds (id PRIMARY KEY, %s)" % ", ".join(HOLD_FIELDS[1:]))
+            tables = (("jobs", RECORD_FIELDS), ("holds", HOLD_FIELDS))
+
+            def missing():
+                return [(t, c) for t, cols in tables
+                        for c in set(cols) - {r[1] for r in con.execute("PRAGMA table_info(%s)" % t)}]
+            if missing():
                 # a records file from an older job: add the missing columns under the write lock, read again
                 # inside it, so two processes upgrading the file at once do not both add the same column
                 con.execute("BEGIN IMMEDIATE")
-                have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
-                for col in RECORD_FIELDS:
-                    if col not in have:
-                        con.execute("ALTER TABLE jobs ADD COLUMN %s" % col)
+                for t, c in missing():
+                    con.execute("ALTER TABLE %s ADD COLUMN %s" % (t, c))
                 con.commit()
             con.execute("CREATE TABLE IF NOT EXISTS samples (t REAL, kind TEXT, key TEXT, value REAL)")
             con.execute("CREATE TABLE IF NOT EXISTS recent (t REAL, sample TEXT)")  # the loop's windows, kept over restarts
             con.execute("CREATE INDEX IF NOT EXISTS samples_t ON samples (t)")
-            con.execute("CREATE TABLE IF NOT EXISTS holds (id PRIMARY KEY, name, card, size, start, ended, how)")
         except BaseException:
             con.close()
             raise
@@ -1913,11 +1942,20 @@ class Loop:
                             u = held_use.setdefault(hid, {})
                             u[c["uuid"]] = u.get(c["uuid"], 0) + used
                             break
+        hold_ram = {}
+        for h in holds:
+            if not h.get("ram"):
+                continue
+            if h["id"] in hold_cgs:
+                vals = [self.m.cgroup_ram(c) for c in hold_cgs[h["id"]]]
+                hold_ram[h["id"]] = sum(v for v in vals if v)
+            elif h["id"] in hold_pids:
+                hold_ram[h["id"]] = self.m.pids_ram(hold_pids[h["id"]])
         s = {"t": now, "busy": busy, "iowait": iowait or 0.0, "avail": mem.get("MemAvailable", 0),
              "psi": self.m.memory_pressure(), "disks": self.m.disks(now, set(self.disk_names.values())),
              "gpus": {c["uuid"]: {k: c[k] for k in ("index", "name", "total", "used", "util")} for c in cards},
              "jobs": {tok: {"ram": j["ram"], "cpu": j["cpu"], "gpu": j.get("gpu", {})} for tok, j in jobs.items()},
-             "holds": held_use}
+             "holds": held_use, "hold_ram": hold_ram}
         self.samples.append(s)
         self.samples = [x for x in self.samples if now - x["t"] <= self.keep_s]
         return s, jobs
@@ -1944,7 +1982,8 @@ class Loop:
                         tasks[tok] = t
                 self.account(con, now, queue, tasks, use, st)
                 inflight = [q for q in queue if q.get("state") == "released"]
-                hl = [{"id": h["id"], "gid": h["uuid"], "size": h["size"]} for h in holds]
+                hl = [{"id": h["id"], "gid": h.get("uuid"), "size": h.get("size") or 0, "ram": h.get("ram") or 0}
+                      for h in holds]
                 covered = self.covered(now)
                 if covered >= self.s["warmup_s"]:
                     self.warming = None
@@ -2185,8 +2224,10 @@ class Loop:
             if present and not h.get("seen"):
                 h["seen"] = True
                 self.adm.write_json(self.adm.path("holds", h["id"] + ".json"), h)
-            if room is not None and h["id"] not in counted and h["uuid"] in room["gpus"]:
-                room["gpus"][h["uuid"]]["room"] -= h["size"]
+            if room is not None and h["id"] not in counted:
+                if h.get("uuid") in room["gpus"]:
+                    room["gpus"][h["uuid"]]["room"] -= h.get("size") or 0
+                room["ram"]["room"] -= h.get("ram") or 0
             live.append(h)
         self.holds = live
 
@@ -2304,7 +2345,7 @@ class Loop:
         jobs = [{"token": q["token"], "task": q["task"], "size": q["size"], "gpus": q.get("gpus"),
                  "released": q.get("released"), "progress": (q.get("progress") or [[0, None, None]])[-1][1:3],
                  "projected_end": q.get("projected_end")} for q in queue if q.get("state") == "released"]
-        holds = [{k: h.get(k) for k in ("id", "name", "index", "uuid", "size", "start", "expires")} for h in self.holds]
+        holds = [{k: h.get(k) for k in ("id", "name", "index", "uuid", "size", "ram", "start", "expires")} for h in self.holds]
         self.adm.write_json(self.adm.path("room.json"), {"t": now, "written": time.time(), "host": socket.gethostname(),
                                                          "room": self.room, "capacity": self.capacity, "held": held,
                                                          "jobs": jobs, "holds": holds, "warmup": self.warming})
@@ -2451,9 +2492,12 @@ def host_hold(req):
             h["expires"] = time.time() + 60 * h["ttl_min"]
             adm.write_json(adm.path("holds", hid + ".json"), h)
             return {"id": hid, "action": "renewed", "expires": h["expires"]}
-        name, size = req.get("name"), req.get("mem")
-        if not isinstance(name, str) or not name or not isinstance(size, int) or size <= 0:
-            raise JobError("a hold needs --name and --mem")
+        name, size, ram = req.get("name"), req.get("mem"), req.get("ram")
+        want_gpu = req.get("gpu") is not None
+        if (not isinstance(name, str) or not name or (want_gpu and (not isinstance(size, int) or size <= 0))
+                or (ram is not None and (not isinstance(ram, int) or ram <= 0)) or (not want_gpu and ram is None)
+                or (size is not None and not want_gpu)):
+            raise JobError("a hold needs --name, and --gpu with --mem, --ram, or both")
         snap = adm.read_json(adm.path("room.json"))
         age = _heartbeat_age(adm)
         if not snap or age is None or age > _heartbeat_limit(settings):
@@ -2461,19 +2505,32 @@ def host_hold(req):
         if not snap.get("room"):
             raise JobError("the admission loop on %s is still measuring the host, so no hold can be granted yet"
                            % socket.gethostname())
-        gpus = snap["room"]["gpus"]
-        want = str(req.get("gpu"))
-        gid = next((u for u, g in gpus.items() if u == want or str(g["index"]) == want), None)
-        if gid is None:
-            raise JobError("no GPU %s on %s" % (want, socket.gethostname()))
         # the snapshot is written under this lock after each cycle's releases; holds since then are not in it
-        newer = sum(h["size"] for h in _holds(adm) if h["uuid"] == gid and h["start"] > snap.get("written", snap["t"]))
-        free = gpus[gid]["room"] - newer
-        if size > free:
-            raise JobError("GPU %d on %s has %s free; the hold needs %s" % (gpus[gid]["index"], socket.gethostname(),
-                                                                           _gbs(max(0, free)), _gbs(size)))
-        h = {"id": uuid.uuid4().hex[:12], "name": name, "uuid": gid, "index": gpus[gid]["index"], "size": size,
-             "start": time.time(), "unit": req.get("unit"), "cgroup": req.get("cgroup"), "ttl_min": req.get("ttl")}
+        newer = [h for h in _holds(adm) if h["start"] > snap.get("written", snap["t"])]
+        if ram:
+            free_ram = snap["room"]["ram"]["room"] - sum(h.get("ram") or 0 for h in newer)
+            if ram > free_ram:
+                raise JobError("%s has %s of RAM free to hold; the hold needs %s" % (
+                    socket.gethostname(), _gbs(max(0, free_ram)), _gbs(ram)))
+        gid = index = None
+        if want_gpu:
+            gpus = snap["room"]["gpus"]
+            want = str(req.get("gpu"))
+            gid = next((u for u, g in gpus.items() if u == want or str(g["index"]) == want), None)
+            if gid is None:
+                raise JobError("no GPU %s on %s" % (want, socket.gethostname()))
+            g, index = gpus[gid], gpus[gid]["index"]
+            on_card = [h for h in newer if h.get("uuid") == gid]
+            free = g["room"] - sum(h.get("size") or 0 for h in on_card)
+            if not g.get("jobs") and not g.get("holds") and not on_card:
+                # the headroom keeps parties on one card apart; a hold alone on its card may use it
+                free += settings["gpu_headroom_mb"] * MB
+            if size > free:
+                raise JobError("GPU %d on %s has %s free; the hold needs %s" % (index, socket.gethostname(),
+                                                                               _gbs(max(0, free)), _gbs(size)))
+        h = {"id": uuid.uuid4().hex[:12], "name": name, "uuid": gid, "index": index, "size": size or 0,
+             "ram": ram or 0, "start": time.time(), "unit": req.get("unit"), "cgroup": req.get("cgroup"),
+             "ttl_min": req.get("ttl")}
         if req.get("while_pid"):
             pid = int(req["while_pid"])
             try:
@@ -2487,12 +2544,15 @@ def host_hold(req):
         adm.write_json(adm.path("holds", h["id"] + ".json"), h)
         con = adm.db()
         try:
-            con.execute("INSERT INTO holds (id, name, card, size, start) VALUES (?, ?, ?, ?, ?)",
-                        (h["id"], name, gid, size, h["start"]))
+            con.execute("INSERT INTO holds (id, name, card, size, start, ram) VALUES (?, ?, ?, ?, ?, ?)",
+                        (h["id"], name, gid, h["size"], h["start"], h["ram"]))
             con.commit()
         finally:
             con.close()
-        return {"id": h["id"], "action": "granted", "gpu": h["index"], "uuid": gid}
+        out = {"id": h["id"], "action": "granted", "ram": h["ram"]}
+        if gid:
+            out.update(gpu=index, uuid=gid)
+        return out
     finally:
         os.close(fd)
 
@@ -2992,13 +3052,15 @@ def cmd_hold(args):
     if args.renew:
         r = call(args.host, "hold", {"renew": args.renew})
     else:
-        if args.gpu is None or args.mem is None or not args.name:
-            raise JobError("job hold needs --gpu, --mem and --name (or --renew ID)")
-        r = call(args.host, "hold", {"gpu": args.gpu, "mem": args.mem, "name": args.name, "while_pid": args.while_pid,
-                                     "unit": args.unit, "cgroup": args.cgroup, "ttl": args.ttl})
+        if not args.name or (args.gpu is None) != (args.mem is None) or (args.gpu is None and args.ram is None):
+            raise JobError("job hold needs --name, and --gpu with --mem, --ram, or both (or --renew ID)")
+        r = call(args.host, "hold", {"gpu": args.gpu, "mem": args.mem, "ram": args.ram, "name": args.name,
+                                     "while_pid": args.while_pid, "unit": args.unit, "cgroup": args.cgroup,
+                                     "ttl": args.ttl})
     print(r["id"])
-    sys.stderr.write("job: hold %s %s on %s%s\n" % (r["id"], r["action"], args.host,
-                                                   " GPU %s" % r["gpu"] if "gpu" in r else ""))
+    sys.stderr.write("job: hold %s %s on %s%s%s\n" % (r["id"], r["action"], args.host,
+                                                     " GPU %s" % r["gpu"] if "gpu" in r else "",
+                                                     " RAM %s" % _gbs(r["ram"]) if r.get("ram") else ""))
     return 0
 
 
@@ -3041,11 +3103,12 @@ def cmd_room(args):
             continue
         room = r["room"]
         cap = r.get("capacity") or {}
-        print("%s: snapshot %s old; CPU %.1f threads used or committed of %s, %.1f free to admit; RAM %s free to admit; "
+        held = room["ram"].get("holds") or 0
+        print("%s: snapshot %s old; CPU %.1f threads used or committed of %s, %.1f free to admit; RAM %s free to admit%s; "
               "memory pressure %.1f%%" % (h, _fmt_dur(r.get("heartbeat_age") or 0), room["cpu"]["outside"]
                                            + room["cpu"]["committed"], cap.get("threads", "?"),
                                            max(0.0, room["cpu"]["room"]), _gbs(max(0, room["ram"]["room"])),
-                                           room["psi"]))
+                                           " (%s held for services)" % _gbs(held) if held else "", room["psi"]))
         for name, busy in sorted(room.get("disks", {}).items()):
             print("  disk %s busy %.0f%%" % (name, busy))
         for gid, g in sorted(room.get("gpus", {}).items(), key=lambda kv: kv[1]["index"]):
@@ -3058,7 +3121,9 @@ def cmd_room(args):
                 ", GPU %s" % ",".join(x[:12] for x in j["gpus"]) if j.get("gpus") else "",
                 "; ends about %s" % dt.datetime.fromtimestamp(end).astimezone().strftime("%H:%M %Z") if end else ""))
         for h2 in r.get("holds") or []:
-            print("  hold %s (%s): %s on GPU %s" % (h2["id"], h2["name"], _gbs(h2["size"]), h2["index"]))
+            parts = (["%s on GPU %s" % (_gbs(h2.get("size") or 0), h2["index"])] if h2.get("index") is not None else []) + (
+                ["%s of RAM" % _gbs(h2["ram"])] if h2.get("ram") else [])
+            print("  hold %s (%s): %s" % (h2["id"], h2["name"], ", ".join(parts)))
         for j in r.get("held") or []:
             print("  held %s (%s) for %s: %s" % (j["token"][:8], j["task"], _fmt_dur(j["waited_s"]),
                                                  j.get("reason") or "not checked yet"))
@@ -3672,10 +3737,11 @@ def build_parser():
     q.add_argument("--all", action="store_true", help="include finished jobs older than --recent")
     q.add_argument("--recent", type=float, default=24.0, metavar="H", help="hide finished jobs older than H hours (default 24)")
 
-    q = sub.add_parser("hold", help="hold GPU memory for a service that runs outside job (first come)")
+    q = sub.add_parser("hold", help="hold GPU memory or RAM for a service that runs outside job (first come)")
     q.add_argument("host", help="an admission host")
     q.add_argument("--gpu", default=None, metavar="INDEX|UUID", help="the card")
     q.add_argument("--mem", type=_parse_size, default=None, metavar="SIZE", help="GPU memory to hold")
+    q.add_argument("--ram", type=_parse_size, default=None, metavar="SIZE", help="RAM to hold")
     q.add_argument("--name", default=None, help="who holds it")
     q.add_argument("--while-pid", type=int, default=None, metavar="PID", help="the hold ends when PID exits")
     q.add_argument("--unit", default=None, help="the service whose processes are the hold's own use")
@@ -3683,7 +3749,7 @@ def build_parser():
     q.add_argument("--ttl", type=float, default=None, metavar="MIN", help="it ends unless renewed within MIN minutes")
     q.add_argument("--renew", default=None, metavar="ID", help="renew hold ID's time to live")
 
-    q = sub.add_parser("release", help="end a GPU hold")
+    q = sub.add_parser("release", help="end a hold")
     q.add_argument("host", help="an admission host")
     q.add_argument("hold_id", metavar="ID")
 

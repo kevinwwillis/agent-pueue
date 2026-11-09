@@ -315,9 +315,12 @@ the larger of their size and their current use. A job that ends frees its room a
   processes it names (`--while-pid` and its descendants, or the cgroup of `--unit`/`--cgroup`); a hold that
   names none is counted at its size and its real use again as outside use (safe, but it wastes room), so
   services should name their processes.
-- **RAM, per host:** the lowest over `outside_window_s` of `MemAvailable + Σ admitted jobs' current use` (what
-  would be free with no admitted jobs), minus `ram_headroom`, minus `Σ over admitted jobs of max(size, current
-  use)`. Nothing is released while memory pressure is over `memory_pressure_max_pct`.
+- **RAM, per host:** the lowest over `outside_window_s` of `MemAvailable + Σ admitted jobs' current use + Σ RAM
+  holds' own use` (what would be free with no admitted jobs and no RAM holds), minus `ram_headroom`, minus `Σ
+  over admitted jobs of max(size, current use)`, minus `Σ over RAM holds of max(size, own use)`. A RAM hold's own
+  use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or `RssAnon + RssShmem` of
+  `--while-pid` and its descendants; a RAM hold that names no processes is counted at its size and its real use
+  again as outside use. Nothing is released while memory pressure is over `memory_pressure_max_pct`.
 - **CPU, per host** (CPU can be shared by time, so older jobs count at their measured use): `outside` is the
   average over `cpu_window_s` of busy threads minus the admitted jobs' measured threads. A job fits when
   `outside + Σ over jobs older than cpu_window_s of their average use over it + Σ over younger jobs of max(size,
@@ -374,8 +377,9 @@ reaches its hard limit before its `total`.
 
 ### Holds
 
-A service that uses a GPU outside `job` (a model server, for example) registers a hold before it loads:
-`job hold <host> --gpu <index|uuid> --mem SIZE --name NAME`, naming its processes with `--while-pid PID` (the
+A service that uses a GPU or much RAM outside `job` (a model server, for example) registers a hold before it
+loads: `job hold <host> --gpu <index|uuid> --mem SIZE --name NAME` for GPU memory, `--ram SIZE` for RAM, or
+both in one hold, naming its processes with `--while-pid PID` (the
 hold ends when that process exits), `--unit NAME` or `--cgroup PATH` (a service or container), and optionally
 `--ttl MIN` (it ends unless renewed with `job hold --renew <id>`). A hold on a unit or cgroup also ends once that
 unit or cgroup, seen before, is gone. Under the queue lock, a hold is granted only if the card has the room:
@@ -383,7 +387,9 @@ the loop writes its snapshot under the same lock after each cycle's releases, an
 room the holds granted since. In each cycle the loop reads the holds again under the lock before it releases,
 and takes out of its room any hold granted since it measured. A refused hold is refused at once, and the
 service decides what to do. A caller that wants room kept for a later step registers a hold the same way.
-Holds and jobs are first come: neither displaces the other.
+Holds and jobs are first come: neither displaces the other. `gpu_headroom` keeps the parties on one card
+apart, so a GPU hold on a card that has no admitted job and no other hold may use it (a model that fills the
+card); jobs admitted after it still keep it. RAM holds always keep `ram_headroom` free.
 
 ## Placement (client side)
 

@@ -288,11 +288,11 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   gone); submit it again instead.
 - A submit without a size, or from an older `job` (protocol 3 or 4), is refused with a message that starts
   `protocol mismatch` or names the size options.
-- A service that uses a GPU outside `job` (a model server) registers its GPU memory before it loads:
-  `job hold HOST --gpu 0 --mem 18G --name NAME` plus `--while-pid PID`, `--unit NAME` or `--cgroup PATH` for
-  its processes, and optionally `--ttl MIN` (renew with `job hold HOST --renew ID`). It prints the hold id;
-  `job release HOST ID` ends it. A hold is granted only if the card has the room now, else refused at once.
-  Holds and jobs are first come.
+- A service that uses a GPU or much RAM outside `job` (a model server) registers it before it loads:
+  `job hold HOST --gpu 0 --mem 18G --name NAME`, `--ram 72G`, or both, plus `--while-pid PID`, `--unit NAME`
+  or `--cgroup PATH` for its processes, and optionally `--ttl MIN` (renew with `job hold HOST --renew ID`). It
+  prints the hold id; `job release HOST ID` ends it. A hold is granted only if the host has the room now, else
+  refused at once. A GPU hold alone on its card may use the card's headroom. Holds and jobs are first come.
 - `job history [HOST ...] [--task T]` lists the records on admission hosts, newest first: size (for a pilot,
   the free room it was counted at), measured peaks, how each job ended, and its token for `--like`.
 - `job admission HOST start|stop|status` installs and starts, stops, or shows the host's admission loop
