@@ -4,7 +4,7 @@ title: 'Admission: start jobs only where they fit, sized by measurement'
 status: In Progress
 assignee: []
 created_date: '2026-11-09T17:00:00Z'
-updated_date: '2026-11-09T21:10:00Z'
+updated_date: '2026-11-09T22:16:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -30,4 +30,6 @@ Several agents share a few machines: servers that people also use directly, and 
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-11-09 16:11 ET: criteria checked: 1 (tests on two throwaway hosts; live on sttp1, held through warm-up and released when it fit), 2 (live: job room on sttp1 matches MemAvailable and the driver's reserved GPU memory), 3 (pilot then --like, tests; no rule takes a run time), 4 (live records on sttp1 with size, counted room, RAM limit and peaks), 5 (sttp1 on protocol 5 while sttp2 is not an admission host; tests of old hosts). Subtasks .01 to .04 done (job 0.6.2). Still open here: rented hosts (hosts.d) and TASK-003.05 (GPU memory caps); service holds with RAM are agent-callers TASK-012.
+
+2026-11-09 17:11 ET: job 0.7.0 released (v0.7.0): holds carry RAM (--ram); a GPU hold alone on its card may use the headroom; job hold exits 206 (NO_ROOM) apart from admission unavailable (205); admitted jobs are counted at their hard RAM limit and fit only if it fits, including the submit-time empty-host check and --like sizing; the loop restarts into changed settings. Two full reviews per piece; set aside: a job whose limit fits an empty host but not today's outside use stays held (by design). Filed TASK-003.06. Still open here: hosts.d (cloud) and TASK-003.05.
 <!-- SECTION:NOTES:END -->
