@@ -355,8 +355,8 @@ commits before it takes the lock.
   (CPU, RAM basis, `memory.peak`, GPU memory, peak disk rate) and how many samples they come from, and the
   earlier job a `--like` size came from, the progress series (time, done, total, RAM; last 200 lines), the
   projected end, and what the loop counted the job at when it released it (RAM, GPU memory per card) with its
-  hard RAM limit. For a pilot, the size holds only its CPUs and GPU count; what it was counted at is the free
-  room at its release.
+  hard RAM limit (cleared if the job is held again). For a pilot, the RAM and GPU memory in the size are
+  placeholders; what it was counted at, and limited to, is the free room at its release.
 - `samples`: per-resource values, kept 7 days; `recent`: the loop's last samples in full.
 - `holds`: id, name, card, size, start, end, and how it ended.
 
