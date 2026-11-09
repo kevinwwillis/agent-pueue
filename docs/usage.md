@@ -136,7 +136,7 @@ only the code. The last line repeats the exit code.
 | `ALERT` | 201 | The `--check` script failed on new output; its message is printed. | **yes**, unless it had just finished |
 | `UNREACHABLE` | 202 | For 15 minutes `job` could not get the job's state: the host was unreachable over ssh, or pueue there did not answer. Shorter gaps are retried quietly. | probably |
 | `GONE` | 204 | The pueue task no longer exists, or its id now belongs to another job. | no |
-| `WRAPPER_ERROR` | 205 | `job` could not do what was asked (bad group, missing directory, bad `--check` path, pueue down at submit time, client and host versions differ); the message says what. If a `note:` line says the job was queued, it was, and keeps running; otherwise it was not queued. | see the message |
+| `WRAPPER_ERROR` | 205 | `job` could not do what was asked (bad group, missing directory, bad `--check` path, pueue down at submit time, client and host versions differ, or an admitted job's systemd scope or memory limit could not be set up, so the job never ran); the message says what. If a `note:` line says the job was queued, it was, and keeps running; otherwise it was not queued. | see the message |
 
 After `STALLED`, `ALERT` or `UNREACHABLE` the job is left alone. Look at the
 log, then wait again or stop it, with the command the output prints
@@ -216,6 +216,7 @@ job run gpu1 TASK-12 --check "$SCRATCH/nan-check.sh" -- 'python train.py'
 | `job wait <host> <id> <id> ...` | Wait on several jobs on one host at once. Ends when all have ended (first line `job: ALL ENDED ...`, exit 0 if all succeeded, else the exit code of the lowest-id job that did not), or as soon as one of them is `STALLED`, `ALERT`, `UNREACHABLE` or `GONE` (first line names it and lists the ids still running). |
 | `job ls [host ...] [--all] [--recent H]` | Every job on this machine and every host in the hosts file: host, id, task id, status, run time, group, session, command. Finished jobs older than `--recent` hours (default 24) are hidden unless `--all`. Exits 202 if a host could not be reached (the reachable ones are still listed). |
 | `job group <host> <name> <n>` | Create a pueue group (if missing) and let it run `n` jobs at a time. Then `job submit/run ... --group <name>`. |
+| `job room [host ...] [--json]` | Each admission host's room: CPU, RAM, memory pressure, disks, each GPU's free memory and outside use, the jobs running and the jobs held with their reasons. |
 | `job kill <host> <id> [--token T]` | Kill a running job (pueue kill), or take a queued one out of the queue (pueue remove). With `--token`, refuses if the id now belongs to another job. |
 
 ## Queues of jobs
@@ -241,6 +242,61 @@ limit for everyone; don't change it without a reason.
 
 A queued or paused job waits without limit and does not count as stalled;
 `job ls` shows it as `Queued` or `Paused`.
+
+## Admission hosts: jobs start only where they fit
+
+A host with an admission settings file (`~/.config/agent-pueue/admission.json`) runs an admission loop
+(`job _admit`) that measures what is in use, including processes `job` did not start, and starts each job only
+when it fits. The design is [admission.md](admission.md). On such a host:
+
+- **Every job needs a size**, one of:
+  - `--pilot`: a first run to measure the job. It gets all the free RAM (and, with `--gpus N`, all the free
+    memory on those cards) and stops at its time limit (`--max-minutes`, or the host's setting).
+    It takes `--cpus N` and `--gpus N`, not `--ram`. Its time limit counts from its start.
+  - `--like TOKEN` (or `HOST#ID`): sized from that earlier job's measured peaks plus margins, printed as
+    `sized like ...`, and run on the host that holds that record. Refused when that run was killed or
+    crashed (its peaks are only a lower bound) or was measured fewer than 3 times.
+  - `--ram SIZE` (required, at least 16 MiB) with `--cpus N` (more than 0), `--gpus N`, `--gpu-mem SIZE` (per
+    GPU), `--gpu-share PCT`; or `--small`. Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
+- `job run auto <task-id> ...` lets `job` choose the host: one with room now, else the job waits (is held) on
+  the first host that takes it. A host that refuses the job (too small, no record for `--like`, a missing
+  `--needs-path`) is skipped; an unreachable host stops the placement, since the job may have been queued
+  there. `--host NAME` (repeatable) limits the choice.
+- A held job's wait prints why every 10 minutes (`held: needs 18.0 GB RAM, 9.4 GB free`); being held is not a
+  verdict. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
+- The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
+  for a pilot its free RAM at release), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
+  `note: it went over its RAM limit of N GB; the whole job was stopped`. Processes it leaves running when its
+  command ends are stopped.
+- GPUs are given by UUID in `CUDA_VISIBLE_DEVICES` (also in `JOB_GPU_UUIDS`); a job without `--gpus` sees none.
+  `--env CUDA_VISIBLE_DEVICES=...` is refused. Code should use devices 0..N-1.
+- `ALERT` (exit 201) can also come from the loop: the job's group is paused, it uses more GPU memory than its
+  size or a GPU it was not given, its RAM trend reaches its limit, a stop at its time limit failed, or the
+  host's loop has stopped while the job is held. The job keeps its place.
+- A pilot stopped at its time limit ends `KILLED` with a note saying so ("as planned"); size the next run
+  `--like` its token.
+- Without `--group`, admitted jobs run in the group `sched`, so they start as soon as they fit.
+- Other constraints: `--gpu-model TEXT`, `--needs-path PATH`, `--data PATH` (its disk; heavy-disk jobs wait
+  while that disk is busy), `--stop-at TIME` (with its UTC offset; stopped then, dropped if still held),
+  `--in-containers`, `--restartable`.
+- After the loop starts with no recent history (a reboot, a long stop), it measures the host for `warmup_s`
+  (10 minutes by default) before it starts anything; `job room` shows `measuring the host first`.
+- A job may append `done total` lines (for example `120 6264`) to the file in `$JOB_PROGRESS`. It then gets a
+  projected end (`job ls` shows `[120 of 6264, ends about ...]`), and an early `ALERT` if its RAM grows with
+  its progress fast enough to reach its RAM limit before the end.
+- Restarting an admitted job in place (`pueue restart --in-place`) ends it `WRAPPER_ERROR` (its assignment is
+  gone); submit it again instead.
+- A submit without a size, or from an older `job` (protocol 3 or 4), is refused with a message that starts
+  `protocol mismatch` or names the size options.
+- A service that uses a GPU outside `job` (a model server) registers its GPU memory before it loads:
+  `job hold HOST --gpu 0 --mem 18G --name NAME` plus `--while-pid PID`, `--unit NAME` or `--cgroup PATH` for
+  its processes, and optionally `--ttl MIN` (renew with `job hold HOST --renew ID`). It prints the hold id;
+  `job release HOST ID` ends it. A hold is granted only if the card has the room now, else refused at once.
+  Holds and jobs are first come.
+- `job history [HOST ...] [--task T]` lists the records on admission hosts, newest first: size, measured
+  peaks, how each job ended, and its token for `--like`.
+- `job admission HOST start|stop|status` installs and starts, stops, or shows the host's admission loop
+  service (`agent-pueue-admit.service`, a systemd user unit).
 
 ## The job's environment
 

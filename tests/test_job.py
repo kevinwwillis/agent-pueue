@@ -71,6 +71,7 @@ class Daemon:
         e["JOB_HOSTS_FILE"] = os.path.join(self.dir, "hosts")
         e["JOB_PUEUE_CONFIG"] = self.cfg
         e["XDG_STATE_HOME"] = os.path.join(self.dir, "state")
+        e["JOB_ADMISSION_CONFIG"] = os.path.join(self.dir, "no-admission.json")  # not an admission host
         e.pop("JOB_SESSION", None)
         e.update(extra)
         return e
