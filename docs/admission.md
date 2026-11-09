@@ -353,14 +353,16 @@ commits before it takes the lock.
   (exit, killed, memory limit, host out of memory, stop-at, pilot time limit, wrapper error), size and where it
   came from (pilot, like, explicit, small), whether the peaks are final or sampled, constraints, GPU UUIDs, peaks
   (CPU, RAM basis, `memory.peak`, GPU memory, peak disk rate) and how many samples they come from, and the
-  earlier job a `--like` size came from, the progress series (time, done, total, RAM; last 200 lines) and the
-  projected end.
+  earlier job a `--like` size came from, the progress series (time, done, total, RAM; last 200 lines), the
+  projected end, and what the loop counted the job at when it released it (RAM, GPU memory per card) with its
+  hard RAM limit. For a pilot, the size holds only its CPUs and GPU count; what it was counted at is the free
+  room at its release.
 - `samples`: per-resource values, kept 7 days; `recent`: the loop's last samples in full.
 - `holds`: id, name, card, size, start, end, and how it ended.
 
 Peaks are kept for good. `job history [HOST ...] [--task T] [--session S] [--token X]` reads every admission
-host's records over the same ssh channel as `job ls`: newest first, each with its size, peaks, how it ended
-and its token (for `--like`).
+host's records over the same ssh channel as `job ls`: newest first, each with its size (for a pilot, the free
+room it was counted at), peaks, how it ended and its token (for `--like`).
 
 ### Alerts
 

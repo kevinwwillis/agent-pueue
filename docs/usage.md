@@ -293,8 +293,8 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   its processes, and optionally `--ttl MIN` (renew with `job hold HOST --renew ID`). It prints the hold id;
   `job release HOST ID` ends it. A hold is granted only if the card has the room now, else refused at once.
   Holds and jobs are first come.
-- `job history [HOST ...] [--task T]` lists the records on admission hosts, newest first: size, measured
-  peaks, how each job ended, and its token for `--like`.
+- `job history [HOST ...] [--task T]` lists the records on admission hosts, newest first: size (for a pilot,
+  the free room it was counted at), measured peaks, how each job ended, and its token for `--like`.
 - `job admission HOST start|stop|status` installs and starts, stops, or shows the host's admission loop
   service (`agent-pueue-admit.service`, a systemd user unit).
 
