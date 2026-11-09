@@ -430,13 +430,19 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(hs({"pilot": 1, "size": pilot}), "1 CPU, 2 GPU, to be counted at the free room at its release")
         released = {"pilot": 1, "size": pilot, "released": 1.0, "ram_counted": 50 * GB, "memory_max": 50 * GB,
                     "gpu_counted": {CARD: 10 * GB, CARD2: 20 * GB}}
-        self.assertEqual(hs(released), "1 CPU, 50.0 GB, 2 GPU (10.0 GB, 20.0 GB) (the free room at its release)")
-        self.assertEqual(hs(dict(released, gpu_counted=None)), "1 CPU, 50.0 GB, 2 GPU (the free room at its release)")
+        self.assertEqual(hs(released), "1 CPU, 50.0 GB, 2 GPUs with 10.0 GB and 20.0 GB, the free room at its release")
+        self.assertEqual(hs(dict(released, gpu_counted={CARD: 10 * GB})),
+                         "1 CPU, 50.0 GB, 1 GPU with 10.0 GB, the free room at its release")
+        self.assertEqual(hs(dict(released, gpu_counted=None)), "1 CPU, 50.0 GB, 2 GPU, the free room at its release")
         by_hand = {"pilot": 1, "size": pilot, "released": 1.0, "ram_counted": 4 * GB, "memory_max": None,
                    "gpu_counted": {}}
         self.assertEqual(hs(by_hand), "1 CPU, 2 GPU, not released by the loop")
+        self.assertEqual(hs(dict(by_hand, pilot=0, size={"cpus": 1, "ram": 4 * GB, "gpus": 0, "gpu_mem": 0})),
+                         "1 CPU, 4.0 GB, not released by the loop")
         old = {"pilot": 1, "size": pilot, "released": 1.0, "started": 2.0}  # a record from before these fields
         self.assertEqual(hs(old), "1 CPU, 2 GPU, room counted not recorded")
+        self.assertEqual(hs({"pilot": 1, "size": pilot, "how": "removed"}), "1 CPU, 2 GPU, never released")
+        self.assertEqual(hs({"pilot": 0, "size": ["not", "a", "size"]}), "0 CPU, 0.0 GB")
 
 
 class RecordsFile(unittest.TestCase):
@@ -450,6 +456,7 @@ class RecordsFile(unittest.TestCase):
                   "spec = importlib.util.spec_from_loader('jobmod', loader)\n"
                   "m = importlib.util.module_from_spec(spec); loader.exec_module(m)\n"
                   "a = m.Admission.__new__(m.Admission); a.path = lambda *p: os.path.join(sys.argv[2], *p)\n"
+                  "open(os.path.join(sys.argv[2], 'ready-%d' % os.getpid()), 'w').close()\n"
                   "while not os.path.exists(os.path.join(sys.argv[2], 'go')): pass\n"
                   "a.db().close()\n")
         for _ in range(8):
@@ -461,7 +468,10 @@ class RecordsFile(unittest.TestCase):
                 c.close()
                 ps = [subprocess.Popen([sys.executable, "-c", opener, JOB, d], stderr=subprocess.PIPE, text=True)
                       for _ in range(2)]
-                time.sleep(0.5)  # both loaded and waiting
+                deadline = time.monotonic() + 60
+                while len([f for f in os.listdir(d) if f.startswith("ready-")]) < 2:  # both loaded and waiting
+                    self.assertLess(time.monotonic(), deadline, "the openers did not start")
+                    time.sleep(0.01)
                 open(os.path.join(d, "go"), "w").close()
                 for p in ps:
                     _, err = p.communicate(timeout=60)
@@ -1219,7 +1229,7 @@ class LoopTests(Base):
             self.assertEqual(list(gpu), [CARD])
             self.assertAlmostEqual(gpu[CARD], 24 * GB - int(0.4 * GB) - 500 * 10 ** 6, delta=MiB)
             p = self.job("history", "local", "--task", "T-adm", **self.env())
-            self.assertIn("pilot: 1 CPU, %s, 1 GPU (%s) (the free room at its release)" % (
+            self.assertIn("pilot: 1 CPU, %s, 1 GPU with %s, the free room at its release" % (
                 self.j._gbs(rec["ram_counted"]), self.j._gbs(gpu[CARD])), p.stdout)
             p = self.job("history", "local", "--json", "--task", "T-adm", **self.env())
             j = [x for x in json.loads(p.stdout)["local"]["jobs"] if x["token"] == tok][0]
@@ -1270,6 +1280,8 @@ class LoopTests(Base):
         self.assertEqual(rec["exit"], 205)
         self.assertIsNone(rec["memory_max"])
         self.assertEqual(rec["ram_counted"], int(1.5 * GB))
+        p = self.job("history", "local", "--task", "T-adm", **self.env())
+        self.assertIn("explicit: 1 CPU, 1.5 GB, not released by the loop", p.stdout)
 
     # -- review cycle 2 ----------------------------------------------------------------------------------------
 

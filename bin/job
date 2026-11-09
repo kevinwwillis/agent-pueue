@@ -1487,24 +1487,24 @@ class Admission:
 
     def db(self):
         con = sqlite3.connect(self.path("admission.sqlite"), timeout=30)
-        con.execute("CREATE TABLE IF NOT EXISTS jobs (%s, PRIMARY KEY (token))" % ", ".join(RECORD_FIELDS))
-        if set(RECORD_FIELDS) - {r[1] for r in con.execute("PRAGMA table_info(jobs)")}:
-            # a records file from an older job: add the missing columns under the write lock, read again inside
-            # it, so two processes upgrading the file at once do not both add the same column
-            try:
+        try:
+            con.execute("CREATE TABLE IF NOT EXISTS jobs (%s, PRIMARY KEY (token))" % ", ".join(RECORD_FIELDS))
+            if set(RECORD_FIELDS) - {r[1] for r in con.execute("PRAGMA table_info(jobs)")}:
+                # a records file from an older job: add the missing columns under the write lock, read again
+                # inside it, so two processes upgrading the file at once do not both add the same column
                 con.execute("BEGIN IMMEDIATE")
                 have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
                 for col in RECORD_FIELDS:
                     if col not in have:
                         con.execute("ALTER TABLE jobs ADD COLUMN %s" % col)
                 con.commit()
-            except BaseException:
-                con.close()
-                raise
-        con.execute("CREATE TABLE IF NOT EXISTS samples (t REAL, kind TEXT, key TEXT, value REAL)")
-        con.execute("CREATE TABLE IF NOT EXISTS recent (t REAL, sample TEXT)")  # the loop's windows, kept over restarts
-        con.execute("CREATE INDEX IF NOT EXISTS samples_t ON samples (t)")
-        con.execute("CREATE TABLE IF NOT EXISTS holds (id PRIMARY KEY, name, card, size, start, ended, how)")
+            con.execute("CREATE TABLE IF NOT EXISTS samples (t REAL, kind TEXT, key TEXT, value REAL)")
+            con.execute("CREATE TABLE IF NOT EXISTS recent (t REAL, sample TEXT)")  # the loop's windows, kept over restarts
+            con.execute("CREATE INDEX IF NOT EXISTS samples_t ON samples (t)")
+            con.execute("CREATE TABLE IF NOT EXISTS holds (id PRIMARY KEY, name, card, size, start, ended, how)")
+        except BaseException:
+            con.close()
+            raise
         return con
 
     def record(self, con, row):
@@ -2010,12 +2010,15 @@ class Loop:
                 continue
             # released
             if status == "Stashed":  # marked released, but the loop stopped before pueue enqueue: hold it again
+                # the record first, committed: if the loop stops before the queue file says held, the next cycle
+                # comes here again, so the record never keeps a release the queue file has dropped
+                self.adm.record(con, {"token": q["token"], "released": None, "gpus": [], "ram_counted": None,
+                                      "gpu_counted": None, "memory_max": None})
+                con.commit()
                 q.update({"state": "held", "reason": None, "released": None})
                 for k in ("gpus", "ram_counted", "gpu_counted", "memory_max"):
                     q.pop(k, None)
                 self.adm.save(q)
-                self.adm.record(con, {"token": q["token"], "released": None, "gpus": [], "ram_counted": None,
-                                      "gpu_counted": None, "memory_max": None})
                 try:
                     os.remove(self.adm.assign_path(q["token"]))
                 except FileNotFoundError:
@@ -2338,6 +2341,8 @@ def admit_main(once=False):
     loop = Loop(settings)
     results = os.path.join(STATE_DIR, "results")
     os.makedirs(results, mode=0o700, exist_ok=True)
+    if not once:  # Loop() took the first CPU and disk readings; the first cycle's rates cover a whole interval
+        time.sleep(settings["sample_interval_s"])
     while True:
         if once:
             loop.cycle()
@@ -2645,10 +2650,12 @@ def host_history(req):
     jobs = []
     for r in rows:
         j = dict(zip(HISTORY_FIELDS, r))
-        for k in ("size", "gpu_counted"):
+        for k in ("size", "gpu_counted"):  # JSON objects; anything else in the row is read as missing
             try:
                 j[k] = json.loads(j[k]) if j[k] else None
-            except ValueError:
+            except (TypeError, ValueError):
+                j[k] = None
+            if not isinstance(j[k], dict):
                 j[k] = None
         jobs.append(j)
     return {"admission": True, "hostname": socket.gethostname(), "jobs": jobs}
@@ -3455,22 +3462,26 @@ def cmd_wait(args):
 
 def _history_size(j):
     """The SIZE text of a record in job history. A pilot is counted at, and limited to, the free room at its
-    release, not at its size (which holds only its CPUs and GPU count; its RAM and GPU memory are placeholders)."""
-    z = j.get("size") or {}
+    release, not at its size (which holds only its CPUs and GPU count; its RAM and GPU memory are placeholders).
+    A job a person started while it was held was counted at its size, with no RAM limit and no GPUs."""
+    z = j.get("size") if isinstance(j.get("size"), dict) else {}
     cpus, ngpu = z.get("cpus") or 0, z.get("gpus") or 0
+    by_hand = j.get("ram_counted") is not None and j.get("memory_max") is None
     if not j.get("pilot"):
-        return "%g CPU, %s%s" % (cpus, _gbs(z.get("ram") or 0),
-                                 ", %d GPU %s" % (ngpu, _gbs(z.get("gpu_mem") or 0)) if ngpu else "")
+        return "%g CPU, %s%s%s" % (cpus, _gbs(z.get("ram") or 0),
+                                   ", %d GPU %s" % (ngpu, _gbs(z.get("gpu_mem") or 0)) if ngpu else "",
+                                   ", not released by the loop" if by_hand else "")
     base = "%g CPU%s" % (cpus, ", %d GPU" % ngpu if ngpu else "")
     if j.get("memory_max") is not None:  # released by the loop
-        gc = list((j.get("gpu_counted") or {}).values())
-        gpus = (", %d GPU (%s)" % (len(gc), ", ".join(_gbs(v) for v in gc)) if gc
-                else ", %d GPU" % ngpu if ngpu else "")
-        return "%g CPU, %s%s (the free room at its release)" % (cpus, _gbs(j.get("ram_counted") or 0), gpus)
-    if j.get("ram_counted") is not None:
+        gc = j.get("gpu_counted")
+        gc = [v for v in gc.values() if isinstance(v, (int, float))] if isinstance(gc, dict) else []
+        gpus = (", %d GPU%s with %s" % (len(gc), "s" if len(gc) > 1 else "", " and ".join(_gbs(v) for v in gc))
+                if gc else ", %d GPU" % ngpu if ngpu else "")
+        return "%g CPU, %s%s, the free room at its release" % (cpus, _gbs(j.get("ram_counted") or 0), gpus)
+    if by_hand:
         return base + ", not released by the loop"
     if not j.get("released") and not j.get("started"):
-        return base + ", to be counted at the free room at its release"
+        return base + (", never released" if j.get("how") else ", to be counted at the free room at its release")
     return base + ", room counted not recorded"
 
 
