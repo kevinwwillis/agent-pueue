@@ -286,7 +286,8 @@ class Settings(unittest.TestCase):
 
     def test_invalid_files_are_refused(self):
         for text, part in (("{", "cannot be read"), ('{"ram_headrom_gb": 1}', "unknown setting ram_headrom_gb"),
-                           ('{"ram_hard_factor": 0.5}', "ram_hard_factor"), ('{"disks": ["data"]}', "absolute"),
+                           ('{"ram_hard_factor": 0.5}', "ram_hard_factor"), ('{"ram_hard_factor": 1e300}', "ram_hard_factor"),
+                           ('{"disks": ["data"]}', "absolute"),
                            ('{"gpu_env": {"CUDA_VISIBLE_DEVICES": "0"}}', "gpu_env"),
                            ('{"small": {"gpus": 1}}', "small")):
             with self.assertRaises(self.j.JobError) as e:
@@ -577,6 +578,16 @@ class HoldMeasure(unittest.TestCase):
             apps["rc"] = 9  # the process query failed
             c = self.j._nvidia_smi_cards()[0]
             self.assertEqual((c["procs"], c["procs_ok"]), ({}, False))
+        finally:
+            self.j.subprocess.run = real
+
+    def test_a_unit_lookup_that_times_out_is_unknown_not_gone(self):
+        def run(args, **kw):
+            raise subprocess.TimeoutExpired(args, 5)
+        real = self.j.subprocess.run
+        self.j.subprocess.run = run
+        try:
+            self.assertIsNone(self.j._hold_cgroups({"unit": "model.service"}))
         finally:
             self.j.subprocess.run = real
 
@@ -1125,6 +1136,8 @@ class LoopTests(Base):
             p = self.hold("--gpu", "0", "--mem", "22.5G", "--name", "beside-a-job")  # 22.1 GB free with the headroom kept
             self.assertNotEqual(p.returncode, 0)
             self.assertIn("GPU 0 on", p.stdout + p.stderr)
+            self.assertIn("(counted at %s, its limit)" % self.j._gbs(self.j.ram_limit(self.settings, 100 * MiB)),
+                          self.job("room", "local", **self.env()).stdout)
         finally:
             self.job("kill", "local", str(tid))
 
@@ -1322,13 +1335,76 @@ class LoopTests(Base):
         p = self.hold("--gpu", "0", "--mem", "23.5G", "--name", "alone")
         self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
 
-    def test_a_job_released_before_limits_were_counted_counts_at_its_limit(self):
+    def test_a_job_released_before_limits_were_recorded_counts_at_the_limit_it_runs_under(self):
         loop = self.loop()
         q = {"token": "t" * 32, "released": time.time(), "size": {"cpus": 1.0, "ram": 4 * GB, "gpus": 0, "gpu_mem": 0},
              "gpus": [], "ram_counted": 4 * GB, "gpu_counted": {}, "memory_max": 6 * GB}
         self.assertEqual(loop._counted(q, time.time())["ram_counted"], 6 * GB)
-        q.pop("memory_max")
+        q.pop("memory_max")  # released by a loop that did not record it
+        assign = loop.adm.assign_path(q["token"])
+        with open(assign, "w") as f:
+            f.write("JOB_MEMORY_MAX=%d\nCUDA_VISIBLE_DEVICES=\nJOB_GPU_UUIDS=\n" % (7 * GB))  # set at an older factor
+        self.assertEqual(loop._counted(q, time.time())["ram_counted"], 7 * GB)
+        os.remove(assign)
+        self.assertEqual(loop._counted(q, time.time())["ram_counted"], self.j.ram_limit(self.settings, 4 * GB))
+        q["pilot"] = True  # a pilot with no record of its limit: counted at what it was counted at
         self.assertEqual(loop._counted(q, time.time())["ram_counted"], 4 * GB)
+
+    def test_a_unit_hold_whose_lookup_fails_is_kept(self):
+        cg = os.path.join(self.host.root, "cgroup")
+        os.makedirs(os.path.join(cg, "system.slice", "model.service"))
+        loop = self.j.Loop(self.settings, measure=self.j.Measure(proc=self.host.proc, gpu_file=self.host.gpu_file,
+                                                                   cgroup_root=cg))
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "4G", "--name", "svc", "--unit", "model.service")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        real, answer = self.j._hold_cgroups, {"cgs": ["/system.slice/model.service"]}
+        self.j._hold_cgroups = lambda h: answer["cgs"]
+        try:
+            self.host.tick()
+            loop.cycle()  # seen
+            answer["cgs"] = None  # systemd could not be asked
+            for _ in range(2):
+                self.host.tick()
+                loop.cycle()
+            self.assertEqual([h["name"] for h in loop.holds], ["svc"])
+            answer["cgs"] = []  # the unit has no cgroup: it is gone
+            for _ in range(2):
+                self.host.tick()
+                loop.cycle()
+            self.assertEqual(loop.holds, [])
+        finally:
+            self.j._hold_cgroups = real
+
+    def test_the_loop_restarts_into_changed_settings(self):
+        adm = self.j.Admission(self.settings)
+
+        def ram_room():
+            snap = adm.read_json(adm.path("room.json")) or {}
+            return ((snap.get("room") or {}).get("ram") or {}).get("room")
+
+        def until(ok, what):
+            deadline = time.monotonic() + 60
+            while not ok():
+                self.assertLess(time.monotonic(), deadline, what)
+                self.host.tick()
+                time.sleep(0.2)
+        p = subprocess.Popen([sys.executable, JOB, "_admit"], env=self.d.env(**self.env()), stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, text=True)
+        try:
+            until(lambda: ram_room() is not None and abs(ram_room() - 49 * GB) < 10 * MiB, "no room with 1 GB headroom")
+            self.write_settings(ram_headroom_gb=11)
+            until(lambda: abs(ram_room() - 39 * GB) < 10 * MiB, "the loop did not take up the new headroom")
+            with open(self.cfg, "w") as f:
+                f.write("{ not json")
+            beat = adm.read_json(adm.path("heartbeat"))["t"]
+            until(lambda: adm.read_json(adm.path("heartbeat"))["t"] > beat + 1, "the loop stopped on bad settings")
+            self.assertIsNone(p.poll())
+        finally:
+            p.kill()
+            _, err = p.communicate(timeout=30)
+        self.assertIn("the changed settings are not valid", err)
 
     def test_a_hold_cgroup_must_be_absolute(self):
         loop = self.loop()

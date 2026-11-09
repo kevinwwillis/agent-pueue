@@ -947,7 +947,7 @@ def _admission_settings(path=None, nthreads=None):
         s["placed_cores_max"] = 1.5 * n
     for k in ("cpu_busy_threads_max", "placed_cores_max", "ram_headroom_gb", "gpu_headroom_mb", "disk_heavy_mb_s"):
         _num(s[k], k)
-    _num(s["ram_hard_factor"], "ram_hard_factor", lo=1.0)
+    _num(s["ram_hard_factor"], "ram_hard_factor", lo=1.0, hi=10.0)
     for k in ("memory_pressure_max_pct", "gpu_busy_max_pct", "iowait_max_pct", "disk_busy_max_pct"):
         _num(s[k], k, hi=100.0)
     for k in ("outside_window_s", "cpu_window_s", "sample_interval_s", "pilot_sample_interval_s", "fairness_wait_min"):
@@ -1969,7 +1969,11 @@ class Loop:
             by_cg[path[len(self.m.cg):]] = tok
         hold_pids = {h["id"]: _pid_tree(self.m.proc, h["while_pid"]) for h in holds if h.get("while_pid")}
         hold_cgs = {h["id"]: _hold_cgroups(h) for h in holds if h.get("unit") or h.get("cgroup")}
-        self.hold_present = {hid: any(os.path.isdir(self.m.cg + c) for c in cgs) for hid, cgs in hold_cgs.items()}
+        # None: systemd could not be asked this cycle, so the hold is neither seen nor gone, and its use this cycle
+        # counts as outside use (the safe side)
+        self.hold_present = {hid: None if cgs is None else any(os.path.isdir(self.m.cg + c) for c in cgs)
+                             for hid, cgs in hold_cgs.items()}
+        hold_cgs = {hid: cgs or [] for hid, cgs in hold_cgs.items()}
         held_use, others = {}, {}
         for c in cards:
             for pid, used in c["procs"].items():
@@ -2086,15 +2090,33 @@ class Loop:
         return [r for r in rows if r[3] is not None]
 
     def _counted(self, q, now):
+        # a job is counted at its RAM limit. One released by a loop that did not record it (no memory_max in its
+        # queue entry) is counted at the limit in its assignment file, which is the one it runs under, or, with no
+        # assignment, at the limit its size would get now
+        limit = q.get("memory_max")
+        if limit is None:
+            limit = self._assigned_limit(q["token"])
+        if limit is None and not q.get("pilot"):
+            limit = ram_limit(self.s, q["size"]["ram"])
         c = {"token": q["token"], "released": q["released"], "size": q["size"], "gpus": q.get("gpus", []),
-             # a job is counted at its RAM limit; one released before limits were counted carries memory_max
-             "ram_counted": max(q.get("ram_counted") or q["size"]["ram"], q.get("memory_max") or 0),
+             "ram_counted": max(q.get("ram_counted") or q["size"]["ram"], limit or 0),
              "gpu_counted": q.get("gpu_counted", {})}
         if ((q.get("constraints") or {}).get("in_containers") and q.get("started")
                 and now - q["started"] >= self.s["outside_window_s"]):
             # its containers' use now shows as outside use; counting its size too would count it twice
             c.update(size=dict(q["size"], cpus=0.0), ram_counted=0, gpu_counted={})
         return c
+
+    def _assigned_limit(self, token):
+        """JOB_MEMORY_MAX from a job's assignment file, or None."""
+        try:
+            with open(self.adm.assign_path(token)) as f:
+                for line in f:
+                    if line.startswith("JOB_MEMORY_MAX="):
+                        return int(line.split("=", 1)[1])
+        except (OSError, ValueError):
+            pass
+        return None
 
     def account(self, con, now, queue, tasks, use, st):
         """Track released jobs until their scope is empty; record peaks; end jobs; enforce time limits."""
@@ -2418,7 +2440,8 @@ class Loop:
                  "size": q["size"], "pilot": q.get("pilot")} for q in queue if q.get("state") == "held"]
         jobs = [{"token": q["token"], "task": q["task"], "size": q["size"], "gpus": q.get("gpus"),
                  "released": q.get("released"), "progress": (q.get("progress") or [[0, None, None]])[-1][1:3],
-                 "projected_end": q.get("projected_end")} for q in queue if q.get("state") == "released"]
+                 "projected_end": q.get("projected_end"), "ram_counted": self._counted(q, now)["ram_counted"]}
+                for q in queue if q.get("state") == "released"]
         holds = [{k: h.get(k) for k in ("id", "name", "index", "uuid", "size", "ram", "start", "expires")} for h in self.holds]
         self.adm.write_json(self.adm.path("room.json"), {"t": now, "written": time.time(), "host": socket.gethostname(),
                                                          "room": self.room, "capacity": self.capacity, "held": held,
@@ -2440,6 +2463,13 @@ class Loop:
             pass
 
 
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
 def admit_main(once=False):
     """`job _admit`: run the admission loop of this host (one instance per host)."""
     settings = _admission_settings()
@@ -2453,6 +2483,7 @@ def admit_main(once=False):
         raise JobError("the admission loop already runs on %s" % socket.gethostname())
     me = os.path.realpath(__file__)
     started_mtime = os.path.getmtime(me)
+    settings_mtime = _mtime(ADMISSION_CONFIG)
     loop = Loop(settings)
     results = os.path.join(STATE_DIR, "results")
     os.makedirs(results, mode=0o700, exist_ok=True)
@@ -2477,12 +2508,25 @@ def admit_main(once=False):
                     break  # a job ended or one was submitted
             except OSError:
                 break
+        restart = False
         try:
-            if os.path.getmtime(me) != started_mtime:  # a new job was installed: run it
-                os.close(fd)
-                os.execv(sys.executable, [sys.executable, me, "_admit"])
+            restart = os.path.getmtime(me) != started_mtime  # a new job was installed: run it
         except OSError:
             pass
+        if not restart and _mtime(ADMISSION_CONFIG) != settings_mtime:
+            # the settings changed: submits read them at once, so the loop must count by them too
+            settings_mtime = _mtime(ADMISSION_CONFIG)
+            try:
+                restart = _admission_settings() is not None
+            except JobError as e:
+                sys.stderr.write("job _admit: the changed settings are not valid, so the loop keeps its own: %s\n" % e)
+                sys.stderr.flush()
+        if restart:
+            try:
+                os.close(fd)
+                os.execv(sys.executable, [sys.executable, me, "_admit"])
+            except OSError:
+                pass
 
 
 def _hold_alive(h, proc="/proc", now=None):
@@ -2503,22 +2547,24 @@ def _hold_alive(h, proc="/proc", now=None):
 
 
 def _hold_cgroups(h):
-    """The cgroup paths whose processes are the hold's own use."""
+    """The cgroup paths whose processes are the hold's own use; None when systemd could not be asked, so a slow or
+    failed lookup never reads as the unit being gone."""
     if h.get("cgroup"):
         return [h["cgroup"].rstrip("/")]
     if h.get("unit"):
-        out = []
+        out, unknown = [], False
         for flag in ("--user", "--system"):
             env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
             try:
                 p = subprocess.run(["systemctl", flag, "show", "-p", "ControlGroup", "--value", h["unit"]], env=env,
                                    capture_output=True, text=True, timeout=5)  # each cycle: a hung call delays it
             except (OSError, subprocess.TimeoutExpired):
+                unknown = True
                 continue
             cg = p.stdout.strip()
             if p.returncode == 0 and cg.startswith("/"):
                 out.append(cg.rstrip("/"))
-        return out
+        return None if unknown and not out else out
     return []
 
 
@@ -3210,8 +3256,9 @@ def cmd_room(args):
                 g["index"], g["name"], _gbs(max(0, g["room"])), _gbs(g["total"]), _gbs(g["outside"]), g["util"]))
         for j in r.get("jobs") or []:
             end = j.get("projected_end")
-            print("  running %s (%s): %g CPU, %s RAM%s%s" % (
+            print("  running %s (%s): %g CPU, %s RAM%s%s%s" % (
                 j["token"][:8], j["task"], j["size"]["cpus"], _gbs(j["size"]["ram"]),
+                " (counted at %s, its limit)" % _gbs(j["ram_counted"]) if j.get("ram_counted") else "",
                 ", GPU %s" % ",".join(x[:12] for x in j["gpus"]) if j.get("gpus") else "",
                 "; ends about %s" % dt.datetime.fromtimestamp(end).astimezone().strftime("%H:%M %Z") if end else ""))
         for h2 in r.get("holds") or []:

@@ -49,9 +49,9 @@ job release host2 <hold-id>
     holds the record: `HOST#ID` is sent only to HOST, and `auto` with a token tries the hosts in turn, the
     others refusing for want of the record. Sampled peaks are a lower bound even for a clean run; the margins
     and `ram_hard_factor` cover the gap between samples.
-  - **Explicit sizes:** `--ram SIZE` (required: it is the job's RAM limit), with `--cpus N` (default: the small
-    size's CPUs), `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or `--small`, the settings file's
-    small size.
+  - **Explicit sizes:** `--ram SIZE` (required; the job's hard RAM limit is `ram_hard_factor` times it), with
+    `--cpus N` (default: the small size's CPUs), `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or
+    `--small`, the settings file's small size.
   - A submit with none of these is refused, with a message naming the options.
 - Constraints: `--host NAME` (repeatable), `--gpu-model TEXT` (a substring of the GPU name), `--needs-path PATH`
   (repeatable; a host without the path refuses the job, so `auto` tries the next), `--data PATH` (prefer the
@@ -149,7 +149,8 @@ which the heartbeat makes visible.
 It writes a heartbeat (`state_dir/heartbeat`) every cycle. A heartbeat older than
 `max(3 × sample_interval_s, 120 s)` (longer than one slow pueue call) means the host is not admitting: `room`
 says so, `auto` skips it, and held jobs' waits get ALERT. When `bin/job` changes on disk (after an install), the
-loop re-executes itself with the new code.
+loop re-executes itself with the new code, and when its settings file changes, with the new settings, since
+submits read them at once (a settings file that is not valid is logged and the loop keeps its own).
 
 Each cycle it measures, counts room, releases held jobs that fit, and writes samples, records and alerts. An
 error in one cycle is written to the journal and the loop goes on; the heartbeat is renewed only by a cycle that
@@ -306,7 +307,8 @@ busy time from `/proc/diskstats` deltas for the devices in `disks`.
 ### Room
 
 For each resource, outside use is measured (what admitted jobs don't account for), and admitted jobs count at
-the larger of their size and their current use. A job that ends frees its room at once.
+the larger of their size (for RAM, their hard limit) and their current use. A job that ends frees its room at
+once.
 
 - **GPU memory, per card:** `total − gpu_headroom − outside − Σ over admitted jobs of max(size on the card,
   current use on the card) − Σ over holds on the card of max(size, own use)`, where `outside` is the highest
