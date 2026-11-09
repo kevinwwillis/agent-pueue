@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -204,6 +205,12 @@ class Settings(unittest.TestCase):
         self.assertEqual(s["cpu_busy_threads_max"], 20)
         self.assertEqual(s["placed_cores_max"], 30)
 
+    def test_warm_up_defaults_to_the_longer_window(self):
+        s = self.j._admission_settings(self.write('{"outside_window_s": 300, "cpu_window_s": 600}'))
+        self.assertEqual(s["warmup_s"], 600)
+        with self.assertRaises(self.j.JobError):
+            self.j._admission_settings(self.write('{"warmup_s": 601}'))
+
     def test_invalid_files_are_refused(self):
         for text, part in (("{", "cannot be read"), ('{"ram_headrom_gb": 1}', "unknown setting ram_headrom_gb"),
                            ('{"ram_hard_factor": 0.5}', "ram_hard_factor"), ('{"disks": ["data"]}', "absolute"),
@@ -212,6 +219,115 @@ class Settings(unittest.TestCase):
             with self.assertRaises(self.j.JobError) as e:
                 self.j._admission_settings(self.write(text))
             self.assertIn(part, str(e.exception))
+
+
+class ClientTests(unittest.TestCase):
+    """auto placement and the client's checks, with the hosts' replies made up."""
+
+    def setUp(self):
+        import argparse
+        self.j = load()
+        self.j.LISTED[:] = ["local", "h1", "h2"]
+        for h in ("h1", "h2"):
+            self.j.HOSTS[h] = "ssh-" + h
+        self.calls = []
+        self.args = argparse.Namespace(host="auto", only_hosts=None)
+        room = {"cpu": {"room": 8, "placed_room": 8, "iowait": 0, "outside": 0, "committed": 0},
+                "ram": {"room": 10 * GB}, "gpus": {}, "disks": {}, "pressure_ok": True, "psi": 0}
+        self.snap = lambda **kw: dict({"admission": True, "stale": False, "room": room, "held": [], "paths": [],
+                                       "settings": settings(self.j, tempfile.mkdtemp(prefix="jobt.", dir="/tmp"))},
+                                      **kw)
+        self.refuse = {}
+
+        def submit_to(args, host, command, adm):
+            self.calls.append((host, bool(adm.get("fit_now"))))
+            if host in self.refuse:
+                raise self.j.JobError(self.refuse[host])
+            return 7, "t" * 32
+        self.j.submit_to = submit_to
+
+    def rooms(self, **by_host):
+        self.j._rooms = lambda hosts, timeout=60, paths=(): dict({"local": {"admission": False}}, **by_host)
+
+    def test_auto_tries_the_next_host_when_one_refuses(self):
+        self.rooms(h1=self.snap(), h2=self.snap(held=[1, 2]))
+        self.refuse["h1"] = "cannot run on h1 even when it is empty: needs 100.0 GB RAM"
+        self.assertEqual(self.j.place(self.args, "true", {"ram": 100 * GB})[0], "h2")
+        self.assertEqual(self.calls, [("h1", True), ("h2", True)])
+
+    def test_auto_holds_on_the_first_host_that_takes_it_and_never_resends_after_unreachable(self):
+        self.rooms(h1=self.snap(), h2=self.snap(held=[1]))
+        self.refuse.update(h1="no room on h1 now: needs RAM", h2="no room on h2 now: needs RAM")
+        calls = self.calls
+
+        def submit_to(args, host, command, adm):
+            calls.append((host, bool(adm.get("fit_now"))))
+            if adm.get("fit_now"):
+                raise self.j.JobError("no room on %s now" % host)
+            raise self.j.Unreachable("%s did not answer" % host)
+        self.j.submit_to = submit_to
+        with self.assertRaises(self.j.Unreachable):
+            self.j.place(self.args, "true", {"ram": GB})
+        self.assertEqual(calls, [("h1", True), ("h2", True), ("h1", False)])  # never sent on to h2
+
+    def test_auto_with_a_host_that_is_not_usable(self):
+        self.rooms(h1=self.snap(), h2=self.snap())
+        with self.assertRaises(self.j.JobError) as e:
+            self.j.place(self.args, "true", {"ram": GB, "hosts": ["nope"]})
+        self.assertIn("no admission host is available", str(e.exception))
+
+    def test_auto_like_host_id_goes_to_that_host_only(self):
+        self.rooms(h1=self.snap(), h2=self.snap())
+        self.assertEqual(self.j.place(self.args, "true", {"like": "h2#5"})[0], "h2")
+        self.assertEqual(self.calls, [("h2", True)])
+
+    def test_auto_holds_on_a_host_that_is_still_measuring(self):
+        self.rooms(h1=self.snap(room=None, warmup={"covered_s": 10, "needed_s": 600}), h2=self.snap(stale=True))
+        self.assertEqual(self.j.place(self.args, "true", {"ram": GB})[0], "h1")
+        self.assertEqual(self.calls, [("h1", False)])
+
+    def test_like_host_id_on_another_host_is_refused(self):
+        import argparse
+        args = argparse.Namespace(host="h1", only_hosts=None, pilot=False, small=False, in_containers=False,
+                                  restartable=False, like="h2#5", needs_path=None,
+                                  **{k: None for k in ("cpus", "ram", "gpus", "gpu_mem", "gpu_share", "gpu_model",
+                                                       "data", "stop_at", "max_minutes")})
+        with self.assertRaises(self.j.JobError) as e:
+            self.j.submit(args, "true")
+        self.assertIn("names a job on h2", str(e.exception))
+
+    def test_this_machine_is_asked_once(self):
+        self.j.HOSTS["h1"] = None  # h1 is this machine
+        self.assertEqual(self.j._placement_hosts(), ["h1", "h2"])
+
+    def test_room_from_a_host_that_predates_admission(self):
+        def call(host, op, req, timeout=120):
+            raise self.j.JobError("no reply from job on the host (exit 2): usage: job [-h] ... invalid choice: 'room'")
+        self.j.call = call
+        self.assertEqual(self.j._rooms(["h1"])["h1"], "its job predates admission")
+
+    def test_job_use_measures_the_disk_rate(self):
+        root = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        try:
+            scope = os.path.join(root, "scope")
+            os.makedirs(os.path.join(scope, "job"))
+            os.makedirs(os.path.join(root, "proc", "77"))
+            for name, text in (("memory.current", "1000000"), ("memory.stat", "active_file 0\ninactive_file 0"),
+                               ("cpu.stat", "usage_usec 0"), ("cgroup.procs", "77")):
+                with open(os.path.join(scope, "job", name), "w") as f:
+                    f.write(text + "\n")
+            m = self.j.Measure(proc=os.path.join(root, "proc"))
+
+            def io(n):
+                with open(os.path.join(root, "proc", "77", "io"), "w") as f:
+                    f.write("rchar: 1\nread_bytes: %d\nwrite_bytes: %d\n" % (n, n))
+            io(0)
+            self.assertIsNone(m.job_use(100.0, {"t": scope})["t"]["disk_mb_s"])
+            io(50 * 10 ** 6)
+            self.assertAlmostEqual(m.job_use(110.0, {"t": scope})["t"]["disk_mb_s"], 10.0)
+        finally:
+            import shutil
+            shutil.rmtree(root)
 
 
 class FakeHost:
@@ -278,7 +394,7 @@ class LoopTests(Base):
     def write_settings(self, **over):
         raw = {"state_dir": self.state, "ram_headroom_gb": 1, "cpu_busy_threads_max": 8,
                "placed_cores_max": 12, "gpu_headroom_mb": 500, "sample_interval_s": 1, "pilot": {"max_minutes": 1},
-               "fairness_wait_min": 1, "small": {"cpus": 1, "ram_gb": 0.5}}
+               "fairness_wait_min": 1, "small": {"cpus": 1, "ram_gb": 0.5}, "warmup_s": 0}
         raw.update(over)
         with open(self.cfg, "w") as f:
             json.dump(raw, f)
@@ -400,6 +516,7 @@ class LoopTests(Base):
         tid, tok = r["data"]["id"], r["data"]["token"]
         self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
         self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= 60 * MiB, n=20)
+        self.cycles(loop, lambda: loop.peaks[tok]["n"] >= 3, n=20)  # measured often enough to size from
         now[0] += 61  # past the pilot's one-minute limit
         self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
         self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
@@ -656,6 +773,239 @@ class LoopTests(Base):
         self.host.tick()
         loop.cycle()
         self.assertEqual(loop.holds, [])
+
+    # -- review cycle 1 ----------------------------------------------------------------------------------------
+
+    def test_stop_at_stops_a_running_job_and_drops_a_held_one(self):
+        loop = self.loop()
+        soon = time.time() + 3
+        r = self.submit_sized("sleep 60", cpus=1, ram=100 * MiB, stop_at=soon)
+        self.assertTrue(r["ok"], r)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done", n=80))
+        self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+        self.assertEqual(self.record(tok)["how"], "stop-at")
+        big = self.submit_sized("true", cpus=1, ram=500 * GB, stop_at=time.time() - 1)
+        self.assertFalse(big["ok"])  # cannot run even when empty: refused at once, not held
+        held = self.submit_sized("true", cpus=1, ram=48 * GB, stop_at=time.time() + 1)
+        self.host.set(avail=10 * GB)
+        time.sleep(1.2)
+        self.assertTrue(self.cycles(loop, lambda: (self.record(held["data"]["token"]) or {}).get("how")
+                                    == "dropped at stop-at"))
+
+    def test_stop_at_needs_an_offset(self):
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB, stop_at="2026-11-10T08:00")
+        self.assertFalse(r["ok"])
+        self.assertIn("UTC offset", r["error"])
+
+    def test_a_pilot_takes_cpus_and_gpus_but_not_ram(self):
+        self.host.set(cards=[{"index": 0, "uuid": CARD, "name": "RTX 3090", "total": 24 * GB, "free": 20 * GB}])
+        for kw in ({"gpus": 1}, {"cpus": 4}):
+            r = self.submit_sized("true", pilot=True, **kw)
+            self.assertTrue(r["ok"], r)
+            with open(os.path.join(self.state, "queue", r["data"]["token"] + ".json")) as f:
+                q = json.load(f)
+            self.assertEqual(q["size"]["gpus"], kw.get("gpus", 0))
+            self.assertEqual(q["size"]["cpus"], kw.get("cpus", 1))
+        r = self.submit_sized("true", pilot=True, ram=GB)
+        self.assertFalse(r["ok"])
+        self.assertIn("not --ram", r["error"])
+
+    def test_max_minutes_is_a_pilots_limit(self):
+        r = self.submit_sized("sleep 30", pilot=True, max_minutes=5)
+        with open(os.path.join(self.state, "queue", r["data"]["token"] + ".json")) as f:
+            self.assertEqual(json.load(f)["constraints"]["max_minutes"], 5)
+        r = self.submit_sized("sleep 30", cpus=1, ram=GB, max_minutes=5)
+        self.assertFalse(r["ok"])
+        self.assertIn("--stop-at", r["error"])
+
+    def test_leftover_processes_of_a_task_killed_behind_jobs_back_are_stopped(self):
+        loop = self.loop()
+        r = self.submit_sized("setsid sleep 300 & sleep 300", cpus=1, ram=200 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+        time.sleep(1)
+        self.d.pueue("kill", str(tid))
+        try:
+            self.assertTrue(self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=40))
+            left = loop.m.job_use(time.time(), loop.m.scopes()).get(tok)
+            self.assertFalse(left and left["populated"], left)
+            self.assertEqual(loop.room["ram"]["committed"] if "committed" in loop.room["ram"] else 0, 0)
+        finally:
+            subprocess.run(["systemctl", "--user", "kill", "--signal=SIGKILL", "agent-pueue-job-%s.scope" % tok],
+                           env=dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid()), capture_output=True)
+
+    def test_peaks_survive_a_loop_restart(self):
+        loop = self.loop()
+        r = self.submit_sized("python3 -c 'import time; b = bytearray(120 * 1024 * 1024); time.sleep(3); del b; "
+                              "time.sleep(5)'", cpus=1, ram=400 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.assertTrue(self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= 100 * MiB, n=40))
+        first = self.record(tok)["peak_ram"]
+        time.sleep(3)
+        loop2 = self.loop()
+        self.assertTrue(self.cycles(loop2, lambda: (self.record(tok) or {}).get("how") is not None, n=60))
+        self.assertGreaterEqual(self.record(tok)["peak_ram"], first)
+
+    def test_like_refuses_a_run_measured_too_few_times(self):
+        loop = self.loop()
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.assertTrue(self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None))
+        r2 = self.submit_sized("true", like=tok)
+        self.assertFalse(r2["ok"])
+        self.assertIn("too few to size from", r2["error"])
+
+    def test_the_first_cycle_sees_outside_cpu_use(self):
+        self.host.set(busy=8.0)  # every thread busy with someone else's work
+        loop = self.loop()
+        r = self.submit_sized("true", cpus=4, ram=100 * MiB)
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(self.status(r["data"]["id"]), "Stashed")
+
+    def test_warm_up_holds_jobs_until_the_windows_are_measured_and_survives_a_restart(self):
+        self.write_settings(warmup_s=30, outside_window_s=30, cpu_window_s=30)
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB)
+        tid = r["data"]["id"]
+        for _ in range(3):
+            now[0] += 5
+            self.host.tick()
+            loop.cycle()
+        self.assertEqual(self.status(tid), "Stashed")
+        with open(os.path.join(self.state, "room.json")) as f:
+            self.assertEqual(json.load(f)["warmup"]["needed_s"], 30)
+        self.assertIn("measuring", self.job("room", "local", **self.env()).stdout)
+        loop2 = self.loop(clock=lambda: now[0])  # a restart keeps the measured history
+        for _ in range(3):
+            now[0] += 5
+            self.host.tick()
+            loop2.cycle()
+        self.assertEqual(self.status(tid), "Stashed")  # 30 s covered only now
+        now[0] += 5
+        self.host.tick()
+        loop2.cycle()
+        self.assertTrue(self.cycles(loop2, lambda: self.status(tid) == "Done", tick=True))
+        now[0] += 3600  # a long gap: the history no longer counts
+        loop3 = self.loop(clock=lambda: now[0])
+        self.host.tick()
+        loop3.cycle()
+        self.assertIsNone(loop3.room)
+
+    # -- review cycle 1, second part --------------------------------------------------------------------------
+
+    def test_a_submit_while_the_loop_releases_does_not_deadlock(self):
+        import sqlite3
+        import threading
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"), timeout=30)
+        out = {}
+
+        def sub():
+            out["r"] = self.submit_sized("true", cpus=1, ram=100 * MiB)
+        fd = loop.adm.lock("queue.lock")  # a submit holds the lock ...
+        th = threading.Thread(target=sub)
+        th.start()
+        time.sleep(1)
+        os.close(fd)
+        con.execute("INSERT INTO samples VALUES (1, 'x', 'y', 1)")  # ... while the loop has a write open
+        loop.release(con, time.time(), loop.adm.queue(), {}, {"groups": {}, "tasks": {}})  # must commit first
+        con.close()
+        th.join(60)
+        self.assertTrue(out["r"]["ok"], out["r"])
+
+    def test_the_snapshot_counts_jobs_released_in_the_same_cycle(self):
+        self.host.set(avail=6 * GB)  # room: 6 - 1 headroom = 5 GB
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        a = self.submit_sized("sleep 20", cpus=1, ram=4 * GB)
+        self.host.tick()
+        loop.cycle()
+        self.assertNotEqual(self.status(a["data"]["id"]), "Stashed")
+        try:
+            with open(os.path.join(self.state, "room.json")) as f:
+                self.assertLess(json.load(f)["room"]["ram"]["room"], 1.1 * GB)
+            b = self.submit_sized("true", cpus=1, ram=4 * GB, fit_now=True)
+            self.assertFalse(b["ok"])
+        finally:
+            self.job("kill", "local", str(a["data"]["id"]))
+
+    def test_a_pilots_time_counts_from_its_start(self):
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized("sleep 120", pilot=True)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        qpath = os.path.join(self.state, "queue", tok + ".json")
+
+        def queued():
+            with open(qpath) as f:
+                return json.load(f)
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+        self.assertTrue(self.cycles(loop, lambda: queued().get("started"), n=10))
+        q = queued()
+        q["released"] -= 3600  # released an hour before it started (it waited for a group slot)
+        with open(qpath, "w") as f:
+            json.dump(q, f)
+        self.cycles(loop, lambda: False, n=3)
+        self.assertEqual(self.status(tid), "Running")
+        now[0] += 61  # past the one-minute limit, counted from its start
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
+
+    def test_a_job_marked_released_but_never_enqueued_is_held_again(self):
+        loop = self.loop()
+        r = self.submit_sized("echo again", cpus=1, ram=100 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        q = os.path.join(self.state, "queue", tok + ".json")
+        with open(q) as f:
+            data = json.load(f)
+        data.update(state="released", released=time.time(), gpus=[], ram_counted=data["size"]["ram"])
+        with open(q, "w") as f:  # what a loop stopped between saving and pueue enqueue leaves
+            json.dump(data, f)
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
+        self.assertIn("again", self.wait(tid, tok).stdout)
+
+    def test_a_job_removed_before_it_ran_is_recorded_as_removed(self):
+        loop = self.loop()
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        qpath = os.path.join(self.state, "queue", tok + ".json")
+        with open(qpath) as f:
+            q = json.load(f)
+        q.update(state="released", released=time.time(), gpus=[], ram_counted=q["size"]["ram"])
+        with open(qpath, "w") as f:  # released, then removed from pueue before it started
+            json.dump(q, f)
+        self.d.pueue("remove", str(tid))
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(self.record(tok)["how"], "removed")
+
+    def test_an_explicit_size_needs_ram(self):
+        r = self.submit_sized("true", cpus=2)
+        self.assertFalse(r["ok"])
+        self.assertIn("needs --ram", r["error"])
+
+    def test_needs_path(self):
+        r = self.submit_sized("true", cpus=1, ram=GB, needs_path=["/no/such/path"])
+        self.assertFalse(r["ok"])
+        self.assertIn("/no/such/path", r["error"])
+        self.assertTrue(self.submit_sized("true", cpus=1, ram=GB, needs_path=[self.d.dir])["ok"])
+
+    def test_a_container_job_counts_at_zero_after_the_window(self):
+        loop = self.loop()
+        q = {"token": "c" * 32, "released": 0, "started": 1000.0, "size": {"cpus": 4, "ram": 8 * GB},
+             "constraints": {"in_containers": True}, "ram_counted": 8 * GB, "gpu_counted": {"g": GB}}
+        self.assertEqual(loop._counted(q, 1000.0 + 599)["ram_counted"], 8 * GB)
+        c = loop._counted(q, 1000.0 + 600)
+        self.assertEqual((c["ram_counted"], c["size"]["cpus"], c["gpu_counted"]), (0, 0.0, {}))
+
+    def test_the_scope_probe_passes_here(self):
+        self.assertIsNone(self.j._scope_probe(dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())))
 
     def test_admission_status(self):
         p = self.job("admission", "local", "status", **self.env())

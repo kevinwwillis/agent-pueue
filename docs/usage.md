@@ -252,12 +252,16 @@ when it fits. The design is [admission.md](admission.md). On such a host:
 - **Every job needs a size**, one of:
   - `--pilot`: a first run to measure the job. It gets all the free RAM (and, with `--gpus N`, all the free
     memory on those cards) and stops at its time limit (`--max-minutes`, or the host's setting).
-  - `--like TOKEN` (or `HOST#ID`): sized from that earlier job's measured peaks plus margins. Refused when that
-    run was killed or crashed, because its peaks are only a lower bound.
-  - `--cpus N`, `--ram SIZE`, `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or `--small`.
-    Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
+    It takes `--cpus N` and `--gpus N`, not `--ram`. Its time limit counts from its start.
+  - `--like TOKEN` (or `HOST#ID`): sized from that earlier job's measured peaks plus margins, printed as
+    `sized like ...`, and run on the host that holds that record. Refused when that run was killed or
+    crashed (its peaks are only a lower bound) or was measured fewer than 3 times.
+  - `--ram SIZE` (required) with `--cpus N`, `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or
+    `--small`. Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
 - `job run auto <task-id> ...` lets `job` choose the host: one with room now, else the job waits (is held) on
-  the best host. `--host NAME` (repeatable) limits the choice.
+  the first host that takes it. A host that refuses the job (too small, no record for `--like`, a missing
+  `--needs-path`) is skipped; an unreachable host stops the placement, since the job may have been queued
+  there. `--host NAME` (repeatable) limits the choice.
 - A held job's wait prints why every 10 minutes (`held: needs 18.0 GB RAM, 9.4 GB free`); being held is not a
   verdict. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
 - The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
@@ -269,8 +273,13 @@ when it fits. The design is [admission.md](admission.md). On such a host:
 - `ALERT` (exit 201) can also come from the loop: the job's group is paused, it uses more GPU memory than its
   size, or the host's loop has stopped while the job is held. The job keeps its place.
 - Without `--group`, admitted jobs run in the group `sched`, so they start as soon as they fit.
-- Other constraints: `--gpu-model TEXT`, `--data PATH` (its disk; heavy-disk jobs wait while that disk is
-  busy), `--stop-at TIME` (stopped then; dropped if still held), `--in-containers`, `--restartable`.
+- Other constraints: `--gpu-model TEXT`, `--needs-path PATH`, `--data PATH` (its disk; heavy-disk jobs wait
+  while that disk is busy), `--stop-at TIME` (with its UTC offset; stopped then, dropped if still held),
+  `--in-containers`, `--restartable`.
+- After the loop starts with no recent history (a reboot, a long stop), it measures the host for `warmup_s`
+  (10 minutes by default) before it starts anything; `job room` shows `measuring the host first`.
+- Restarting an admitted job in place (`pueue restart --in-place`) ends it `WRAPPER_ERROR` (its assignment is
+  gone); submit it again instead.
 - A submit without a size, or from an older `job` (protocol 3 or 4), is refused with a message that starts
   `protocol mismatch` or names the size options.
 - A service that uses a GPU outside `job` (a model server) registers its GPU memory before it loads:

@@ -4,7 +4,8 @@ Status: spec for TASK-003 (written 2026-11-09 12:05 ET; revised 12:20 and 12:50 
 "Per-job scope" revised 13:10 ET after a code review). Built so far: the per-job scope (job 0.6.0, protocol 5,
 used only by a submit that carries a scope), then the loop, held submits, records, the client commands
 (`--cpus/--ram/...`, `job run auto`, `job room`), holds and the loop's service command (all in job 0.6.0, not yet
-released). Not built yet: progress files and projected ends, the RAM-trend alert, cloud hosts.
+released). Not built yet: progress files and projected ends, the RAM-trend alert, `job history`, and rented
+machines as hosts (`hosts.d`).
 
 ## Why
 
@@ -38,20 +39,25 @@ job release host2 <hold-id>
   - **`--pilot`**: a first run to measure the job. It is counted at, and limited to, all the RAM room at
     release, and, with `--gpus N`, all the free memory on the cards it gets, so nothing else can be admitted into
     room it may grow into. It has a time limit (`pilot.max_minutes`, or `--max-minutes`), so it never holds the
-    room for long. Its use is sampled every `pilot_sample_interval_s`.
-  - **`--like TOKEN`** (or `HOST#ID`, resolved through the records to the newest job with that id on that host,
-    and printed): that job's measured peaks times the margins, each capped at the host's or card's maximum when
-    the peak itself fits. Accepted from a run that exited 0, or a pilot that reached its time limit; refused
-    from a run that was killed for memory, crashed or was killed, because its peaks are only a lower bound. The
-    new job goes to the same host unless `--any-host` is given.
-  - **Explicit sizes:** `--cpus N`, `--ram SIZE`, `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`;
-    or `--small`, the settings file's small size.
+    room for long; the limit counts from its start. It takes `--cpus` and `--gpus`, and a GPU pilot needs at
+    least `pilot.gpu_min_gb` free on each card. Its use is sampled every `pilot_sample_interval_s`.
+  - **`--like TOKEN`** (or `HOST#ID`, the newest job with that id on that host): that job's measured peaks
+    times the margins, each capped at the host's or card's maximum when the peak itself fits, and its peak disk
+    rate. The size is printed (`sized like <token>: ...`). Accepted from a run that exited 0, or a pilot that
+    reached its time limit, and measured at least 3 times while it ran; refused from a run that was killed for
+    memory, crashed or was killed, because its peaks are only a lower bound. The new job runs on the host that
+    holds the record: `HOST#ID` is sent only to HOST, and `auto` with a token tries the hosts in turn, the
+    others refusing for want of the record. Sampled peaks are a lower bound even for a clean run; the margins
+    and `ram_hard_factor` cover the gap between samples.
+  - **Explicit sizes:** `--ram SIZE` (required: it is the job's RAM limit), with `--cpus N` (default: the small
+    size's CPUs), `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or `--small`, the settings file's
+    small size.
   - A submit with none of these is refused, with a message naming the options.
 - Constraints: `--host NAME` (repeatable), `--gpu-model TEXT` (a substring of the GPU name), `--needs-path PATH`
-  (only hosts where the path exists), `--data PATH` (prefer the host that has it; names the disk it reads),
-  `--stop-at TIME` (`YYYY-MM-DDTHH:MM±HH:MM`; the job is stopped then, and if it is still held then, it is
-  dropped), `--in-containers` (see "Jobs that run containers"), `--restartable` (may run on hosts marked
-  `preemptible`).
+  (repeatable; a host without the path refuses the job, so `auto` tries the next), `--data PATH` (prefer the
+  host that has it; names the disk it reads), `--stop-at TIME` (`YYYY-MM-DDTHH:MM±HH:MM`, the offset required;
+  the job is stopped then, and if it is still held then, it is dropped), `--in-containers` (see "Jobs that run
+  containers"), `--restartable` (may run on hosts marked `preemptible`). `--max-minutes` is for pilots only.
 - `--group G` keeps its meaning, a concurrency limit: the loop releases a job only while group G has a free slot,
   so release still means start. Without `--group`, admitted jobs go to the group `sched`, so on an admission host
   they run as soon as they fit, not one at a time as in pueue's `default` group.
@@ -94,16 +100,18 @@ standard-library Python 3.8. An example for a 32-thread host with 256 GB RAM (il
   "memory_pressure_max_pct": 10,
   "gpu_headroom_mb": 1024,
   "gpu_busy_max_pct": 90,
+  "iowait_max_pct": 20,
   "disk_busy_max_pct": 30,
   "disk_heavy_mb_s": 50,
-  "disks": {"/data": "nvme0n1", "/scratch": "sdb"},
+  "disks": ["/", "/data", "/scratch"],
   "outside_window_s": 600,
   "cpu_window_s": 600,
+  "warmup_s": 600,
   "sample_interval_s": 15,
   "pilot_sample_interval_s": 1,
   "fairness_wait_min": 30,
   "small": {"cpus": 1, "ram_gb": 4},
-  "pilot": {"max_minutes": 30},
+  "pilot": {"max_minutes": 30, "gpu_min_gb": 2},
   "margins": {"cpu": 1.2, "ram": 1.25, "gpu_mem": 1.15},
   "preemptible": false,
   "oom_score_adj": 500,
@@ -116,8 +124,12 @@ standard-library Python 3.8. An example for a 32-thread host with 256 GB RAM (il
   local disk, not a network filesystem.
 - An unreadable or invalid file stops admission on that host: submits there are refused with the reason. It
   never falls back to admitting without rules.
-- Needs cgroup v2, kernel 5.19 or later (`memory.peak`), and systemd 243 or later (scope `OOMPolicy`). The loop
-  checks these at start.
+- `disks` lists paths; each is resolved to its disk at loop start, and `job room` shows each disk's busy time.
+  `warmup_s` (default: the longer window, at most that) is how much unbroken measurement the loop needs before
+  it releases anything (see "The admission loop").
+- Needs cgroup v2, kernel 5.19 or later (`memory.peak`), systemd 243 or later (scope `OOMPolicy`), and a user
+  manager that outlives logins (lingering). `job admission <host> start` checks these with a test scope and
+  refuses to start the loop when one is missing; there is no mode without limits.
 
 ## The admission loop
 
@@ -134,7 +146,15 @@ It writes a heartbeat (`state_dir/heartbeat`) every cycle. A heartbeat older tha
 says so, `auto` skips it, and held jobs' waits get ALERT. When `bin/job` changes on disk (after an install), the
 loop re-executes itself with the new code.
 
-Each cycle it measures, counts room, releases held jobs that fit, and writes samples, records and alerts.
+Each cycle it measures, counts room, releases held jobs that fit, and writes samples, records and alerts. An
+error in one cycle is written to the journal and the loop goes on; the heartbeat is renewed only by a cycle that
+completes, so an error that repeats shows as a stale loop.
+
+Its last samples are kept in `admission.sqlite` (`recent`, the longest window plus a minute), so the windows
+carry on over a restart or an install. The loop releases nothing until it has `warmup_s` of unbroken
+measurement (a gap longer than the heartbeat limit breaks it): after a long stop it can't know the outside use
+over the windows. Meanwhile held jobs say `the loop is measuring this host first`, `job room` says so, `auto`
+may hold jobs there but not start them, and holds are refused.
 Between cycles it checks the results folder every second, so a job ending wakes it at once.
 
 ### Submitting, holding and releasing
@@ -227,9 +247,13 @@ Limits and settings:
 - `job kill` first records the job's use so far (its shim dies with it), then kills the pueue task and every
   process left in the scope with SIGKILL, as `pueue kill` does, so detached processes end at once.
 - Processes a job leaves behind when its command ends are stopped by the shim within two seconds.
-- Each cycle the loop stops any scope named `agent-pueue-job-<32 hex>` whose token is in the queue or records and
-  whose task pueue reports Done, or reports absent in a status read that succeeded. A failed or timed-out pueue
-  read never counts as "absent". Scopes with other names are never touched.
+- Each cycle the loop stops any scope named `agent-pueue-job-<32 hex>` that still has processes after its task
+  is Done (the shim was killed, for example by a `pueue kill` outside `job`), or after its task is absent in a
+  status read that succeeded and this host has the job's shim script, unless the job started again after the
+  status was read. A failed or timed-out pueue read never counts as "absent". Scopes with other names, and
+  scopes of tasks pueue still runs, are never touched.
+- A pilot past its time limit or a job past `--stop-at` is killed while Running; a paused one is killed once it
+  is resumed. A kill that fails is tried again each cycle, with an ALERT.
 
 ### Jobs that run containers
 
@@ -283,8 +307,11 @@ the larger of their size and their current use. A job that ends frees its room a
 - **GPU time, per card:** closed to new jobs when its average utilization over the last minute is over
   `gpu_busy_max_pct`, or the recorded GPU shares of its admitted jobs add up to more than that. These are
   fractions of time with any kernel running, not exact shares, so this is a soft rule.
-- **Disk:** a job whose earlier run read or wrote faster than `disk_heavy_mb_s` is not released while the disk
-  of its `--data` path is busier than `disk_busy_max_pct`.
+- **Disk:** a job whose earlier run (its `--like` record) read or wrote faster than `disk_heavy_mb_s` at its
+  peak is not released while the disk of its `--data` path is busier than `disk_busy_max_pct`, or while iowait
+  is over `iowait_max_pct` and that disk is the busiest. A job's disk rate is the sum of `read_bytes +
+  write_bytes` from `/proc/<pid>/io` over its processes between samples (the io controller is not delegated to
+  user managers, so cgroup `io.stat` is not available).
 
 Room a job is sized for but doesn't use is not given to others for memory, because whoever got it would fail
 when the first job grows back. The record keeps the measured peaks, so the next `--like` uses the measured number.
@@ -299,14 +326,16 @@ and holds alone leave too little.
 
 ### Records
 
-`state_dir/admission.sqlite` (standard-library `sqlite3`), written only by the loop:
+`state_dir/admission.sqlite` (standard-library `sqlite3`). A submit writes a job's first row before it adds
+the task to pueue; the loop writes the rest. The lock order is `queue.lock`, then the database: the loop
+commits before it takes the lock.
 
 - `jobs`: token, task, session, host, pueue id, group, submitted, released, started, ended, exit, how it ended
   (exit, killed, memory limit, host out of memory, stop-at, pilot time limit, wrapper error), size and where it
   came from (pilot, like, explicit, small), whether the peaks are final or sampled, constraints, GPU UUIDs, peaks
-  (CPU, RAM basis, `memory.peak`, GPU memory, GPU share, bytes read and written), progress series and projected
-  end, and the earlier job a `--like` size came from.
-- `samples`: per-resource values, kept 7 days.
+  (CPU, RAM basis, `memory.peak`, GPU memory, peak disk rate) and how many samples they come from, and the
+  earlier job a `--like` size came from. Not built yet: progress series and projected end.
+- `samples`: per-resource values, kept 7 days; `recent`: the loop's last samples in full.
 - `holds`: id, name, card, size, start, end, and how it ended.
 
 Peaks are kept for good. `job history` reads every host's records over the same ssh channel as `job ls`.
@@ -344,22 +373,22 @@ in the output.
 per GPU its name, memory room, outside use, busy time and the jobs and holds on it, plus the held queue with each
 reason. `--json` gives the same for scripts.
 
-Rented machines appear as hosts when a deployment's tooling writes a file for each into
+Not built yet: rented machines appear as hosts when a deployment's tooling writes a file for each into
 `~/.config/agent-pueue/hosts.d/` (same format as the hosts file), read after the hosts file.
 
 ## Protocol and rollout
 
-- Every host reply gains `admission` (true or false) and the protocol numbers the host accepts; old clients
-  ignore unknown fields.
-- Protocol 5 is a superset of 4. A new client sends submits at 5. A host that predates it refuses ("protocol
-  mismatch"); the client then resends at 3 (or 4 for `--normal-priority`) only if the submit has no admission
-  fields, and otherwise reports that the host predates admission.
+- `room` replies say whether the host is an admission host (`admission`); old clients never ask.
+- Protocol 5 is a superset of 4. A new client sends a submit at 5 only when it carries a size or a scope;
+  other submits go at 3 (or 4 for `--normal-priority`), as before. A host that predates protocol 5 refuses a
+  sized submit ("protocol mismatch"), and a host without settings refuses one too, so a size is never silently
+  ignored.
 - An admission host refuses protocol 3 and 4 submits with a message that starts "protocol mismatch" (so old
   clients report it as a version problem) and says to update `job` on the submitting machine. The check is in
   `host_submit` itself, so it also applies to `local`, which skips `host_main`.
 - Probes stay at protocol 3; an admission host adds held reasons and alerts to the reply.
-- New operations (`room`, `hold`, `release`, `history`) on a host that predates them fail with a usage error
-  (exit 2, no JSON); the client maps that to "host predates admission".
+- New operations (`room`, `hold`, `admission`) on a host that predates them fail with a usage error (exit 2,
+  no JSON); `job room` shows that host as `its job predates admission`.
 - Rollout: install the new `bin/job` on every machine first. No host has a settings file yet, so nothing changes.
   Then turn admission on one host at a time: add the settings file, start the loop, check it, then the next. No
   pueued restart is needed (a restart kills running jobs). Jobs already running in other groups keep running and

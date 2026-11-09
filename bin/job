@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 
 VERSION = "0.6.0"
@@ -853,9 +854,10 @@ ADMISSION_DEFAULTS = {
     "cpu_window_s": 600,
     "sample_interval_s": 15,
     "pilot_sample_interval_s": 1,
+    "warmup_s": None,                  # default: the longer of the two windows
     "fairness_wait_min": 30,
     "small": {"cpus": 1, "ram_gb": 4},
-    "pilot": {"max_minutes": 30},
+    "pilot": {"max_minutes": 30, "gpu_min_gb": 2},
     "margins": {"cpu": 1.2, "ram": 1.25, "gpu_mem": 1.15},
     "preemptible": False,
     "oom_score_adj": 500,
@@ -912,9 +914,13 @@ def _admission_settings(path=None, nthreads=None):
         _num(s[k], k, hi=100.0)
     for k in ("outside_window_s", "cpu_window_s", "sample_interval_s", "pilot_sample_interval_s", "fairness_wait_min"):
         _num(s[k], k, lo=1, whole=True)
+    if s["warmup_s"] is None:
+        s["warmup_s"] = max(s["outside_window_s"], s["cpu_window_s"])
+    _num(s["warmup_s"], "warmup_s", lo=0, hi=max(s["outside_window_s"], s["cpu_window_s"]), whole=True)
     _num(s["small"]["cpus"], "small.cpus", lo=0.01)
     _num(s["small"]["ram_gb"], "small.ram_gb", lo=0.01)
     _num(s["pilot"]["max_minutes"], "pilot.max_minutes", lo=1)
+    _num(s["pilot"]["gpu_min_gb"], "pilot.gpu_min_gb", lo=0)
     for k in ("cpu", "ram", "gpu_mem"):
         _num(s["margins"][k], "margins." + k, lo=1.0)
     if not isinstance(s["preemptible"], bool):
@@ -945,6 +951,7 @@ class Measure:
         self.uid = os.getuid() if uid is None else uid
         self.nvml = None
         self.last_cpu = None
+        self.last_io = {}
         self.last_disk = None
         self.last_jobs = {}
 
@@ -1065,9 +1072,10 @@ class Measure:
         return out
 
     def job_use(self, now, scopes):
-        """{token: {ram, cpu, pids, populated}} for each scope: RAM size basis (bytes, file cache excluded),
-        CPU threads since the last call, and the job's pids."""
+        """{token: {ram, cpu, disk_mb_s, pids, populated}} for each scope: RAM size basis (bytes, file cache
+        excluded), CPU threads and disk MB/s (read plus written) since the last call, and the job's pids."""
         out, seen = {}, {}
+        io_seen = {}
         for tok, scope in scopes.items():
             job = os.path.join(scope, "job")
             base = job if os.path.isdir(job) else scope
@@ -1083,9 +1091,25 @@ class Measure:
             last = self.last_jobs.get(tok)
             cpu = (usec - last[1]) / 1e6 / (now - last[0]) if last and now > last[0] else None
             seen[tok] = (now, usec)
-            out[tok] = {"ram": ram, "cpu": cpu, "pids": pids, "populated": bool(pids)}
+            moved = 0
+            for pid in pids:
+                b = self._io_bytes(pid)
+                if b is None:
+                    continue
+                io_seen[pid] = b
+                moved += max(0, b - self.last_io.get(pid, 0))  # a new pid started since the last call
+            disk = moved / 1e6 / (now - last[0]) if last and now > last[0] else None
+            out[tok] = {"ram": ram, "cpu": cpu, "disk_mb_s": disk, "pids": pids, "populated": bool(pids)}
         self.last_jobs = seen
+        self.last_io = io_seen
         return out
+
+    def _io_bytes(self, pid):
+        try:
+            f = dict(ln.split(": ", 1) for ln in self._read(self.proc, str(pid), "io").splitlines() if ": " in ln)
+            return int(f["read_bytes"]) + int(f["write_bytes"])
+        except (OSError, KeyError, ValueError):
+            return None
 
     def cgroup_of(self, pid):
         try:
@@ -1315,8 +1339,8 @@ def fits(settings, room, job, data_disk=None):
             if g["shares"] + (size.get("gpu_share") or 0) > settings["gpu_busy_max_pct"]:
                 why.append("GPU %d time is taken (%.0f%% shared)" % (g["index"], g["shares"]))
                 continue
-            need = 1 if pilot else size["gpu_mem"]
-            if g["room"] < need:
+            need = settings["pilot"]["gpu_min_gb"] * GB if pilot else size["gpu_mem"]
+            if g["room"] < max(need, 1):
                 why.append("GPU %d has %s free" % (g["index"], _gbs(max(0, g["room"]))))
                 continue
             ok.append((g["room"], g["index"], gid))
@@ -1357,7 +1381,9 @@ HEARTBEAT_MIN_S = 120
 IN_FLIGHT = ("Queued", "Running", "Paused", "Locked")
 RECORD_FIELDS = ("token", "task", "session", "host", "pueue_id", "grp", "submitted", "released", "started", "ended",
                  "exit", "how", "size", "size_source", "like_from", "pilot", "constraints", "gpus", "peak_cpu",
-                 "peak_ram", "memory_peak", "peak_gpu_mem", "peaks_final")
+                 "peak_ram", "memory_peak", "peak_gpu_mem", "peaks_final", "peak_samples",
+                 "peak_disk_mb_s")
+LIKE_MIN_SAMPLES = 3  # a --like source must have been measured at least this many times while it ran
 
 
 class Admission:
@@ -1420,7 +1446,12 @@ class Admission:
     def db(self):
         con = sqlite3.connect(self.path("admission.sqlite"), timeout=30)
         con.execute("CREATE TABLE IF NOT EXISTS jobs (%s, PRIMARY KEY (token))" % ", ".join(RECORD_FIELDS))
+        have = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
+        for col in RECORD_FIELDS:
+            if col not in have:  # a records file from an older job
+                con.execute("ALTER TABLE jobs ADD COLUMN %s" % col)
         con.execute("CREATE TABLE IF NOT EXISTS samples (t REAL, kind TEXT, key TEXT, value REAL)")
+        con.execute("CREATE TABLE IF NOT EXISTS recent (t REAL, sample TEXT)")  # the loop's windows, kept over restarts
         con.execute("CREATE INDEX IF NOT EXISTS samples_t ON samples (t)")
         con.execute("CREATE TABLE IF NOT EXISTS holds (id PRIMARY KEY, name, card, size, start, ended, how)")
         return con
@@ -1434,7 +1465,7 @@ class Admission:
     def find(self, con, ref):
         """The record a --like names: a token, or HOST#ID for the newest job with that id here."""
         con.row_factory = sqlite3.Row
-        if "#" in ref:
+        if "#" in ref:  # HOST#ID: the client sends it only to HOST
             try:
                 tid = int(ref.rsplit("#", 1)[1])
             except ValueError:
@@ -1450,6 +1481,13 @@ def _size_from(settings, adm, capacity, req):
     """The size a submit asks for: (size, source, pilot, like_from). Raises JobError naming the options."""
     a = req.get("admission") or {}
     explicit = {k: a.get(k) for k in ("cpus", "ram", "gpus", "gpu_mem", "gpu_share") if a.get(k) is not None}
+    pilot_with = {}
+    if a.get("pilot"):
+        extra = sorted(set(explicit) - {"cpus", "gpus"})
+        if extra:
+            raise JobError("a pilot gets all the free RAM, and all the free memory on its GPUs; it takes --cpus and "
+                           "--gpus but not %s" % ", ".join("--" + k.replace("_", "-") for k in extra))
+        pilot_with, explicit = explicit, {}
     chosen = [k for k in ("pilot", "like", "small") if a.get(k)] + (["explicit"] if explicit else [])
     if len(chosen) != 1:
         raise JobError("an admission host needs exactly one size: --pilot, --like TOKEN, --small, or "
@@ -1464,14 +1502,18 @@ def _size_from(settings, adm, capacity, req):
     for k in ("ram", "gpus", "gpu_mem"):
         if k in explicit:
             size[k] = int(_num(explicit[k], "--" + k.replace("_", "-"), lo=0, whole=True))
+    if explicit and "ram" not in explicit:
+        raise JobError("an explicit size needs --ram (it is the job's RAM limit); or use --pilot to measure the "
+                       "job, or --small")
     if "gpu_mem" in explicit and not size["gpus"]:
         size["gpus"] = 1
     if size["gpus"] and not size["gpu_mem"] and not a.get("pilot"):
         raise JobError("--gpus needs --gpu-mem (memory per GPU), or use --pilot to measure it")
     if a.get("pilot"):
-        size["gpus"] = int(a.get("gpus") or 0)
-        if "cpus" in a and a["cpus"] is not None:
-            size["cpus"] = float(a["cpus"])
+        if "gpus" in pilot_with:
+            size["gpus"] = int(_num(pilot_with["gpus"], "--gpus", lo=0, whole=True))
+        if "cpus" in pilot_with:
+            size["cpus"] = float(_num(pilot_with["cpus"], "--cpus", lo=0.0))
         return size, "pilot", True, None
     if a.get("small"):
         return size, "small", False, None
@@ -1487,6 +1529,9 @@ def _size_from(settings, adm, capacity, req):
             raise JobError("--like %s: that run ended by %s (exit %s), so its peaks are only a lower bound; "
                            "size it from a run that exited 0 or a pilot that reached its time limit"
                            % (a["like"], r["how"] or "?", r["exit"]))
+        if (r.get("peak_samples") or 0) < LIKE_MIN_SAMPLES:
+            raise JobError("--like %s: that run was measured %d times while it ran, too few to size from; size it "
+                           "from a longer run or a pilot, or give --cpus/--ram" % (a["like"], r.get("peak_samples") or 0))
         m = settings["margins"]
         ram_max = capacity["mem_total"] - settings["ram_headroom_gb"] * GB
         gpu_max = max([c["total"] for c in capacity["gpus"]] or [0]) - settings["gpu_headroom_mb"] * MB
@@ -1495,6 +1540,7 @@ def _size_from(settings, adm, capacity, req):
         size["ram"] = int(min(peak_ram * m["ram"], ram_max) if peak_ram <= ram_max else peak_ram * m["ram"])
         size["gpus"] = len(json.loads(r["gpus"] or "[]"))
         size["gpu_mem"] = int(min(peak_gpu * m["gpu_mem"], gpu_max) if peak_gpu <= gpu_max else peak_gpu * m["gpu_mem"])
+        size["disk_mb_s"] = float(r.get("peak_disk_mb_s") or 0.0)
         return size, "like", False, r["token"]
     return size, "explicit", False, None
 
@@ -1529,6 +1575,8 @@ def _simulate_fit(settings, adm, job):
     age = _heartbeat_age(adm)
     if not snap or age is None or age > _heartbeat_limit(settings):
         return False, "the admission loop is not running here"
+    if not snap.get("room"):
+        return False, "the admission loop is still measuring this host"
     room = snap["room"]
     for q in adm.queue():
         if q.get("state") == "held":
@@ -1549,6 +1597,16 @@ def _take(room, job, got):
         g["shares"] += job["size"].get("gpu_share") or 0
 
 
+def _stop_at(v):
+    """--stop-at as epoch seconds; a time without its UTC offset is refused."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    t = _parse_time(v) if isinstance(v, str) else None
+    if t is None or t.tzinfo is None:
+        raise JobError("--stop-at needs a time with its UTC offset, like 2026-11-10T08:00-05:00")
+    return t.timestamp()
+
+
 def host_submit_admitted(req, settings, command):
     """host_submit on an admission host: size the job, queue it held, and let the loop release it."""
     if req.get("protocol") != PROTOCOL_ADMISSION or not isinstance(req.get("admission"), dict):
@@ -1565,7 +1623,16 @@ def host_submit_admitted(req, settings, command):
     capacity = _capacity(measure)
     size, source, pilot, like_from = _size_from(settings, adm, capacity, req)
     a = req["admission"]
-    constraints = {k: a[k] for k in ("gpu_model", "data", "stop_at", "in_containers", "restartable") if a.get(k)}
+    constraints = {k: a[k] for k in ("gpu_model", "data", "in_containers", "restartable") if a.get(k)}
+    missing = [x for x in (a.get("needs_path") or []) if not (isinstance(x, str) and os.path.exists(x))]
+    if missing:
+        raise JobError("%s does not have %s" % (socket.gethostname(), ", ".join(map(str, missing))))
+    if a.get("stop_at") is not None:
+        constraints["stop_at"] = _stop_at(a["stop_at"])
+    if a.get("max_minutes") is not None:
+        if not pilot:
+            raise JobError("--max-minutes is a pilot's time limit; use --stop-at to stop another job at a time")
+        constraints["max_minutes"] = float(_num(a["max_minutes"], "--max-minutes", lo=1))
     job = {"size": size, "pilot": pilot, "constraints": constraints}
     why = fits_empty(settings, capacity, job)
     if why:
@@ -1598,27 +1665,50 @@ def host_submit_admitted(req, settings, command):
             ok, got = _simulate_fit(settings, adm, q)
             if not ok:
                 raise JobError("no room on %s now: %s" % (socket.gethostname(), got))
+        # The record and queue file come first: once pueue has the task, nothing may report the submit as failed
+        # (the job would run anyway, and a resubmit would run it twice).
+        qpath = adm.path("queue", token + ".json")
         adm.save(q)
         try:
+            con = adm.db()
+            try:
+                adm.record(con, {"token": token, "task": q["task"], "session": q["session"],
+                                 "host": socket.gethostname(), "grp": group, "submitted": q["submitted"],
+                                 "size": size, "size_source": source, "like_from": like_from, "pilot": int(pilot),
+                                 "constraints": constraints, "peaks_final": 0})
+                con.commit()
+            finally:
+                con.close()
             reply = host_submit(dict(req, token=token, group=group, stashed=True,
                                      admitted={"assign": adm.assign_path(token),
                                                "oom_score_adj": settings["oom_score_adj"],
                                                "gpu_env": settings["gpu_env"]}), _admission_checked=True)
-        except JobError:
-            os.remove(adm.path("queue", token + ".json"))
+        except BaseException:
+            os.remove(qpath)
+            try:
+                con = adm.db()
+                con.execute("DELETE FROM jobs WHERE token = ?", (token,))
+                con.commit()
+                con.close()
+            except sqlite3.Error:
+                pass
             raise
         q["pueue_id"] = reply["id"]
-        adm.save(q)
-        con = adm.db()
         try:
-            adm.record(con, {"token": token, "task": q["task"], "session": q["session"], "host": socket.gethostname(),
-                             "pueue_id": reply["id"], "grp": group, "submitted": q["submitted"], "size": size,
-                             "size_source": source, "like_from": like_from, "pilot": int(pilot),
-                             "constraints": constraints, "peaks_final": 0})
-            con.commit()
-        finally:
-            con.close()
+            adm.save(q)
+            con = adm.db()
+            try:
+                con.execute("UPDATE jobs SET pueue_id = ? WHERE token = ?", (reply["id"], token))
+                con.commit()
+            finally:
+                con.close()
+        except (OSError, sqlite3.Error):
+            pass  # the job is queued; the loop records its id when it releases it
         reply["held"] = True
+        if source == "like":
+            reply["sized"] = "sized like %s: %g CPU threads, %s RAM%s" % (
+                like_from, size["cpus"], _gbs(size["ram"]),
+                ", %d GPU(s) with %s each" % (size["gpus"], _gbs(size["gpu_mem"])) if size["gpus"] else "")
         return reply
     finally:
         os.close(fd)
@@ -1642,6 +1732,7 @@ class Loop:
         self.clock = clock
         self.samples = []
         self.keep_s = max(settings["outside_window_s"], settings["cpu_window_s"], GPU_BUSY_WINDOW_S) + 60
+        self.warming = None
         self.disk_names = {}
         for p in settings["disks"]:
             d = self.m.disk_of(p)
@@ -1651,6 +1742,25 @@ class Loop:
         self.room = self.room_empty = None
         self.peaks = {}
         self.holds = []
+        self.m.cpu(self.clock())  # so the first cycle has a CPU reading
+        con = self.adm.db()
+        try:  # the windows carry on from before a restart (an install re-executes the loop)
+            rows = con.execute("SELECT sample FROM recent WHERE t >= ? ORDER BY t", (self.clock() - self.keep_s,))
+            self.samples = [json.loads(x) for (x,) in rows]
+        finally:
+            con.close()
+
+    def covered(self, now):
+        """Seconds of unbroken measurement up to now; a gap longer than the heartbeat limit breaks it."""
+        ts = [x["t"] for x in self.samples]
+        if not ts:
+            return 0.0
+        gap, start = _heartbeat_limit(self.s), ts[-1]
+        for i in range(len(ts) - 1, 0, -1):
+            if ts[i] - ts[i - 1] > gap:
+                break
+            start = ts[i - 1]
+        return now - start
 
     # -- one cycle -----------------------------------------------------------------------------------------------
 
@@ -1705,6 +1815,7 @@ class Loop:
                 _end_hold(self.adm, h, why)
         self.holds = holds
         s, use = self.sample(now, scopes, holds)
+        read_at = time.time()
         try:
             st = _pueue_status()
         except JobError:
@@ -1721,10 +1832,19 @@ class Loop:
                 self.account(con, now, queue, tasks, use, st)
                 inflight = [q for q in queue if q.get("state") == "released"]
                 hl = [{"id": h["id"], "gid": h["uuid"], "size": h["size"]} for h in holds]
-                self.room = compute_room(self.s, self.samples, [self._counted(q) for q in inflight], hl, now)
-                self.room_empty = compute_room(self.s, self.samples, [], hl, now)  # as if no admitted job ran
+                covered = self.covered(now)
+                if covered >= self.s["warmup_s"]:
+                    self.warming = None
+                    self.room = compute_room(self.s, self.samples, [self._counted(q, now) for q in inflight], hl,
+                                             now)
+                    self.room_empty = compute_room(self.s, self.samples, [], hl, now)  # as if no admitted job ran
+                else:  # too little history to know the outside use over the windows: release nothing yet
+                    self.warming = {"covered_s": covered, "needed_s": self.s["warmup_s"]}
+                    self.room = self.room_empty = None
                 self.release(con, now, queue, tasks, st)
-                self.clean_scopes(scopes, queue, tasks, use)
+                self.clean_scopes(scopes, tasks, use, read_at)
+            con.execute("DELETE FROM recent WHERE t < ?", (now - self.keep_s,))
+            con.execute("INSERT INTO recent VALUES (?, ?)", (s["t"], json.dumps(s)))
             con.execute("DELETE FROM samples WHERE t < ?", (now - 7 * 86400,))
             con.executemany("INSERT INTO samples VALUES (?, ?, ?, ?)", self._sample_rows(s))
             con.commit()
@@ -1742,9 +1862,14 @@ class Loop:
             rows += [(s["t"], "gpu_used", u, g["used"]), (s["t"], "gpu_util", u, g["util"])]
         return [r for r in rows if r[3] is not None]
 
-    def _counted(self, q):
-        return {"token": q["token"], "released": q["released"], "size": q["size"], "gpus": q.get("gpus", []),
-                "ram_counted": q.get("ram_counted", q["size"]["ram"]), "gpu_counted": q.get("gpu_counted", {})}
+    def _counted(self, q, now):
+        c = {"token": q["token"], "released": q["released"], "size": q["size"], "gpus": q.get("gpus", []),
+             "ram_counted": q.get("ram_counted", q["size"]["ram"]), "gpu_counted": q.get("gpu_counted", {})}
+        if ((q.get("constraints") or {}).get("in_containers") and q.get("started")
+                and now - q["started"] >= self.s["outside_window_s"]):
+            # its containers' use now shows as outside use; counting its size too would count it twice
+            c.update(size=dict(q["size"], cpus=0.0), ram_counted=0, gpu_counted={})
+        return c
 
     def account(self, con, now, queue, tasks, use, st):
         """Track released jobs until their scope is empty; record peaks; end jobs; enforce time limits."""
@@ -1756,14 +1881,27 @@ class Loop:
                 if t is None:  # removed before release, or still being added: give a submit time to finish
                     if now - q["submitted"] > 120:
                         self.end(con, q, now, "removed", None)
-                elif q["constraints"].get("stop_at") and _parse_time(q["constraints"]["stop_at"]) <= now:
+                elif q["constraints"].get("stop_at") and q["constraints"]["stop_at"] <= now:
                     _pueue(["remove", str(t["id"])])
                     self.end(con, q, now, "dropped at stop-at", None)
                 continue
             # released
-            p = self.peaks.setdefault(q["token"], {"cpu": 0.0, "ram": 0, "gpu": 0})
+            if status == "Stashed":  # marked released, but the loop stopped before pueue enqueue: hold it again
+                q.update({"state": "held", "reason": None})
+                self.adm.save(q)
+                try:
+                    os.remove(self.adm.assign_path(q["token"]))
+                except FileNotFoundError:
+                    pass
+                continue
+            p = self.peaks.get(q["token"])
+            if p is None:
+                p = self.peaks[q["token"]] = self._stored_peaks(con, q["token"])
             if u:
+                if u.get("populated"):
+                    p["n"] += 1
                 p["cpu"] = max(p["cpu"], u["cpu"] or 0.0)
+                p["disk"] = max(p["disk"], u.get("disk_mb_s") or 0.0)
                 p["ram"] = max(p["ram"], u["ram"])
                 p["gpu"] = max([p["gpu"]] + list(u.get("gpu", {}).values()))
                 over = [uu for uu, b in u.get("gpu", {}).items() if b > q["size"]["gpu_mem"] > 0 and not q.get("pilot")]
@@ -1773,24 +1911,26 @@ class Loop:
                                        _gbs(max(u["gpu"].values())), _gbs(q["size"]["gpu_mem"])))
             if status == "Running" and not q.get("started"):
                 q["started"] = now
-            if status in ("Running", "Paused") and q.get("stop_reason") is None:
+            if status == "Running" and q.get("stop_reason") is None:  # a paused job is stopped once resumed
                 limit = None
-                if q.get("pilot"):
-                    limit = q["released"] + 60 * float(q["constraints"].get("max_minutes") or
-                                                       self.s["pilot"]["max_minutes"])
+                if q.get("pilot"):  # a pilot's time counts from its start, not from its release
+                    limit = q["started"] + 60 * float(q["constraints"].get("max_minutes") or
+                                                      self.s["pilot"]["max_minutes"])
                     reason = "pilot time limit"
                 if q["constraints"].get("stop_at"):
-                    at = _parse_time(q["constraints"]["stop_at"])
+                    at = q["constraints"]["stop_at"]
                     if limit is None or at < limit:
                         limit, reason = at, "stop-at"
                 if limit is not None and now >= limit:
-                    q["stop_reason"] = reason
-                    self.adm.save(q)
                     try:
                         host_kill({"id": t["id"], "token": q["token"]})
-                    except JobError:
-                        pass
-                    continue
+                    except JobError as e:  # tried again next cycle
+                        self.adm.alert(q, "stop_failed", "could not stop it at its %s: %s" % (reason, e))
+                        self.adm.save(q)
+                    else:
+                        q["stop_reason"] = reason
+                        self.adm.save(q)
+                        continue
             running = status in IN_FLIGHT or (u is not None and u["populated"])
             if running:
                 self.record_peaks(con, q, final=False)
@@ -1800,29 +1940,40 @@ class Loop:
                 continue  # never end a job on a failed pueue read
             self.end(con, q, now, None, t)
 
+    def _stored_peaks(self, con, token):
+        """The peaks recorded so far (by this loop or one before a restart), so a restart never lowers them."""
+        r = con.execute("SELECT peak_cpu, peak_ram, peak_gpu_mem, peak_samples FROM jobs WHERE token = ?",
+                        (token,)).fetchone()
+        d = con.execute("SELECT peak_disk_mb_s FROM jobs WHERE token = ?", (token,)).fetchone()
+        r = r or (None, None, None, None)
+        return {"cpu": r[0] or 0.0, "ram": r[1] or 0, "gpu": r[2] or 0, "n": r[3] or 0, "disk": (d or [0])[0] or 0.0}
+
     def record_peaks(self, con, q, final):
-        p = self.peaks.get(q["token"], {})
+        p = self.peaks.get(q["token"]) or self._stored_peaks(con, q["token"])
         self.adm.record(con, {"token": q["token"], "released": q.get("released"), "started": q.get("started"),
-                              "gpus": q.get("gpus", []), "peak_cpu": p.get("cpu"), "peak_ram": p.get("ram"),
-                              "peak_gpu_mem": p.get("gpu"), "peaks_final": int(final)})
+                              "gpus": q.get("gpus", []), "peak_cpu": p["cpu"], "peak_ram": p["ram"],
+                              "peak_gpu_mem": p["gpu"], "peak_samples": p["n"], "peak_disk_mb_s": p["disk"],
+                              "peaks_final": int(final)})
 
     def end(self, con, q, now, how, t):
         """A job ended (or left the queue): write its final record and forget it."""
         row = {"token": q["token"], "ended": now}
         if how is None:
             res = _scope_result(q["token"]) or {}
-            if q.get("stop_reason"):
-                how = q["stop_reason"]
-            elif t is not None and (t.get("status") or {}).get("Done", {}).get("result") == "Killed":
-                how = "killed"
-            else:
-                how = HOW_LABEL.get(res.get("how"), res.get("how") or "exit")
             rec = os.path.join(STATE_DIR, "results", q["token"] + ".exit")
             try:
                 with open(rec) as f:
                     row["exit"] = int(f.read().strip())
             except (OSError, ValueError):
                 row["exit"] = None
+            if q.get("stop_reason"):
+                how = q["stop_reason"]
+            elif t is not None and (t.get("status") or {}).get("Done", {}).get("result") == "Killed":
+                how = "killed"
+            elif t is None and not res and row["exit"] is None:
+                how = "removed"  # removed from pueue before it ran
+            else:
+                how = HOW_LABEL.get(res.get("how"), res.get("how") or "exit")
             row["memory_peak"] = res.get("memory_peak_incl_cache")
             self.record_peaks(con, q, final=True)
         row["how"] = how
@@ -1839,6 +1990,12 @@ class Loop:
         """Release held jobs that fit, oldest first; once the oldest has waited fairness_wait_min, a younger
         job is released only if it takes nothing from a resource the oldest is short of."""
         if self.room is None:
+            if self.warming:
+                for q in queue:
+                    if q.get("state") == "held":
+                        q["reason"] = "the loop is measuring this host first (%s of %s)" % (
+                            _fmt_dur(self.warming["covered_s"]), _fmt_dur(self.warming["needed_s"]))
+                        self.adm.save(q)
             return
         room = json.loads(json.dumps(self.room))
         groups = st.get("groups", {})
@@ -1847,6 +2004,7 @@ class Loop:
             if _task_status(t) in ("Running", "Queued"):  # an enqueued job takes a slot as soon as one is free
                 running[t.get("group")] = running.get(t.get("group"), 0) + 1
         blocked = None  # the resources the waiting oldest job is short of
+        con.commit()  # lock order is queue.lock, then the records: a submit holds the lock while it writes one
         fd = self.adm.lock("queue.lock")
         try:
             for q in queue:
@@ -1877,11 +2035,15 @@ class Loop:
                         # it would fit once admitted jobs end, so younger jobs must not take that room
                         blocked = self._short_of(room, q)
                     continue
-                self.enqueue(con, now, q, t, got)
-                _take(room, q, got)
-                running[q["group"]] = running.get(q["group"], 0) + 1
+                if self.enqueue(con, now, q, t, got):
+                    _take(room, q, got)
+                    running[q["group"]] = running.get(q["group"], 0) + 1
+            self.room = room  # the snapshot shows the room left after this cycle's releases
         finally:
-            os.close(fd)
+            try:
+                con.commit()
+            finally:
+                os.close(fd)
 
     def _resources(self, q, got):
         r = {"ram", "cpu"} if q["size"]["ram"] or q["size"]["cpus"] else set()
@@ -1899,7 +2061,11 @@ class Loop:
         if size["cpus"] > room["cpu"]["room"]:
             short.add("cpu")
         if size.get("gpus"):
-            short |= {"gpu:" + u for u in room["gpus"]}
+            model = (q.get("constraints") or {}).get("gpu_model")
+            need = self.s["pilot"]["gpu_min_gb"] * GB if q.get("pilot") else size["gpu_mem"]
+            short |= {"gpu:" + u for u, g in room["gpus"].items()
+                      if (not model or model.lower() in g["name"].lower())
+                      and (g["room"] < need or g["util"] > self.s["gpu_busy_max_pct"])}
         if q.get("data_disk"):
             short.add("disk:" + q["data_disk"])
         return short
@@ -1923,18 +2089,24 @@ class Loop:
             q.update({"state": "held", "reason": "release failed: %s" % e})
             self.adm.save(q)
             os.remove(path)
-            return
-        self.adm.record(con, {"token": q["token"], "released": now, "gpus": got["gpus"]})
+            return False
+        self.adm.record(con, {"token": q["token"], "released": now, "gpus": got["gpus"], "pueue_id": int(t["id"])})
+        return True
 
-    def clean_scopes(self, scopes, queue, tasks, use):
-        """Stop a job scope whose task is Done or gone; scopes of other names are never touched."""
-        known = {q["token"] for q in queue if q.get("state") != "ended"}
+    def clean_scopes(self, scopes, tasks, use, read_at):
+        """Stop a job scope that still has processes after its task is Done or gone (the shim was killed, so
+        nothing else stops them). Scopes of other names, and of tasks pueue still runs, are never touched."""
         for tok in scopes:
             t = tasks.get(tok)
-            if tok in known or (t is not None and _task_status(t) != "Done"):
+            if t is not None and _task_status(t) != "Done":
                 continue
             if t is None and not os.path.exists(os.path.join(STATE_DIR, "scripts", tok + ".shim")):
                 continue  # not a job of this host's pueue: leave it alone
+            try:
+                if os.path.getmtime(os.path.join(STATE_DIR, "results", tok + ".started")) >= read_at:
+                    continue  # restarted since pueue's status was read
+            except OSError:
+                pass
             if use.get(tok, {}).get("populated"):
                 _stop_scope(tok)
 
@@ -1946,7 +2118,8 @@ class Loop:
         holds = [{k: h.get(k) for k in ("id", "name", "index", "uuid", "size", "start", "expires")} for h in self.holds]
         self.adm.write_json(self.adm.path("room.json"), {"t": now, "host": socket.gethostname(), "room": self.room,
                                                          "capacity": self.capacity, "held": held, "jobs": jobs,
-                                                         "holds": holds, "pueue_ok": pueue_ok})
+                                                         "holds": holds, "pueue_ok": pueue_ok,
+                                                         "warmup": self.warming})
         self.adm.write_json(self.adm.path("heartbeat"), {"t": now, "pid": os.getpid(), "version": VERSION})
 
 
@@ -1967,9 +2140,15 @@ def admit_main(once=False):
     results = os.path.join(STATE_DIR, "results")
     os.makedirs(results, mode=0o700, exist_ok=True)
     while True:
-        wait = loop.cycle()
         if once:
+            loop.cycle()
             return 0
+        try:
+            wait = loop.cycle()
+        except Exception:  # logged to the journal; the heartbeat is not renewed, so a lasting error shows as stale
+            sys.stderr.write("job _admit: cycle failed:\n%s" % traceback.format_exc())
+            sys.stderr.flush()
+            wait = settings["sample_interval_s"]
         marks = (os.path.getmtime(results), os.path.getmtime(adm.path("queue")))
         end = time.monotonic() + wait
         while time.monotonic() < end:
@@ -2073,8 +2252,11 @@ def host_hold(req):
             raise JobError("a hold needs --name and --mem")
         snap = adm.read_json(adm.path("room.json"))
         age = _heartbeat_age(adm)
-        if not snap or not snap.get("room") or age is None or age > _heartbeat_limit(settings):
+        if not snap or age is None or age > _heartbeat_limit(settings):
             raise JobError("the admission loop on %s is not running, so no hold can be granted" % socket.gethostname())
+        if not snap.get("room"):
+            raise JobError("the admission loop on %s is still measuring the host, so no hold can be granted yet"
+                           % socket.gethostname())
         gpus = snap["room"]["gpus"]
         want = str(req.get("gpu"))
         gid = next((u for u, g in gpus.items() if u == want or str(g["index"]) == want), None)
@@ -2174,6 +2356,14 @@ def host_admission(req):
     if action == "start":
         if _admission_settings() is None:  # raises with the reason when the file is unusable
             raise JobError("no admission settings at %s; write them first" % ADMISSION_CONFIG)
+        why = _scope_probe(env)
+        if why:
+            raise JobError("this host cannot run admitted jobs, so admission stays off: %s" % why)
+        p = subprocess.run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"], env=env,
+                           capture_output=True, text=True, timeout=30)
+        if p.stdout.strip() != "yes":
+            raise JobError("the systemd user manager does not outlive logins here, so the loop would stop at logout; "
+                           "turn on lingering (loginctl enable-linger) first")
         unit_dir = os.path.expanduser("~/.config/systemd/user")
         os.makedirs(unit_dir, exist_ok=True)
         with open(os.path.join(unit_dir, ADMIT_UNIT + ".tmp"), "w") as f:
@@ -2199,6 +2389,35 @@ def host_admission(req):
     if settings is not None:
         out["heartbeat_age"] = _heartbeat_age(Admission(settings))
     return out
+
+
+PROBE_SCRIPT = r"""
+d=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)
+mkdir "$d/shim" "$d/job" && echo $$ > "$d/shim/cgroup.procs" && echo +memory > "$d/cgroup.subtree_control" &&
+  echo 67108864 > "$d/job/memory.max" && echo 0 > "$d/job/memory.swap.max" && echo 1 > "$d/job/memory.oom.group" &&
+  [ "$(cat "$d/job/memory.max")" = 67108864 ] && [ "$(cat "$d/job/memory.swap.max")" = 0 ] &&
+  [ "$(cat "$d/job/memory.oom.group")" = 1 ] && [ -e "$d/job/memory.peak" ] && echo PROBE-OK
+"""
+
+
+def _scope_probe(env):
+    """Why this host cannot give a job the scope admission relies on (docs/admission.md), or None."""
+    if not os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+        return "cgroup v2 is not mounted at /sys/fs/cgroup"
+    unit = "agent-pueue-probe-%s.scope" % uuid.uuid4().hex[:12]
+    try:
+        # on stdin: systemd-run would rewrite "$$" in its arguments (environment expansion, systemd 254 and later)
+        p = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit, "-p", "Delegate=yes",
+                            "-p", "OOMPolicy=continue", "--", "bash", "-s"], input=PROBE_SCRIPT,
+                           env=env, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "systemd-run failed: %s" % e
+    finally:
+        subprocess.run(["systemctl", "--user", "reset-failed", unit], env=env, capture_output=True, timeout=30)
+    if "PROBE-OK" not in p.stdout:
+        return ("a test scope could not set a RAM limit, no swap and whole-job kill on its job cgroup "
+                "(systemd-run exit %d: %s)" % (p.returncode, (p.stdout + p.stderr).strip()[-300:] or "no output"))
+    return None
 
 
 HOST_OPS = {"submit": host_submit, "probe": host_probe, "ls": host_ls,
@@ -2361,6 +2580,10 @@ def submit(args, command):
         host, tid, token = place(args, command, adm)
         args.host = host
         return {"id": tid, "token": token}
+    like = str((adm or {}).get("like") or "")
+    if "#" in like and like.rsplit("#", 1)[0] != args.host:
+        raise JobError("--like %s names a job on %s; submit to %s, or name the job by its token"
+                       % (like, like.rsplit("#", 1)[0], like.rsplit("#", 1)[0]))
     tid, token = submit_to(args, args.host, command, adm)
     return {"id": tid, "token": token}
 
@@ -2379,6 +2602,8 @@ def submit_to(args, host, command, adm):
     for attempt in range(4):
         try:
             r = call(host, "submit", req)
+            if r.get("sized"):
+                sys.stderr.write("job: %s\n" % r["sized"])
             return r["id"], r["token"]
         except Unreachable as e:
             last = e
@@ -2419,10 +2644,10 @@ def _admission_request(args):
     for k in ("pilot", "small", "in_containers", "restartable"):
         if getattr(args, k, False):
             a[k] = True
+    if getattr(args, "needs_path", None):
+        a["needs_path"] = list(args.needs_path)
     if a.get("stop_at"):
-        if _parse_time(a["stop_at"]) is None:
-            raise JobError("--stop-at needs a time like 2026-11-10T08:00-05:00")
-        a["stop_at"] = _parse_time(a["stop_at"]).isoformat()
+        a["stop_at"] = _stop_at(a["stop_at"])
     return a or None
 
 
@@ -2434,7 +2659,9 @@ def _rooms(hosts, timeout=60, paths=()):
         try:
             out[h] = call(h, "room", {"paths": list(paths)}, timeout=timeout)
         except (JobError, Unreachable) as e:
-            out[h] = str(e)
+            text = str(e)
+            # a host whose job predates `room` answers with argparse's usage error (exit 2)
+            out[h] = "its job predates admission" if ("invalid choice" in text or "usage:" in text) else text
 
     threads = [threading.Thread(target=ask, args=(h,)) for h in hosts]
     for t in threads:
@@ -2445,7 +2672,10 @@ def _rooms(hosts, timeout=60, paths=()):
 
 
 def _placement_hosts():
-    return ["local"] + [h for h in LISTED if h != "local"] if "local" not in LISTED else list(LISTED)
+    names = ["local"] + [h for h in LISTED if h != "local"]
+    if any(HOSTS.get(h) is None for h in names if h != "local"):
+        names.remove("local")  # this machine is listed by its own name: ask it once
+    return names
 
 
 def place(args, command, adm):
@@ -2459,17 +2689,20 @@ def place(args, command, adm):
             skipped.append("%s (%s)" % (h, r))
         elif not r.get("admission"):
             continue
-        elif r.get("stale") or not r.get("room"):
+        elif r.get("stale") or not (r.get("room") or r.get("warmup")):
             skipped.append("%s (its admission loop is not running)" % h)
         else:
-            usable.append(h)
+            usable.append(h)  # a host whose loop is still measuring can hold the job, not start it now
     if skipped:
         sys.stderr.write("job: auto skipped %s\n" % "; ".join(skipped))
-    if not usable:
-        raise JobError("no admission host is available for auto")
     want_host = set(adm.pop("hosts", []) or [])
+    like = str(adm.get("like") or "")
+    if "#" in like:  # HOST#ID names a record on that host only
+        want_host = (want_host & {like.rsplit("#", 1)[0]}) if want_host else {like.rsplit("#", 1)[0]}
     if want_host:
         usable = [h for h in usable if h in want_host]
+    if not usable:
+        raise JobError("no admission host is available for auto")
 
     def order(h):
         r = rooms[h]
@@ -2481,18 +2714,27 @@ def place(args, command, adm):
         return (not ok, -int(bool(adm.get("data")) and adm["data"] in (r.get("paths") or [])), len(r.get("held") or []))
 
     usable.sort(key=order)
+    # A host's refusal (JobError) is definite, so the next host may be tried. Unreachable is not: the job may
+    # have been queued there, so it is never sent to a second host.
     for h in usable:
+        if not rooms[h].get("room"):
+            continue
         try:
             tid, token = submit_to(args, h, command, dict(adm, fit_now=True))
             sys.stderr.write("job: auto placed the job on %s\n" % h)
             return h, tid, token
+        except JobError:
+            pass  # no room there now, or it refuses the job: try the next
+    held_refused = []
+    for h in usable:
+        try:
+            tid, token = submit_to(args, h, command, adm)
         except JobError as e:
-            if "no room" not in str(e):
-                raise
-    h = usable[0]
-    tid, token = submit_to(args, h, command, adm)
-    sys.stderr.write("job: no host has room now; the job is held on %s until it fits\n" % h)
-    return h, tid, token
+            held_refused.append("%s: %s" % (h, e))
+            continue
+        sys.stderr.write("job: no host has room now; the job is held on %s until it fits\n" % h)
+        return h, tid, token
+    raise JobError("no admission host takes this job: %s" % "; ".join(held_refused))
 
 
 def _probe_size(adm):
@@ -2543,6 +2785,11 @@ def cmd_room(args):
             continue
         if not r.get("admission"):
             print("%s: not an admission host" % h)
+            continue
+        if r.get("warmup") and not r.get("stale"):
+            w = r["warmup"]
+            print("%s: admission loop measuring the host first (%s of %s); nothing starts until then" % (
+                h, _fmt_dur(w["covered_s"]), _fmt_dur(w["needed_s"])))
             continue
         if r.get("stale") or not r.get("room"):
             age = r.get("heartbeat_age")
@@ -3075,6 +3322,8 @@ def build_parser():
         a.add_argument("--data", default=None, metavar="PATH", help="the data it reads (names its disk)")
         a.add_argument("--stop-at", default=None, metavar="TIME", help="stop it then (YYYY-MM-DDTHH:MM+-HH:MM)")
         a.add_argument("--in-containers", action="store_true", help="its work runs in containers")
+        a.add_argument("--needs-path", action="append", metavar="PATH",
+                       help="run only on a host where PATH exists (repeatable)")
         a.add_argument("--restartable", action="store_true", help="it may run on hosts that can be reclaimed")
         a.add_argument("--host", dest="only_hosts", action="append", default=None, metavar="NAME",
                        help="with auto: only this host (repeatable)")
