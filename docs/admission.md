@@ -69,8 +69,8 @@ job release host2 <hold-id>
   - While a job is held, its wait prints a line saying why (for example `held: needs 18.0 GB on GPU 0, 9.4 GB
     free`) every 10 minutes, and `job ls` shows `Held` with the reason. Being held is not a verdict and does not
     end a multi-job wait.
-  - A submit that cannot fit on any host even when that host is empty (its capacity minus headroom) is refused
-    at once with `WRAPPER_ERROR` and the reason.
+  - A submit that cannot fit on any host even when that host is empty (its capacity minus headroom; for RAM, the
+    job's hard limit must fit) is refused at once with `WRAPPER_ERROR` and the reason.
   - When a job's command ends, any processes it left running (for example a `nohup ... &`) are stopped within one
     cycle. A job that needs a service to outlive it starts the service some other way.
 
@@ -239,8 +239,8 @@ scope, as it ends pueued.
 Limits and settings:
 
 - **RAM:** the hard limit on `job/` is the job's size times `ram_hard_factor` (a pilot's is its counted room).
-  Room is counted at `max(size, current use)`, so a job that runs over its size takes room from new jobs at
-  once, and only past the hard limit is it stopped. `memory.swap.max` 0 keeps an over-size job from spilling
+  Room is counted at `max(hard limit, current use)`, so a job can grow up to its limit without taking room
+  other jobs were counted into, and only past the hard limit is it stopped. `memory.swap.max` 0 keeps an over-size job from spilling
   into swap. `memory.oom.group` 1 stops the whole job when one process is killed for memory, instead of leaving
   it running short of a worker.
 - **CPU:** no quota; a quota throttles jobs that size their worker pools from the core count. Ranking jobs below
@@ -276,9 +276,10 @@ Limits and settings:
 
 Processes started by a container engine run in the engine's cgroups, outside the job's scope: the scope's
 limits, nice and per-job measurement don't reach them, and their use shows as outside use. A job that runs its
-work in containers says `--in-containers`. It is counted at its size until its containers' use has had
+work in containers says `--in-containers`. It is counted at its hard limit until its containers' use has had
 `outside_window_s` to appear as outside use, then at zero, so its use is counted twice only for that window
-(the safe direction). Deployments that want limits on container work set them in the container engine.
+(the safe direction). Its containers are not bounded by that limit, so room is kept for them only as their
+measured use grows. Deployments that want limits on container work set them in the container engine.
 
 ### Measurement
 
@@ -320,9 +321,14 @@ the larger of their size and their current use. A job that ends frees its room a
   over admitted jobs of max(hard limit, current use)`, minus `Σ over RAM holds of max(size, own use)`. A job is
   counted at its hard limit (`ram_hard_factor` times its size, a pilot's counted room), not its size, and fits
   only if its limit fits, so jobs that grow up to their limits together still leave `ram_headroom` free. A RAM
-  hold's own use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or `Pss_Anon +
-  Pss_Shmem` (`RssAnon + RssShmem` on kernels without them) of `--while-pid` and its descendants; a RAM hold that names no processes is counted at its size and its real use
-  again as outside use. Nothing is released while memory pressure is over `memory_pressure_max_pct`.
+  hold's own use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or the sum of `Pss_Anon
+  + Pss_Shmem` of `--while-pid` and its descendants. Where a process's `smaps_rollup` can't be read (another
+  user's process, a kernel without `Pss_Anon`), it is a lower bound instead: the larger of that sum and the
+  biggest single process's `RssAnon + RssShmem`, since own use counted too high would give its room out twice. A
+  process or cgroup is the own use of one hold only, the oldest that names it, so two holds on the same or
+  nested processes (a service that registers again before its old hold ends) don't add it back twice. A RAM hold
+  that names no processes is counted at its size and its real use again as outside use. Nothing is released
+  while memory pressure is over `memory_pressure_max_pct`.
 - **CPU, per host** (CPU can be shared by time, so older jobs count at their measured use): `outside` is the
   average over `cpu_window_s` of busy threads minus the admitted jobs' measured threads. A job fits when
   `outside + Σ over jobs older than cpu_window_s of their average use over it + Σ over younger jobs of max(size,
@@ -392,8 +398,12 @@ once with its own exit status (206, `NO_ROOM`), apart from admission being unava
 what to do. A caller that wants room kept for a later step registers a hold the same way.
 Holds and jobs are first come: neither displaces the other. `gpu_headroom` keeps the parties on one card
 apart, so a GPU hold on a card that has no admitted job and no other hold may use it (a model that fills the
-card): no admitted job, no other hold and no other process on the card. Jobs admitted after it still keep it.
-RAM holds always keep `ram_headroom` free. A hold's own GPU use is its processes' use on its own card; their use
+card): no admitted job, no other hold and no other process on the card. A process the driver lists without
+its memory counts as another process, and so does every card when the process list can't be read. Jobs
+admitted after it still keep it. RAM holds always keep `ram_headroom` free, and are granted only by a loop
+running the same `job` as the request (its heartbeat's version): just after an install, until the loop has
+restarted into the new file and finished a cycle (up to two sample intervals), a RAM hold is refused as admission
+unavailable (exit 205). A hold's own GPU use is its processes' use on its own card; their use
 on any other card counts as outside use. A service registers its hold before it loads (one registered while
 loaded is counted twice until the window passes, which only wastes room), and its cgroup must not contain
 `job`'s own scopes, whose RAM would then count twice.

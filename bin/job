@@ -1068,12 +1068,14 @@ class Measure:
     # -- GPUs --------------------------------------------------------------------------------------------------
 
     def gpus(self):
-        """[{index, uuid, name, total, used, util, procs: {pid: bytes}}] in bytes; [] on a host without GPUs."""
+        """[{index, uuid, name, total, used, util, procs: {pid: bytes}, procs_ok}] in bytes (procs_ok False when the
+        process list could not be read); [] on a host without GPUs."""
         if self.gpu_file:
             with open(self.gpu_file) as f:
                 raw = json.load(f)
             cards = [{"index": c["index"], "uuid": c["uuid"], "name": c.get("name", "?"), "total": c["total"],
-                      "used": c["total"] - c["free"], "util": c.get("util", 0), "procs": {}} for c in raw["cards"]]
+                      "used": c["total"] - c["free"], "util": c.get("util", 0), "procs": {},
+                      "procs_ok": c.get("procs_ok", True)} for c in raw["cards"]]
             by = {c["uuid"]: c for c in cards}
             for p in raw.get("procs", []):
                 if p["uuid"] in by:
@@ -1156,23 +1158,31 @@ class Measure:
 
     def pids_ram(self, pids):
         """Anonymous and shared memory of pids, file-backed pages excluded (as for a job): Pss_Anon + Pss_Shmem from
-        smaps_rollup, so memory shared between them counts once; RssAnon + RssShmem where the kernel has no Pss_Anon."""
-        total = 0
+        smaps_rollup, summed, so memory shared between them counts once. Where a process's smaps_rollup cannot be
+        read (another user's process, a kernel without Pss_Anon), a lower bound instead: the larger of that sum and
+        the biggest single process's RssAnon + RssShmem. Own use counted too high would give its room out twice;
+        too low only keeps some room back."""
+        pss, exact = 0, True
         for pid in pids:
             try:
                 f = dict(ln.split(":", 1) for ln in self._read(self.proc, str(pid), "smaps_rollup").splitlines()
                          if ":" in ln)
                 if "Pss_Anon" in f:
-                    total += sum(int(f[k].split()[0]) * 1024 for k in ("Pss_Anon", "Pss_Shmem") if k in f)
+                    pss += sum(int(f[k].split()[0]) * 1024 for k in ("Pss_Anon", "Pss_Shmem") if k in f)
                     continue
             except (OSError, ValueError, IndexError):
                 pass
+            exact = False
+        if exact:
+            return pss
+        biggest = 0
+        for pid in pids:
             try:
                 f = dict(ln.split(":", 1) for ln in self._read(self.proc, str(pid), "status").splitlines() if ":" in ln)
-                total += sum(int(f[k].split()[0]) * 1024 for k in ("RssAnon", "RssShmem") if k in f)
+                biggest = max(biggest, sum(int(f[k].split()[0]) * 1024 for k in ("RssAnon", "RssShmem") if k in f))
             except (OSError, ValueError, IndexError):
                 continue
-        return total
+        return max(pss, biggest)
 
     def _io_bytes(self, pid):
         try:
@@ -1227,8 +1237,10 @@ class _Nvml:
             arr = (self.Proc * count.value)()
             rc = fn(h, ctypes.byref(count), arr)
         self._ok(rc, "process list")
-        return {arr[i].pid: arr[i].usedGpuMemory for i in range(count.value)
-                if arr[i].usedGpuMemory < (1 << 63)}  # NVML_VALUE_NOT_AVAILABLE is all ones
+        # NVML_VALUE_NOT_AVAILABLE (all ones): the process is on the card but its memory is not known; it is kept,
+        # at 0, so the card is not taken for one no one else uses
+        return {arr[i].pid: arr[i].usedGpuMemory if arr[i].usedGpuMemory < (1 << 63) else 0
+                for i in range(count.value)}
 
     def cards(self):
         lib, out = self.lib, []
@@ -1270,10 +1282,13 @@ def _nvidia_smi_cards():
                           "used": total - (int(float(f[4])) << 20),
                           "util": int(float(f[5])) if f[5].replace(".", "").isdigit() else 0, "procs": {}})
     by = {c["uuid"]: c for c in cards}
+    if q.returncode != 0:
+        for c in cards:
+            c["procs_ok"] = False  # its processes are not known, so it is not taken to have none
     for line in q.stdout.splitlines() if q.returncode == 0 else []:
         f = [x.strip() for x in line.split(",")]
-        if len(f) == 3 and f[0] in by and f[1].isdigit() and f[2].isdigit():
-            by[f[0]]["procs"][int(f[1])] = int(f[2]) << 20
+        if len(f) == 3 and f[0] in by and f[1].isdigit():
+            by[f[0]]["procs"][int(f[1])] = int(f[2]) << 20 if f[2].isdigit() else 0  # "[N/A]": on the card, size unknown
     return cards
 
 
@@ -1446,8 +1461,11 @@ def fits_empty(settings, capacity, job):
         return "needs %g%% of a GPU's time; this host shares out at most %g%% of a card" % (
             size["gpu_share"], settings["gpu_busy_max_pct"])
     ram_max = capacity["mem_total"] - settings["ram_headroom_gb"] * GB
-    if size["ram"] > ram_max:
+    if job.get("pilot") and size["ram"] > ram_max:
         return "needs %s RAM; this host has at most %s for jobs" % (_gbs(size["ram"]), _gbs(ram_max))
+    if not job.get("pilot") and ram_limit(settings, size["ram"]) > ram_max:  # a job is counted at its limit
+        return "needs %s RAM (its limit, %g times its size); this host has at most %s for jobs" % (
+            _gbs(ram_limit(settings, size["ram"])), settings["ram_hard_factor"], _gbs(ram_max))
     if size["cpus"] > min(settings["cpu_busy_threads_max"], settings["placed_cores_max"]):
         return "needs %g CPU threads; this host admits at most %g" % (
             size["cpus"], min(settings["cpu_busy_threads_max"], settings["placed_cores_max"]))
@@ -1608,8 +1626,8 @@ def _size_from(settings, adm, capacity, req):
         if k in explicit:
             size[k] = int(_num(explicit[k], "--" + k.replace("_", "-"), lo=0, whole=True))
     if explicit and "ram" not in explicit:
-        raise JobError("an explicit size needs --ram (it is the job's RAM limit); or use --pilot to measure the "
-                       "job, or --small")
+        raise JobError("an explicit size needs --ram (the job's RAM; its hard limit is that times the host's "
+                       "ram_hard_factor); or use --pilot to measure the job, or --small")
     if "gpu_mem" in explicit and not size["gpus"]:
         size["gpus"] = 1
     if size["gpus"] and not size["gpu_mem"] and not a.get("pilot"):
@@ -1642,7 +1660,10 @@ def _size_from(settings, adm, capacity, req):
         gpu_max = max([c["total"] for c in capacity["gpus"]] or [0]) - settings["gpu_headroom_mb"] * MB
         peak_ram, peak_gpu = r["peak_ram"] or 0, r["peak_gpu_mem"] or 0
         size["cpus"] = max(0.1, round((r["peak_cpu"] or 0) * m["cpu"], 1))
-        size["ram"] = int(min(peak_ram * m["ram"], ram_max) if peak_ram <= ram_max else peak_ram * m["ram"])
+        # the margin is cut so the job's limit (its size times ram_hard_factor, what it is counted at) fits the
+        # host; the limit still covers the peak, since the peak fits
+        size["ram"] = int(min(peak_ram * m["ram"], ram_max / settings["ram_hard_factor"]) if peak_ram <= ram_max
+                          else peak_ram * m["ram"])
         size["gpus"] = len(json.loads(r["gpus"] or "[]"))
         size["gpu_mem"] = int(min(peak_gpu * m["gpu_mem"], gpu_max) if peak_gpu <= gpu_max else peak_gpu * m["gpu_mem"])
         size["disk_mb_s"] = float(r.get("peak_disk_mb_s") or 0.0)
@@ -1970,15 +1991,9 @@ class Loop:
                             break
                     else:
                         others[c["uuid"]] = others.get(c["uuid"], 0) + 1
-        hold_ram = {}
-        for h in holds:
-            if not h.get("ram"):
-                continue
-            if h["id"] in hold_cgs:
-                vals = [self.m.cgroup_ram(c) for c in hold_cgs[h["id"]]]
-                hold_ram[h["id"]] = sum(v for v in vals if v)
-            elif h["id"] in hold_pids:
-                hold_ram[h["id"]] = self.m.pids_ram(hold_pids[h["id"]])
+            if not c.get("procs_ok", True):
+                others[c["uuid"]] = others.get(c["uuid"], 0) + 1
+        hold_ram = self.hold_ram(holds, hold_cgs, hold_pids)
         s = {"t": now, "busy": busy, "iowait": iowait or 0.0, "avail": mem.get("MemAvailable", 0),
              "psi": self.m.memory_pressure(), "disks": self.m.disks(now, set(self.disk_names.values())),
              "gpus": {c["uuid"]: dict({k: c[k] for k in ("index", "name", "total", "used", "util")},
@@ -1988,6 +2003,31 @@ class Loop:
         self.samples.append(s)
         self.samples = [x for x in self.samples if now - x["t"] <= self.keep_s]
         return s, jobs
+
+    def hold_ram(self, holds, hold_cgs, hold_pids):
+        """Each RAM hold's own use. A process or cgroup is the own use of one hold only, the oldest that names it:
+        two holds naming the same or nested processes (a service that registers again before its old hold ends)
+        would otherwise add its RAM back to the room twice."""
+        out, taken_cg, taken_pids = {}, {}, set()  # taken_cg: path -> its whole measured use
+        for h in sorted((h for h in holds if h.get("ram")), key=lambda h: h.get("start") or 0):
+            hid, own = h["id"], 0
+            if hid in hold_cgs:
+                for c in hold_cgs[hid]:
+                    if _in_cgroups(c, taken_cg):
+                        continue  # inside an older hold's cgroup: counted there
+                    whole = self.m.cgroup_ram(c) or 0
+                    inner = [x for x in taken_cg if x.startswith(c + "/")]
+                    pids = [p for p in taken_pids if _in_cgroups(self.m.cgroup_of(p) or "", [c])]
+                    own += max(0, whole - sum(taken_cg.pop(x) for x in inner) - self.m.pids_ram(pids))
+                    taken_pids.difference_update(pids)  # now inside c, which covers them
+                    taken_cg[c] = whole
+            elif hid in hold_pids:
+                pids = [p for p in hold_pids[hid]
+                        if p not in taken_pids and not _in_cgroups(self.m.cgroup_of(p) or "", taken_cg)]
+                own = self.m.pids_ram(pids)
+                taken_pids.update(pids)
+            out[hid] = own
+        return out
 
     def cycle(self):
         """Measure, account, end, release; returns the seconds to sleep before the next cycle."""
@@ -2257,8 +2297,11 @@ class Loop:
                 self.adm.write_json(self.adm.path("holds", h["id"] + ".json"), h)
             if room is not None and h["id"] not in counted:
                 if h.get("uuid") in room["gpus"]:
-                    room["gpus"][h["uuid"]]["room"] -= h.get("size") or 0
+                    g = room["gpus"][h["uuid"]]
+                    g["room"] -= h.get("size") or 0
+                    g["holds"] += h.get("size") or 0  # a hold on the card: a later hold does not get the headroom
                 room["ram"]["room"] -= h.get("ram") or 0
+                room["ram"]["holds"] += h.get("ram") or 0
             live.append(h)
         self.holds = live
 
@@ -2469,7 +2512,7 @@ def _hold_cgroups(h):
             env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
             try:
                 p = subprocess.run(["systemctl", flag, "show", "-p", "ControlGroup", "--value", h["unit"]], env=env,
-                                   capture_output=True, text=True, timeout=30)
+                                   capture_output=True, text=True, timeout=5)  # each cycle: a hung call delays it
             except (OSError, subprocess.TimeoutExpired):
                 continue
             cg = p.stdout.strip()
@@ -2477,6 +2520,11 @@ def _hold_cgroups(h):
                 out.append(cg.rstrip("/"))
         return out
     return []
+
+
+def _in_cgroups(cg, paths):
+    """Whether cgroup path cg is one of paths or inside one."""
+    return any(cg == x or cg.startswith(x + "/") for x in paths)
 
 
 def _pid_tree(proc, root):
@@ -2541,6 +2589,11 @@ def host_hold(req):
         # the snapshot is written under this lock after each cycle's releases; holds since then are not in it
         newer = [h for h in _holds(adm) if h["start"] > snap.get("written", snap["t"])]
         if ram:
+            running = (adm.read_json(adm.path("heartbeat")) or {}).get("version")
+            if running != VERSION:  # just after an install, until the loop restarts into this file (one cycle)
+                raise JobError("the admission loop on %s runs job %s, which does not count RAM holds as job %s does; "
+                               "no RAM hold can be granted until it restarts" % (socket.gethostname(), running or "?",
+                                                                                 VERSION))
             free_ram = snap["room"]["ram"]["room"] - sum(h.get("ram") or 0 for h in newer)
             if ram > free_ram:
                 raise NoRoom("%s has %s of RAM free to hold; the hold needs %s" % (
