@@ -27,7 +27,7 @@ import threading
 import time
 import uuid
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 PROTOCOL = 3
 # Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
 # option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
@@ -297,23 +297,34 @@ def _runner(script, normal_priority=False):
     return "nice -n 19 ionice -c 3 bash %s" % shlex.quote(script)
 
 
+GPU_VARS = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "JOB_GPU_UUIDS")  # set by admission, never by the caller
+SCOPE_MIN_MEMORY = 16 << 20
+
+
+def _env_name_ok(k):
+    return (isinstance(k, str) and k != "" and k.isascii() and (k[0].isalpha() or k[0] == "_")
+            and all(c.isalnum() or c == "_" for c in k))
+
+
 def _check_scope(scope):
     """Validate a scope request; return it normalized. See docs/admission.md, "Per-job scope"."""
     if not isinstance(scope, dict):
         raise JobError("scope must be an object")
     mem = scope.get("memory_max")
-    if not isinstance(mem, int) or isinstance(mem, bool) or mem < (1 << 20):
-        raise JobError("scope.memory_max must be a whole number of bytes, at least 1 MiB")
+    if not isinstance(mem, int) or isinstance(mem, bool) or mem < SCOPE_MIN_MEMORY:
+        raise JobError("scope.memory_max must be a whole number of bytes, at least %d MiB" % (SCOPE_MIN_MEMORY >> 20))
     gpus = scope.get("gpus")
-    if gpus is not None:
-        if not isinstance(gpus, list) or not all(
-                isinstance(g, str) and g and all(c.isalnum() or c in "-_:" for c in g) for g in gpus):
-            raise JobError("scope.gpus must be null or a list of GPU UUIDs")
+    if gpus is None:
+        gpus = []  # a scoped job sees no GPU unless it was given one
+    if not isinstance(gpus, list) or not all(
+            isinstance(g, str) and g and g.isascii() and all(c.isalnum() or c in "-_:/." for c in g) for g in gpus):
+        raise JobError("scope.gpus must be a list of GPU UUIDs")
     gpu_env = scope.get("gpu_env") or {}
-    if not isinstance(gpu_env, dict) or not all(
-            isinstance(k, str) and k and (k[0].isalpha() or k[0] == "_") and all(c.isalnum() or c == "_" for c in k)
-            and isinstance(v, str) for k, v in gpu_env.items()):
+    if not isinstance(gpu_env, dict) or not all(_env_name_ok(k) and isinstance(v, str) for k, v in gpu_env.items()):
         raise JobError("scope.gpu_env must map variable names to strings")
+    bad = sorted(k for k in gpu_env if k in GPU_VARS or k.startswith("JOB_"))
+    if bad:
+        raise JobError("scope.gpu_env may not set %s" % ", ".join(bad))
     adj = scope.get("oom_score_adj", 0)
     if not isinstance(adj, int) or isinstance(adj, bool) or not 0 <= adj <= 1000:
         raise JobError("scope.oom_score_adj must be a whole number from 0 to 1000")
@@ -321,27 +332,57 @@ def _check_scope(scope):
 
 
 def _scope_scripts(token, body, record, scope):
-    """The wrapper (pueue's child, outside the scope) and the shim (inside it) of a scoped job."""
+    """The wrapper (pueue's child, outside the scope) and the shim (inside it) of a scoped job.
+
+    The scope is delegated to the shim, which splits it into two cgroups: shim/ (itself) and job/ (the
+    command, with the memory limit, no swap and whole-group kill). So the shim outlives a memory kill of the
+    job and reads the job's own counters to say why it ended, on any systemd version.
+    """
     results = os.path.dirname(record)
     q = shlex.quote
     started, final, result = (os.path.join(results, token + ext) for ext in (".started", ".final", ".scope"))
     shim_path = os.path.join(os.path.dirname(body), token + ".shim")
-    unit = SCOPE_PREFIX + token
-    systemd_run = os.environ.get("JOB_SYSTEMD_RUN") or "systemd-run"  # tests point this at a failing command
+    unit = SCOPE_PREFIX + token + ".scope"
+    sysd = "timeout 30 systemctl --user"
     shim = "\n".join([
         "#!/bin/bash",
-        "# job %s: runs inside the scope; records that the scope started and the job's final usage" % VERSION,
-        ": > %s" % q(started),
-        ("echo %d > /proc/self/oom_score_adj 2>/dev/null" % scope["oom_score_adj"]) if scope["oom_score_adj"]
-        else ":",
+        "# job %s: runs inside the job's systemd scope; runs the command in job/ and records how it ended" % VERSION,
+        "final=%s" % q(final),
+        'fail() { echo "setup_error=$1" > "$final.tmp" && mv "$final.tmp" "$final"; exit 205; }',
         'cg="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"',
-        "bash -o pipefail %s" % q(body),
+        '[ "${cg##*/}" = %s ] || fail "not running in its own scope"' % q(unit),
+        '[ -w "$cg/cgroup.subtree_control" ] || fail "the scope is not delegated"',
+        'mkdir "$cg/shim" "$cg/job" 2>/dev/null || fail "could not make the job cgroups"',
+        'echo $$ 2>/dev/null > "$cg/shim/cgroup.procs" || fail "could not move the shim into its cgroup"',
+        'echo +memory 2>/dev/null > "$cg/cgroup.subtree_control" || fail "no memory controller in the scope"',
+        "{ echo %d > \"$cg/job/memory.max\" && echo 0 > \"$cg/job/memory.swap.max\" &&"
+        " echo 1 > \"$cg/job/memory.oom.group\"; } 2>/dev/null || fail \"could not set the memory limit\""
+        % scope["memory_max"],
+        '[ "$(cat "$cg/job/memory.max")" = %d ] && [ "$(cat "$cg/job/memory.swap.max")" = 0 ] &&'
+        ' [ "$(cat "$cg/job/memory.oom.group")" = 1 ] || fail "the memory limit did not take effect"'
+        % scope["memory_max"],
+        "(",
+        '  echo $BASHPID 2>/dev/null > "$cg/job/cgroup.procs" || exit 0',
+        "  : > %s" % q(started),
+        ("  echo %d 2>/dev/null > /proc/self/oom_score_adj" % scope["oom_score_adj"]) if scope["oom_score_adj"]
+        else "  :",
+        "  exec bash -o pipefail %s" % q(body),
+        ")",
         "rc=$?",
+        '[ -e %s ] || fail "could not move the job into its cgroup"' % q(started),
+        "# processes still dying from a kill leave within moments; anything left after that, the job left behind",
+        'for i in $(seq 20); do grep -qx "populated 0" "$cg/job/cgroup.events" && break; sleep 0.1; done',
+        'left=$(wc -l < "$cg/job/cgroup.procs")',
+        'if [ "$left" -gt 0 ]; then',
+        '  echo 1 > "$cg/job/cgroup.kill"',
+        '  for i in $(seq 100); do grep -qx "populated 0" "$cg/job/cgroup.events" && break; sleep 0.1; done',
+        "fi",
         "{",
-        '  echo "cgroup=$cg"',
-        '  for f in memory.peak memory.current memory.max; do echo "$f=$(cat "$cg/$f" 2>/dev/null)"; done',
-        '  for f in memory.stat memory.events cpu.stat; do sed "s/^/$f./;s/ /=/" "$cg/$f" 2>/dev/null; done',
-        "} > %s.tmp && mv %s.tmp %s" % (q(final), q(final), q(final)),
+        '  echo "rc=$rc"',
+        '  echo "leftover=$left"',
+        '  echo "memory.peak=$(cat "$cg/job/memory.peak" 2>/dev/null)"',
+        '  for f in memory.events cpu.stat; do sed "s/^/$f./;s/ /=/" "$cg/job/$f" 2>/dev/null; done',
+        '} > "$final.tmp" && mv "$final.tmp" "$final"',
         "exit $rc",
         ""])
     wrapper = "\n".join([
@@ -349,18 +390,21 @@ def _scope_scripts(token, body, record, scope):
         "# job %s: runs the job in its own systemd scope and records how it ended" % VERSION,
         'export PATH="$HOME/.local/bin:$PATH"',
         'export XDG_RUNTIME_DIR="/run/user/$(id -u)"',
-        "rm -f %s %s %s" % (q(started), q(final), q(result)),
-        "%s --user --scope --quiet --unit=%s -p MemoryMax=%d -p MemorySwapMax=0 -p OOMPolicy=kill -- bash %s"
-        % (q(systemd_run), q(unit), scope["memory_max"], q(shim_path)),
+        "rm -f %s %s %s %s" % (q(started), q(final), q(result), q(os.path.join(results, token + ".killed"))),
+        "# a restarted job reuses its token, so end any scope an earlier run of it left",
+        "%s kill --signal=SIGKILL %s >/dev/null 2>&1" % (sysd, q(unit)),
+        "%s stop %s >/dev/null 2>&1" % (sysd, q(unit)),
+        "%s reset-failed %s >/dev/null 2>&1" % (sysd, q(unit)),
+        "systemd-run --user --scope --quiet --unit=%s -p Delegate=yes -p OOMPolicy=continue -- bash %s"
+        % (q(unit), q(shim_path)),
         "rc=$?",
         "{",
         '  echo "rc=$rc"',
         '  echo "memory_max=%d"' % scope["memory_max"],
         "  [ -e %s ] && echo started=1 || echo started=0" % q(started),
-        "  [ -e %s ] && echo final=1 || echo final=0" % q(final),
-        "  systemctl --user show %s -p Result -p MemoryPeak -p LoadState 2>/dev/null" % q(unit + ".scope"),
+        "  %s show %s -p Result -p LoadState 2>/dev/null" % (sysd, q(unit)),
         "} > %s.tmp && mv %s.tmp %s" % (q(result), q(result), q(result)),
-        "systemctl --user reset-failed %s >/dev/null 2>&1" % q(unit + ".scope"),
+        "%s reset-failed %s >/dev/null 2>&1" % (sysd, q(unit)),
         "echo $rc > %s" % q(record),
         "exit $rc",
         ""])
@@ -387,41 +431,93 @@ def _int_or_none(v):
         return None
 
 
+def _usage(kv, out):
+    """Copy a job cgroup's final counters from a shim or kill record into a result."""
+    out["memory_peak_incl_cache"] = _int_or_none(kv.get("memory.peak"))  # page cache counts: not a RAM size
+    out["memory_events"] = {k.split(".", 2)[2]: _int_or_none(v) for k, v in kv.items()
+                            if k.startswith("memory.events.")}
+    out["cpu_usage_usec"] = _int_or_none(kv.get("cpu.stat.usage_usec"))
+
+
 def _scope_result(token):
-    """How a scoped job ended, from the files its wrapper and shim wrote; None if it has not ended in a scope."""
+    """How a scoped job ended, from the files its wrapper, shim or `job kill` wrote; None if not scoped."""
     if not token:
         return None
     results = os.path.join(STATE_DIR, "results")
     kv = _read_kv(os.path.join(results, token + ".scope"))
-    if kv is None:
+    final = _read_kv(os.path.join(results, token + ".final"))
+    killed = _read_kv(os.path.join(results, token + ".killed"))
+    if kv is None and final is None and killed is None:
         return None
-    final = _read_kv(os.path.join(results, token + ".final")) if kv.get("final") == "1" else None
-    mem_max = _int_or_none(kv.get("memory_max"))
-    peak = _int_or_none(kv.get("MemoryPeak"))  # systemd 256 and later; "[not set]" otherwise
-    out = {"rc": _int_or_none(kv.get("rc")), "memory_max": mem_max, "scope_result": kv.get("Result")}
-    if kv.get("started") != "1":
-        out["how"] = "wrapper_error"
-    elif final is not None:
-        out["how"] = "exit"
-        out["memory_peak"] = _int_or_none(final.get("memory.peak"))
-        out["memory_events"] = {k.split(".", 2)[2]: _int_or_none(v) for k, v in final.items()
-                                if k.startswith("memory.events.")}
-        out["cpu_usage_usec"] = _int_or_none(final.get("cpu.stat.usage_usec"))
-    elif kv.get("Result") == "oom-kill":
-        out["how"] = "oom"
-        out["memory_peak"] = peak
-        if peak is not None and mem_max:
-            out["hit_limit"] = peak >= mem_max * 0.98
-    else:
+    kv = kv or {}
+    out = {"rc": _int_or_none(kv.get("rc")), "memory_max": _int_or_none(kv.get("memory_max")),
+           "scope_result": kv.get("Result")}
+    if killed is not None:
         out["how"] = "killed"
+        out["memory_max"] = out["memory_max"] or _int_or_none(killed.get("memory_max"))
+        _usage(killed, out)
+    elif final is not None and final.get("setup_error"):
+        out["how"] = "setup_error"
+        out["reason"] = final["setup_error"]
+    elif final is not None:
+        _usage(final, out)
+        ev = out["memory_events"]
+        out["leftover"] = _int_or_none(final.get("leftover")) or 0
+        if ev.get("oom_group_kill") or ev.get("oom_kill"):
+            # oom counts the times the job reached its own limit; a kill without it came from the host
+            out["how"] = "memory_limit" if ev.get("oom") else "host_oom"
+        elif _int_or_none(final.get("rc")) == 137:
+            out["how"] = "sigkill"
+        else:
+            out["how"] = "exit"
+    elif kv.get("started") != "1":
+        out["how"] = "wrapper_error"
+    else:
+        out["how"] = "scope_killed"  # the shim died with the job: the whole scope was killed from outside
     return out
 
 
+def _scope_cgroup(token):
+    env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
+    try:
+        p = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value",
+                            SCOPE_PREFIX + token + ".scope"], env=env, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    cg = p.stdout.strip()
+    return "/sys/fs/cgroup" + cg if p.returncode == 0 and cg.startswith("/") else None
+
+
+def _snapshot_kill(token):
+    """Before `job kill` ends a scoped job, keep its use so far, since its shim dies with it."""
+    path = os.path.join(STATE_DIR, "results", token + ".killed")
+    lines = ["stopped_by=job kill"]
+    cg = _scope_cgroup(token)
+    if cg:
+        job = os.path.join(cg, "job")
+        try:
+            with open(os.path.join(job, "memory.max")) as f:
+                lines.append("memory_max=" + f.read().strip())
+            with open(os.path.join(job, "memory.peak")) as f:
+                lines.append("memory.peak=" + f.read().strip())
+            for name in ("memory.events", "cpu.stat"):
+                with open(os.path.join(job, name)) as f:
+                    lines += ["%s.%s" % (name, line.strip().replace(" ", "=", 1)) for line in f if line.strip()]
+        except OSError:
+            pass
+    try:
+        with open(path + ".tmp", "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
 def _stop_scope(token):
-    """Stop a job's scope (its leftover processes) and forget a failed one; errors are ignored."""
+    """Kill everything left in a job's scope (SIGKILL, as pueue kill does) and forget the unit."""
     unit = SCOPE_PREFIX + token + ".scope"
     env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
-    for args in (["stop", unit], ["reset-failed", unit]):
+    for args in (["kill", "--signal=SIGKILL", unit], ["stop", unit], ["reset-failed", unit]):
         try:
             subprocess.run(["systemctl", "--user"] + args, env=env, capture_output=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired):
@@ -437,8 +533,9 @@ def host_submit(req):
         if req.get("protocol", PROTOCOL_ADMISSION) != PROTOCOL_ADMISSION:
             raise JobError("protocol mismatch: a job with a scope needs protocol %d" % PROTOCOL_ADMISSION)
         scope = _check_scope(scope)
-        if scope["gpus"] is not None and "CUDA_VISIBLE_DEVICES" in (req.get("env") or {}):
-            raise JobError("CUDA_VISIBLE_DEVICES is set by admission; do not pass it with --env")
+        bad = sorted(k for k in (req.get("env") or {}) if k in GPU_VARS)
+        if bad:
+            raise JobError("%s is set by admission; do not pass it with --env" % ", ".join(bad))
     token = req.get("token") or uuid.uuid4().hex
     if not all(c in "0123456789abcdef" for c in token):
         raise JobError("bad token")
@@ -500,11 +597,10 @@ def host_submit(req):
     if scope is not None:
         # the GPUs admission assigned, by UUID so CUDA's own device order does not matter;
         # an empty list hides every GPU from a job that did not ask for one
-        if scope["gpus"] is not None:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(scope["gpus"])
-            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-            env["JOB_GPU_UUIDS"] = ",".join(scope["gpus"])
         env.update(scope["gpu_env"])
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(scope["gpus"])
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        env["JOB_GPU_UUIDS"] = ",".join(scope["gpus"])
     env.update(req.get("env") or {})
     env.update({
         "JOB_TOKEN": token,
@@ -634,10 +730,13 @@ def host_kill(req):
         raise JobError("task %d now belongs to a different job; not killed" % tid)
     status = next(iter(t.get("status") or {"?": 0}))
     if status == "Running":
-        _pueue(["kill", str(tid)])
         token = (t.get("envs") or {}).get("JOB_TOKEN")
-        if token and os.path.exists(os.path.join(STATE_DIR, "scripts", token + ".shim")):
-            _stop_scope(token)  # processes the job left behind (setsid, nohup) end with it
+        scoped = bool(token) and os.path.exists(os.path.join(STATE_DIR, "scripts", token + ".shim"))
+        if scoped:
+            _snapshot_kill(token)  # its shim dies with it, so keep its use so far
+        _pueue(["kill", str(tid)])
+        if scoped:
+            _stop_scope(token)  # processes the job detached (setsid, nohup) end with it
         return {"id": tid, "action": "killed"}
     if status in ("Queued", "Stashed", "Locked"):
         _pueue(["remove", str(tid)])
@@ -840,23 +939,31 @@ def scope_verdict(verdict, code, scope):
     """Adjust a finished job's verdict with how its scope ended. Returns (verdict, code, note or None)."""
     if not scope:
         return verdict, code, None
-    how = scope.get("how")
+    how, limit = scope.get("how"), scope.get("memory_max")
     if how == "wrapper_error":
         return ("WRAPPER_ERROR", EXIT["WRAPPER_ERROR"],
                 "the job's systemd scope could not be started (systemd-run exit %s), so the job never ran; "
-                "the log shows why" % scope.get("rc"))
-    if how == "oom":
-        limit = scope.get("memory_max")
-        if scope.get("hit_limit") is True:
-            why = "it went over its RAM limit of %s" % _gb(limit)
-        elif scope.get("hit_limit") is False:
-            why = ("it was killed for memory by the host's out-of-memory killer (peak %s, below its RAM limit "
-                   "of %s)" % (_gb(scope["memory_peak"]), _gb(limit)))
-        else:
-            why = ("it was killed for memory: it went over its RAM limit of %s, or the host ran out of memory"
-                   % _gb(limit))
-        return verdict, code, "%s; the whole job was stopped" % why
-    return verdict, code, None
+                "systemd-run's message went to the job's log" % scope.get("rc"))
+    if how == "setup_error":
+        return ("WRAPPER_ERROR", EXIT["WRAPPER_ERROR"],
+                "the job's memory limit could not be set up (%s), so the job never ran" % scope.get("reason"))
+    if how == "memory_limit":
+        return verdict, code, "it went over its RAM limit of %s; the whole job was stopped" % _gb(limit or 0)
+    if how == "host_oom":
+        return verdict, code, ("the host ran out of memory and its out-of-memory killer stopped the job, which was "
+                               "under its RAM limit of %s; the whole job was stopped" % _gb(limit or 0))
+    if how == "sigkill":
+        return verdict, code, ("it was killed by signal 9 from outside, not by its RAM limit (for example by "
+                               "systemd-oomd under memory pressure, or by hand)")
+    if how == "scope_killed":
+        return verdict, code, ("its whole scope was killed from outside (systemd result %s), for example by "
+                               "systemd-oomd under memory pressure" % scope.get("scope_result"))
+    notes = []
+    if how == "exit" and (scope.get("memory_events") or {}).get("oom"):
+        notes.append("it reached its RAM limit of %s (allocations failed) but was not killed" % _gb(limit or 0))
+    if scope.get("leftover"):
+        notes.append("%d process(es) it left running were stopped when it ended" % scope["leftover"])
+    return verdict, code, "; ".join(notes) or None
 
 
 def report(host, o, out):

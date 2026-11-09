@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-11-09T17:00:00Z'
-updated_date: '2026-11-09T17:45:00Z'
+updated_date: '2026-11-09T18:10:00Z'
 labels: []
 dependencies:
   - TASK-003.01
@@ -44,4 +44,6 @@ Admitted jobs need hard RAM limits and exact per-job measurement. Running each j
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-11-09 12:45 ET: scope code written in bin/job (protocol 5, _check_scope, wrapper and shim, _scope_result, _stop_scope on kill, scope_verdict). tests/test_scope.py: 12 tests on real user scopes with a throwaway pueued (over the memory limit, clean exit with final peaks, limits in effect, systemd-run failure, protocol 5 required, bad request, GPU env by UUID, no GPU hides all, CUDA_VISIBLE_DEVICES in --env refused, kill stops a setsid child, stall found inside the scope, unscoped submit unchanged). Full local suite: 67 pass, 12 remote skipped. Full review next.
+
+2026-11-09 13:10 ET: first full review (Claude Sonnet 5.5, sonnet, high) found 8 groups of defects. Root cause of most: the shim shared the job's cgroup, so a memory kill took the bookkeeping with it. Redesign (my call): the scope is delegated (Delegate=yes, OOMPolicy=continue) and the shim splits it into shim/ and job/; job/ carries memory.max, swap 0, oom.group 1; the shim survives, reads job/ memory.events and tells own limit (oom>0) from host OOM (oom_kill>0, oom 0) from outside SIGKILL, on systemd 255 too (verified on sttp1 and this PC). Fixed: limits read back, fail closed (1); job kill SIGKILLs the scope at once and keeps a usage snapshot (2); peak renamed memory_peak_incl_cache, not used for verdicts (3); attribution per spec (4); bookkeeping outside the limit (5); leftovers stopped at end, restart clears an old scope (6); VERSION 0.6.0, spec and usage.md updated (7); gpus default [] (fail closed), GPU variables refused in gpu_env and --env, MIG names, systemctl timeouts, test hook JOB_SYSTEMD_RUN removed (fake HOME instead), skip unless memory is delegated, tests for GONE path, normal priority, protocol 5 (8). Added: the shim refuses to touch any cgroup that is not its own scope. Set aside: TasksMax (not in the spec; a fork runaway is bounded by the user slice's TasksMax, and a per-job limit could break wide worker pools). 78 local tests pass. Second and final review next.
 <!-- SECTION:NOTES:END -->

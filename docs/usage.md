@@ -136,7 +136,7 @@ only the code. The last line repeats the exit code.
 | `ALERT` | 201 | The `--check` script failed on new output; its message is printed. | **yes**, unless it had just finished |
 | `UNREACHABLE` | 202 | For 15 minutes `job` could not get the job's state: the host was unreachable over ssh, or pueue there did not answer. Shorter gaps are retried quietly. | probably |
 | `GONE` | 204 | The pueue task no longer exists, or its id now belongs to another job. | no |
-| `WRAPPER_ERROR` | 205 | `job` could not do what was asked (bad group, missing directory, bad `--check` path, pueue down at submit time, client and host versions differ); the message says what. If a `note:` line says the job was queued, it was, and keeps running; otherwise it was not queued. | see the message |
+| `WRAPPER_ERROR` | 205 | `job` could not do what was asked (bad group, missing directory, bad `--check` path, pueue down at submit time, client and host versions differ, or an admitted job's systemd scope or memory limit could not be set up, so the job never ran); the message says what. If a `note:` line says the job was queued, it was, and keeps running; otherwise it was not queued. | see the message |
 
 After `STALLED`, `ALERT` or `UNREACHABLE` the job is left alone. Look at the
 log, then wait again or stop it, with the command the output prints

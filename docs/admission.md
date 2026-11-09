@@ -1,7 +1,8 @@
 # Admission: start jobs only where they fit
 
-Status: spec for TASK-003 (written 2026-11-09 12:05 ET; revised 12:20 and 12:50 ET after two full reviews).
-Nothing here is built yet.
+Status: spec for TASK-003 (written 2026-11-09 12:05 ET; revised 12:20 and 12:50 ET after two full reviews;
+"Per-job scope" revised 13:10 ET after a code review). Built so far: the per-job scope (job 0.6.0, protocol 5,
+used only by a submit that carries a scope). The loop, the client commands and holds are not built yet.
 
 ## Why
 
@@ -146,7 +147,7 @@ room the loop releases into can't race.
 - Release, under the lock, is `pueue enqueue <id>`, only while the job's group has a free slot and is not
   paused. A paused group gets one ALERT per held job.
 - A job is in flight, and counts against room, from release while its pueue task is Queued, Running, Paused or
-  Locked, or while its scope's cgroup exists. A job paused with pueue still holds its RAM and GPU memory.
+  Locked, or while its scope's `job/` cgroup has processes. A job paused with pueue still holds its RAM and GPU memory.
 
 Jobs in other groups on non-admission hosts, and anything started outside `job`, are not admitted jobs: their
 use is outside use.
@@ -155,51 +156,63 @@ use is outside use.
 
 Three layers, all written by `job`:
 
-1. **The wrapper**, pueue's child, as today. It runs the scope and writes the exit record.
-2. **`systemd-run --user --scope --quiet --unit=agent-pueue-job-<token>`** with `-p MemoryMax=<hard limit>
-   -p MemorySwapMax=0 -p OOMPolicy=kill`, and `XDG_RUNTIME_DIR=/run/user/<uid>` set explicitly (without it
-   `systemd-run --user` fails).
-3. **The shim**, inside the scope. It writes a `started` marker; sets `oom_score_adj` from the settings, so the
-   kernel's global out-of-memory killer picks jobs before other users' processes; runs the job's command as its
-   child at `nice -n 19 ionice -c 3` (or normal with `--normal-priority`); then, after the command exits, reads
-   its own cgroup's `memory.peak`, `memory.stat`, `memory.events` and `cpu.stat` (still there, because the shim
-   is still in it) and writes them next to the exit record, and exits with the command's code.
+1. **The wrapper**, pueue's child, as today. It ends any scope an earlier run of the same job left (a restart
+   reuses the token), runs the scope, and writes the exit record.
+2. **`systemd-run --user --scope --quiet --unit=agent-pueue-job-<token>.scope -p Delegate=yes
+   -p OOMPolicy=continue`**, with `XDG_RUNTIME_DIR=/run/user/<uid>` set explicitly (without it `systemd-run
+   --user` fails). The scope is delegated, so the shim can divide it.
+3. **The shim**, inside the scope. It first checks that it is in its own scope (it never changes any other
+   cgroup), then splits the scope into two cgroups: `shim/`, where it moves itself, and `job/`, which gets
+   `memory.max` (the hard limit), `memory.swap.max` 0 and `memory.oom.group` 1. It reads these back; if any
+   step fails or a value did not take effect, the job does not run and the result is a wrapper error naming
+   the step. It runs the command in `job/` at the wrapper's priority (nice 19 and idle I/O, or normal with
+   `--normal-priority`), with `oom_score_adj` from the settings, so the kernel's global out-of-memory killer
+   picks jobs before other users' processes.
 
-What the wrapper records:
+Because the shim is outside `job/`, it outlives a memory kill of the job. When the command ends it waits
+briefly for processes still dying from a kill, stops any processes the job left behind (`cgroup.kill`), then
+writes `job/`'s final `memory.peak` (which counts page cache, so it is not a RAM size), `memory.events` and
+`cpu.stat` next to the exit record, and exits with the command's code. How the job ended, from those counters:
 
-- The `started` marker is missing: `systemd-run` failed. Recorded as a wrapper error, never as the job's exit.
-- The shim's final values are present: the job ended by itself; these are the final peaks.
-- The shim died with the command (the scope was killed for memory, which kills every process in it): the
-  wrapper reads `systemctl --user show -p Result,OOMKills,MemoryPeak` for the failed scope, records the cause,
-  then `reset-failed`. A memory kill is reported as "went over its RAM limit of N GB" only when the scope's own
-  limit was reached (`memory.events` `oom` > 0, or `Result=oom-kill`); a kill by the kernel's global killer or by
-  systemd-oomd is reported as "killed by signal 9 (out of memory on the host)".
-- The wrapper itself was killed (`job kill`, or pueued stopping): the loop records the result from the scope's
-  state at its next cycle.
+- `oom_kill` or `oom_group_kill` above 0 with `oom` above 0: it went over its RAM limit; the whole job was
+  stopped.
+- `oom_kill` above 0 with `oom` 0: the host ran out of memory and the kernel's out-of-memory killer stopped the
+  job while it was under its limit.
+- Killed by signal 9 with no out-of-memory event: killed from outside (systemd-oomd, or by hand).
+- The shim's record is missing although the job started: the whole scope was killed from outside (for example
+  by systemd-oomd); the wrapper keeps the scope's systemd `Result`.
+- The `started` marker is missing: `systemd-run` failed or the setup failed. Recorded as a wrapper error,
+  never as the job's exit.
+
+These hold on every systemd version the spec supports; none of them needs systemd's `MemoryPeak` property
+(systemd 256 and later).
 
 Limits and settings:
 
-- **RAM:** the scope's hard limit is the job's size times `ram_hard_factor` (a pilot's is its counted room). Room
-  is counted at `max(size, current use)`, so a job that runs over its size takes room from new jobs at once,
-  and only past the hard limit is it stopped. `MemorySwapMax=0` keeps an over-size job from spilling into swap.
-  `OOMPolicy=kill` stops the whole job when one process is killed for memory, instead of leaving it running
-  short of a worker.
+- **RAM:** the hard limit on `job/` is the job's size times `ram_hard_factor` (a pilot's is its counted room).
+  Room is counted at `max(size, current use)`, so a job that runs over its size takes room from new jobs at
+  once, and only past the hard limit is it stopped. `memory.swap.max` 0 keeps an over-size job from spilling
+  into swap. `memory.oom.group` 1 stops the whole job when one process is killed for memory, instead of leaving
+  it running short of a worker.
 - **CPU:** no quota; a quota throttles jobs that size their worker pools from the core count. Ranking jobs below
-  other users' processes across users needs a CPU weight on the user's own `user-<uid>.slice`, set by root; that
-  is up to the deployment. Within the user's own processes, nice ranks the jobs.
+  other users' work needs CPU weights set by root on the slices involved (the user's own `user-<uid>.slice`, and
+  any slice other users' work runs in, such as a notebook server's); that is up to the deployment. Within the
+  user's own processes, nice ranks the jobs.
 - **GPU:** `CUDA_VISIBLE_DEVICES=<GPU UUIDs>` and `CUDA_DEVICE_ORDER=PCI_BUS_ID`; the assigned UUIDs are also in
   `JOB_GPU_UUIDS` for jobs that pass them on (for example to a container). Among cards that fit, the one with the
   least room that still fits is chosen. `--gpus 2` takes two cards on one host. Code with a hard-coded device
   number other than 0 fails under this; it should use device 0..N-1. The `gpu_env` settings are added unless the
   job's `--env` sets them.
-- **Probe at loop start:** the loop runs a test scope and checks that `memory.max`, `memory.swap.max` and
-  `memory.oom.group` took effect and that `memory.peak` exists. If not, the host runs jobs without scopes: no
+- **Probe at loop start:** the loop runs a test scope with the same setup as the shim and checks that
+  `memory.max`, `memory.swap.max` and `memory.oom.group` took effect on its `job/` and that `memory.peak` exists. If not, the host runs jobs without scopes: no
   hard RAM limit, RAM measured as the sum of `RssAnon + RssShmem` over the job's processes (found by token and
   descendants, as today), and `job room` marks the host `no limits`.
 
 ### Ending, killing and clean-up
 
-- `job kill` kills the pueue task and stops the scope (`systemctl --user stop`), so detached processes end too.
+- `job kill` first records the job's use so far (its shim dies with it), then kills the pueue task and every
+  process left in the scope with SIGKILL, as `pueue kill` does, so detached processes end at once.
+- Processes a job leaves behind when its command ends are stopped by the shim at once.
 - Each cycle the loop stops any scope named `agent-pueue-job-<32 hex>` whose token is in the queue or records and
   whose task pueue reports Done, or reports absent in a status read that succeeded. A failed or timed-out pueue
   read never counts as "absent". Scopes with other names are never touched.
@@ -225,7 +238,7 @@ work in containers says `--in-containers`. It is counted at its size until its c
   two consecutive passes, on both paths.
 - Utilization for the busy rule is the average over the last minute.
 
-**Per admitted job**, from its scope's cgroup: `memory.current`, `memory.stat`, `cpu.stat`. The RAM size basis is
+**Per admitted job**, from its scope's `job/` cgroup: `memory.current`, `memory.stat`, `cpu.stat`. The RAM size basis is
 `memory.current − active_file − inactive_file` (anonymous, shared and kernel memory; `/dev/shm` included, file
 cache excluded). Per-process GPU values map to a job through `/proc/<pid>/cgroup`. Bytes read and written come
 from `io.stat` where the io controller is delegated, otherwise from `/proc/<pid>/io` summed over the scope's
