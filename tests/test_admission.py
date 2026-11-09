@@ -1689,7 +1689,7 @@ class LoopTests(Base):
         loop = self.loop()
         q = {"token": "c" * 32, "released": 0, "started": 1000.0, "size": {"cpus": 4, "ram": 8 * GB},
              "constraints": {"in_containers": True}, "ram_counted": 8 * GB, "gpu_counted": {"g": GB}}
-        self.assertEqual(loop._counted(q, 1000.0 + 599)["ram_counted"], 8 * GB)
+        self.assertEqual(loop._counted(q, 1000.0 + 599)["ram_counted"], self.j.ram_limit(self.settings, 8 * GB))  # its limit
         c = loop._counted(q, 1000.0 + 600)
         self.assertEqual((c["ram_counted"], c["size"]["cpus"], c["gpu_counted"]), (0, 0.0, {}))
 
