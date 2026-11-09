@@ -1,11 +1,11 @@
 ---
 id: TASK-003.03
 title: 'Admission loop on each host: measure, count room, release held jobs, record'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-11-09T17:00:00Z'
-updated_date: '2026-11-09T20:34:00Z'
+updated_date: '2026-11-09T21:10:00Z'
 labels: []
 dependencies:
   - TASK-003.01
@@ -23,11 +23,11 @@ One loop per host is the only thing that starts admitted jobs, so two jobs canno
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The loop releases a held job only when its size fits the room rules from the settings file
-- [ ] #2 Use by processes that job did not start counts against room
-- [ ] #3 A job is counted from release until its scope is gone
-- [ ] #4 Every admitted job gets a record with its measured peaks
-- [ ] #5 Tests cover fit, no fit, outside use, and a finished job freeing its room
+- [x] #1 The loop releases a held job only when its size fits the room rules from the settings file
+- [x] #2 Use by processes that job did not start counts against room
+- [x] #3 A job is counted from release until its scope is gone
+- [x] #4 Every admitted job gets a record with its measured peaks
+- [x] #5 Tests cover fit, no fit, outside use, and a finished job freeing its room
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -42,4 +42,12 @@ One loop per host is the only thing that starts admitted jobs, so two jobs canno
 2026-11-09 14:45 ET: full review cycle 2 (Claude Sonnet 5.5, sonnet at high) of the whole admission change found 10 defects plus smaller items and doc mismatches. Fixed in the commit after ef75237: F1 GPU use on a card a job was not given, F2 hold and job given the same room (holds re-read and snapshot written under the queue lock), F3 queue file vs pueue disagreement, F4 retry after late pueue add, F5 no reply treated as a refusal in auto, F6 impossible GPU share and zero sizes, F7 NaN settings, F8 heartbeat renewed without pueue, F9 clean-up scope, plus unit/cgroup holds ending, NVML retry, probe robustness, alert file clean-up, pilot stop note, docs. Set aside: F10 STATE_DIR follows XDG_STATE_HOME (checked unset in ssh, user manager, pueued and profiles on sttp1 and sttp2; documented); per-cycle systemctl calls for unit holds and per-second pueue status during pilots. Two review cycles done for this piece; no more.
 
 2026-11-09 15:36 ET: live on sttp1 since 14:51 ET. Checked there: the smoke job was held through the 10-minute warm-up and released at 15:01:56 ET into its own scope, no GPU, RAM limit 6.0 GB (4 GB x 1.5), nice 19; room matched the host (RAM 102.2 GB = the 10-minute minimum of MemAvailable 118.2 GB less 16 GB; each card's outside use = the driver's reserved memory, 406 and 444 MiB; CPU 3.7 against a 3.5-thread average); a GPU pilot got the 2080 Ti by UUID and its record kept 1.0 GB peak over 36 samples; a pilot's RAM limit was 102.16 GB, all the free room. Defect found there: records kept a pilot's placeholder size, so job history showed 4.0 GB for a pilot limited to 102 GB; fixed in 0.6.1 (2babe25), reviewed by Claude Sonnet 5.5 (sonnet) at high, repairs in 9428150 (records-file upgrade under a write lock, a job held again loses its release in its record, counted values filled in each cycle, pilot size text for every case). Also fixed: the loop did not prime its disk reading at start, so the first cycle after a restart had no disk readings. Second review of the repairs running.
+
+2026-11-09 16:10 ET: second review (Claude Sonnet 5.5, sonnet at high) of the record fixes: repaired in 524a0c1 (history says never released / not released by the loop; the first cycle waits one full interval after the start readings; a re-held job's record is committed before its queue file; malformed history rows read as missing; the records-file opener closes its connection on any error; the upgrade test waits for both openers). Set aside: per-job CPU and disk readings are not primed at a restart, so outside CPU is overcounted for one cycle (errs safe); the record writer's upsert needs SQLite 3.24+ (predates this; every supported Ubuntu has it). Released as 0.6.2 (tag v0.6.2): this PC, sttp1 (loop restarted on it 16:09 ET; a GPU pilot at 16:10 ET recorded 'pilot: 1 CPU, 101.6 GB, 1 GPU with 9.8 GB, the free room at its release'), sttp2 (not an admission host; job ls answers). Suite: 3 of 3 clean at normal priority (180 tests, 12 remote skipped). One failure seen once at 15:19 ET in an unnamed test (not reproduced in 3 direct and 3 normal-priority runs since); cause unknown; running the suite with -v until it recurs would name it. Evidence per criterion: 1 live (the smoke job and pilots were released only after warm-up and when they fit) and tests; 2 live (RAM room from MemAvailable; GPU outside use = the driver's reserved memory) and tests; 3 and 5 tests; 4 live (sttp1#573: 1.0 GB peak over 36 samples) and tests.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+The admission loop (job _admit, agent-pueue-admit.service): measures each host, counts room from measurement (including use job did not start), releases held jobs first come when they fit, runs each in its own scope with a hard RAM limit, enforces pilot time limits and --stop-at, keeps GPU holds, relays alerts, and writes a record of every admitted job with its size, what it was counted at, its RAM limit and measured peaks. Released in job 0.6.0 to 0.6.2 after four full reviews (two on the loop, two on the record fixes) by Claude Sonnet 5.5 (sonnet) at high. Live on sttp1 since 2026-11-09 14:51 ET. Open elsewhere: rented hosts (TASK-003 hosts.d), service holds with RAM (agent-callers TASK-012), GPU memory caps (TASK-003.05).
+<!-- SECTION:FINAL_SUMMARY:END -->
