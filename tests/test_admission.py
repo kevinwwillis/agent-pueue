@@ -1401,7 +1401,7 @@ class LoopTests(Base):
         self.assertEqual(self.record(tok)["how"], "stop-at")
         big = self.submit_sized("true", cpus=1, ram=500 * GB, stop_at=time.time() - 1)
         self.assertFalse(big["ok"])  # cannot run even when empty: refused at once, not held
-        held = self.submit_sized("true", cpus=1, ram=48 * GB, stop_at=time.time() + 1)
+        held = self.submit_sized("true", cpus=1, ram=40 * GB, stop_at=time.time() + 1)  # a 60 GB limit: fits when empty
         self.host.set(avail=10 * GB)
         time.sleep(1.2)
         self.assertTrue(self.cycles(loop, lambda: (self.record(held["data"]["token"]) or {}).get("how")
