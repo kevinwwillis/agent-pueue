@@ -137,6 +137,7 @@ only the code. The last line repeats the exit code.
 | `UNREACHABLE` | 202 | For 15 minutes `job` could not get the job's state: the host was unreachable over ssh, or pueue there did not answer. Shorter gaps are retried quietly. | probably |
 | `GONE` | 204 | The pueue task no longer exists, or its id now belongs to another job. | no |
 | `WRAPPER_ERROR` | 205 | `job` could not do what was asked (bad group, missing directory, bad `--check` path, pueue down at submit time, client and host versions differ, or an admitted job's systemd scope or memory limit could not be set up, so the job never ran); the message says what. If a `note:` line says the job was queued, it was, and keeps running; otherwise it was not queued. | see the message |
+| `NO_ROOM` | 206 | `job hold` only: the host has no room for the hold now. Any other failure of `job hold` (not an admission host, its loop stopped or still measuring, unreachable) exits as above, so a service refuses its load on 206 and otherwise falls back to its own check. | the service decides |
 
 After `STALLED`, `ALERT` or `UNREACHABLE` the job is left alone. Look at the
 log, then wait again or stop it, with the command the output prints
@@ -262,8 +263,8 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   the first host that takes it. A host that refuses the job (too small, no record for `--like`, a missing
   `--needs-path`) is skipped; an unreachable host stops the placement, since the job may have been queued
   there. `--host NAME` (repeatable) limits the choice.
-- A held job's wait prints why every 10 minutes (`held: needs 18.0 GB RAM, 9.4 GB free`); being held is not a
-  verdict. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
+- A held job's wait prints why every 10 minutes (`held: needs 22.5 GB RAM (its limit, 1.5 times its size), 9.4 GB
+  free`); being held is not a verdict. A job needs room for its hard RAM limit, not just its size. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
 - The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
   for a pilot its free RAM at release), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
   `note: it went over its RAM limit of N GB; the whole job was stopped`. Processes it leaves running when its
@@ -288,11 +289,12 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   gone); submit it again instead.
 - A submit without a size, or from an older `job` (protocol 3 or 4), is refused with a message that starts
   `protocol mismatch` or names the size options.
-- A service that uses a GPU outside `job` (a model server) registers its GPU memory before it loads:
-  `job hold HOST --gpu 0 --mem 18G --name NAME` plus `--while-pid PID`, `--unit NAME` or `--cgroup PATH` for
-  its processes, and optionally `--ttl MIN` (renew with `job hold HOST --renew ID`). It prints the hold id;
-  `job release HOST ID` ends it. A hold is granted only if the card has the room now, else refused at once.
-  Holds and jobs are first come.
+- A service that uses a GPU or much RAM outside `job` (a model server) registers it before it loads:
+  `job hold HOST --gpu 0 --mem 18G --name NAME`, `--ram 72G`, or both, plus `--while-pid PID`, `--unit NAME`
+  or `--cgroup PATH` for its processes, and optionally `--ttl MIN` (renew with `job hold HOST --renew ID`). It
+  prints the hold id; `job release HOST ID` ends it. A hold is granted only if the host has the room now, else
+  refused at once with exit 206 (`NO_ROOM`). A GPU hold alone on its card may use the card's headroom. Holds and
+  jobs are first come.
 - `job history [HOST ...] [--task T]` lists the records on admission hosts, newest first: size (for a pilot,
   the free room it was counted at), measured peaks, how each job ended, and its token for `--like`.
 - `job admission HOST start|stop|status` installs and starts, stops, or shows the host's admission loop

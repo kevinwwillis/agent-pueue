@@ -49,9 +49,9 @@ job release host2 <hold-id>
     holds the record: `HOST#ID` is sent only to HOST, and `auto` with a token tries the hosts in turn, the
     others refusing for want of the record. Sampled peaks are a lower bound even for a clean run; the margins
     and `ram_hard_factor` cover the gap between samples.
-  - **Explicit sizes:** `--ram SIZE` (required: it is the job's RAM limit), with `--cpus N` (default: the small
-    size's CPUs), `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or `--small`, the settings file's
-    small size.
+  - **Explicit sizes:** `--ram SIZE` (required; the job's hard RAM limit is `ram_hard_factor` times it), with
+    `--cpus N` (default: the small size's CPUs), `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or
+    `--small`, the settings file's small size.
   - A submit with none of these is refused, with a message naming the options.
 - Constraints: `--host NAME` (repeatable), `--gpu-model TEXT` (a substring of the GPU name), `--needs-path PATH`
   (repeatable; a host without the path refuses the job, so `auto` tries the next), `--data PATH` (prefer the
@@ -69,8 +69,8 @@ job release host2 <hold-id>
   - While a job is held, its wait prints a line saying why (for example `held: needs 18.0 GB on GPU 0, 9.4 GB
     free`) every 10 minutes, and `job ls` shows `Held` with the reason. Being held is not a verdict and does not
     end a multi-job wait.
-  - A submit that cannot fit on any host even when that host is empty (its capacity minus headroom) is refused
-    at once with `WRAPPER_ERROR` and the reason.
+  - A submit that cannot fit on any host even when that host is empty (its capacity minus headroom; for RAM, the
+    job's hard limit must fit) is refused at once with `WRAPPER_ERROR` and the reason.
   - When a job's command ends, any processes it left running (for example a `nohup ... &`) are stopped within one
     cycle. A job that needs a service to outlive it starts the service some other way.
 
@@ -149,7 +149,8 @@ which the heartbeat makes visible.
 It writes a heartbeat (`state_dir/heartbeat`) every cycle. A heartbeat older than
 `max(3 × sample_interval_s, 120 s)` (longer than one slow pueue call) means the host is not admitting: `room`
 says so, `auto` skips it, and held jobs' waits get ALERT. When `bin/job` changes on disk (after an install), the
-loop re-executes itself with the new code.
+loop re-executes itself with the new code, and when its settings file changes, with the new settings, since
+submits read them at once (a settings file that is not valid is logged and the loop keeps its own).
 
 Each cycle it measures, counts room, releases held jobs that fit, and writes samples, records and alerts. An
 error in one cycle is written to the journal and the loop goes on; the heartbeat is renewed only by a cycle that
@@ -239,8 +240,8 @@ scope, as it ends pueued.
 Limits and settings:
 
 - **RAM:** the hard limit on `job/` is the job's size times `ram_hard_factor` (a pilot's is its counted room).
-  Room is counted at `max(size, current use)`, so a job that runs over its size takes room from new jobs at
-  once, and only past the hard limit is it stopped. `memory.swap.max` 0 keeps an over-size job from spilling
+  Room is counted at `max(hard limit, current use)`, so a job can grow up to its limit without taking room
+  other jobs were counted into, and only past the hard limit is it stopped. `memory.swap.max` 0 keeps an over-size job from spilling
   into swap. `memory.oom.group` 1 stops the whole job when one process is killed for memory, instead of leaving
   it running short of a worker.
 - **CPU:** no quota; a quota throttles jobs that size their worker pools from the core count. Ranking jobs below
@@ -276,9 +277,10 @@ Limits and settings:
 
 Processes started by a container engine run in the engine's cgroups, outside the job's scope: the scope's
 limits, nice and per-job measurement don't reach them, and their use shows as outside use. A job that runs its
-work in containers says `--in-containers`. It is counted at its size until its containers' use has had
+work in containers says `--in-containers`. It is counted at its hard limit until its containers' use has had
 `outside_window_s` to appear as outside use, then at zero, so its use is counted twice only for that window
-(the safe direction). Deployments that want limits on container work set them in the container engine.
+(the safe direction). Its containers are not bounded by that limit, so room is kept for them only as their
+measured use grows. Deployments that want limits on container work set them in the container engine.
 
 ### Measurement
 
@@ -305,7 +307,8 @@ busy time from `/proc/diskstats` deltas for the devices in `disks`.
 ### Room
 
 For each resource, outside use is measured (what admitted jobs don't account for), and admitted jobs count at
-the larger of their size and their current use. A job that ends frees its room at once.
+the larger of their size (for RAM, their hard limit) and their current use. A job that ends frees its room at
+once.
 
 - **GPU memory, per card:** `total − gpu_headroom − outside − Σ over admitted jobs of max(size on the card,
   current use on the card) − Σ over holds on the card of max(size, own use)`, where `outside` is the highest
@@ -315,9 +318,19 @@ the larger of their size and their current use. A job that ends frees its room a
   processes it names (`--while-pid` and its descendants, or the cgroup of `--unit`/`--cgroup`); a hold that
   names none is counted at its size and its real use again as outside use (safe, but it wastes room), so
   services should name their processes.
-- **RAM, per host:** the lowest over `outside_window_s` of `MemAvailable + Σ admitted jobs' current use` (what
-  would be free with no admitted jobs), minus `ram_headroom`, minus `Σ over admitted jobs of max(size, current
-  use)`. Nothing is released while memory pressure is over `memory_pressure_max_pct`.
+- **RAM, per host:** the lowest over `outside_window_s` of `MemAvailable + Σ admitted jobs' current use + Σ RAM
+  holds' own use` (what would be free with no admitted jobs and no RAM holds), minus `ram_headroom`, minus `Σ
+  over admitted jobs of max(hard limit, current use)`, minus `Σ over RAM holds of max(size, own use)`. A job is
+  counted at its hard limit (`ram_hard_factor` times its size, a pilot's counted room), not its size, and fits
+  only if its limit fits, so jobs that grow up to their limits together still leave `ram_headroom` free. A RAM
+  hold's own use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or the sum of
+  `Pss_Anon + Pss_Shmem` of `--while-pid` and its descendants. Where a process's `smaps_rollup` can't be read
+  (another user's process, a kernel without `Pss_Anon`), it is a lower bound instead: the larger of that sum and
+  the biggest single process's `RssAnon + RssShmem`, since own use counted too high would give its room out
+  twice. A process or cgroup is the own use of one hold only, the oldest that names it, so two holds on the same
+  or nested processes (a service that registers again before its old hold ends) don't add it back twice. A RAM
+  hold that names no processes is counted at its size and its real use again as outside use. Nothing is released
+  while memory pressure is over `memory_pressure_max_pct`.
 - **CPU, per host** (CPU can be shared by time, so older jobs count at their measured use): `outside` is the
   average over `cpu_window_s` of busy threads minus the admitted jobs' measured threads. A job fits when
   `outside + Σ over jobs older than cpu_window_s of their average use over it + Σ over younger jobs of max(size,
@@ -374,16 +387,28 @@ reaches its hard limit before its `total`.
 
 ### Holds
 
-A service that uses a GPU outside `job` (a model server, for example) registers a hold before it loads:
-`job hold <host> --gpu <index|uuid> --mem SIZE --name NAME`, naming its processes with `--while-pid PID` (the
+A service that uses a GPU or much RAM outside `job` (a model server, for example) registers a hold before it
+loads: `job hold <host> --gpu <index|uuid> --mem SIZE --name NAME` for GPU memory, `--ram SIZE` for RAM, or
+both in one hold, naming its processes with `--while-pid PID` (the
 hold ends when that process exits), `--unit NAME` or `--cgroup PATH` (a service or container), and optionally
 `--ttl MIN` (it ends unless renewed with `job hold --renew <id>`). A hold on a unit or cgroup also ends once that
 unit or cgroup, seen before, is gone. Under the queue lock, a hold is granted only if the card has the room:
 the loop writes its snapshot under the same lock after each cycle's releases, and the grant takes from that
 room the holds granted since. In each cycle the loop reads the holds again under the lock before it releases,
-and takes out of its room any hold granted since it measured. A refused hold is refused at once, and the
-service decides what to do. A caller that wants room kept for a later step registers a hold the same way.
-Holds and jobs are first come: neither displaces the other.
+and takes out of its room any hold granted since it measured. A hold the host has no room for is refused at
+once with its own exit status (206, `NO_ROOM`), apart from admission being unavailable, and the service decides
+what to do. A caller that wants room kept for a later step registers a hold the same way.
+Holds and jobs are first come: neither displaces the other. `gpu_headroom` keeps the parties on one card
+apart, so a GPU hold on a card that has no admitted job and no other hold may use it (a model that fills the
+card): no admitted job, no other hold and no other process on the card. A process the driver lists without
+its memory counts as another process, and so does every card when the process list can't be read. Jobs
+admitted after it still keep it. RAM holds always keep `ram_headroom` free, and are granted only by a loop
+running the same `job` as the request (its heartbeat's version): just after an install, until the loop has
+restarted into the new file and finished a cycle (up to two sample intervals), a RAM hold is refused as admission
+unavailable (exit 205). A hold's own GPU use is its processes' use on its own card; their use
+on any other card counts as outside use. A service registers its hold before it loads (one registered while
+loaded is counted twice until the window passes, which only wastes room), and its cgroup must not contain
+`job`'s own scopes, whose RAM would then count twice.
 
 ## Placement (client side)
 

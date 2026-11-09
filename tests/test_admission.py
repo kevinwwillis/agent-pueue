@@ -20,7 +20,7 @@ import unittest
 from test_job import JOB, Base
 from test_scope import SCOPES
 
-GB, MiB = 10 ** 9, 1 << 20
+GB, MiB, GiB = 10 ** 9, 1 << 20, 1 << 30
 CARD = "GPU-aaaaaaaa-0000-0000-0000-000000000001"
 CARD2 = "GPU-aaaaaaaa-0000-0000-0000-000000000002"
 
@@ -75,11 +75,14 @@ class RoomRules(unittest.TestCase):
         return self.j.compute_room(self.s, samples, list(inflight), [], now or samples[-1]["t"])
 
     def test_ram_fit_and_no_fit(self):
-        r = self.room([sample(100, avail=11 * GB)])
-        self.assertTrue(self.j.fits(self.s, r, held(ram=9 * GB))[0])
-        ok, why = self.j.fits(self.s, r, held(ram=11 * GB))
+        r = self.room([sample(100, avail=11 * GB)])  # 10 GB of room; a job counts at its limit, 1.5 times its size
+        ok, got = self.j.fits(self.s, r, held(ram=6 * GB))
+        self.assertTrue(ok)
+        self.assertEqual(got["ram_counted"], self.j.ram_limit(self.s, 6 * GB))
+        self.assertAlmostEqual(got["ram_counted"], 9 * GB, delta=4096)
+        ok, why = self.j.fits(self.s, r, held(ram=7 * GB))
         self.assertFalse(ok)
-        self.assertIn("needs 11.0 GB RAM, 10.0 GB free", why)
+        self.assertIn("needs 10.5 GB RAM (its limit, 1.5 times its size), 10.0 GB free", why)
 
     def test_outside_ram_counts_at_its_highest_in_the_window(self):
         # someone else's process took 20 GB 30 s ago and let it go: the room stays down for the window
@@ -178,6 +181,26 @@ class RoomRules(unittest.TestCase):
         self.assertIn("at most 31.0 GB", self.j.fits_empty(self.s, cap, held(ram=40 * GB)))
         self.assertIn("1 GPU(s) with 9.0 GB", self.j.fits_empty(self.s, cap, held(gpus=1, gpu_mem=9 * GB)))
         self.assertIsNone(self.j.fits_empty(self.s, cap, held(gpus=1, gpu_mem=7 * GB)))
+        # a job is counted at its limit: a size that fits with a limit that does not could never be released
+        self.assertIn("needs 37.5 GB RAM (its limit, 1.5 times its size); this host has at most 31.0 GB",
+                      self.j.fits_empty(self.s, cap, held(ram=25 * GB)))
+        self.assertIsNone(self.j.fits_empty(self.s, cap, held(ram=20 * GB)))
+        self.assertIsNone(self.j.fits_empty(self.s, cap, held(ram=25 * GB, pilot=True)))  # counted at the room
+
+    def test_like_cuts_its_margin_so_the_limit_fits_the_host(self):
+        class Adm:
+            def db(self):
+                return sqlite3.connect(":memory:")
+
+            def find(self, con, ref):
+                return {"token": "t" * 32, "how": "exit", "exit": 0, "peak_samples": 100, "peak_ram": 25 * GB,
+                        "peak_gpu_mem": 0, "peak_cpu": 1.0, "gpus": "[]", "peak_disk_mb_s": 0.0}
+        cap = {"mem_total": 32 * GB, "threads": 8, "gpus": []}
+        size = self.j._size_from(self.s, Adm(), cap, {"admission": {"like": "t" * 32}})[0]
+        limit = self.j.ram_limit(self.s, size["ram"])
+        self.assertLessEqual(limit, 31 * GB)
+        self.assertGreaterEqual(limit, 25 * GB)  # it still covers the peak
+        self.assertIsNone(self.j.fits_empty(self.s, cap, held(ram=size["ram"])))
 
 
 class RoomRulesCycle2(unittest.TestCase):
@@ -263,7 +286,8 @@ class Settings(unittest.TestCase):
 
     def test_invalid_files_are_refused(self):
         for text, part in (("{", "cannot be read"), ('{"ram_headrom_gb": 1}', "unknown setting ram_headrom_gb"),
-                           ('{"ram_hard_factor": 0.5}', "ram_hard_factor"), ('{"disks": ["data"]}', "absolute"),
+                           ('{"ram_hard_factor": 0.5}', "ram_hard_factor"), ('{"ram_hard_factor": 1e300}', "ram_hard_factor"),
+                           ('{"disks": ["data"]}', "absolute"),
                            ('{"gpu_env": {"CUDA_VISIBLE_DEVICES": "0"}}', "gpu_env"),
                            ('{"small": {"gpus": 1}}', "small")):
             with self.assertRaises(self.j.JobError) as e:
@@ -422,6 +446,23 @@ class ClientTests(unittest.TestCase):
             import shutil
             shutil.rmtree(root)
 
+    def test_a_ram_hold_on_a_host_that_predates_it_is_released_and_refused(self):
+        import argparse
+        calls = []
+
+        def old_host(host, op, req, timeout=120):
+            calls.append(req)
+            if req.get("release"):
+                return {"id": req["release"], "action": "released"}
+            return {"id": "abc123", "action": "granted", "gpu": 0, "uuid": CARD}  # no "ram": it was ignored
+        self.j.call = old_host
+        a = argparse.Namespace(host="h1", renew=None, name="svc", gpu="0", mem=GB, ram=GB, while_pid=None, unit=None,
+                               cgroup=None, ttl=None)
+        with self.assertRaises(self.j.JobError) as e:
+            self.j.cmd_hold(a)
+        self.assertIn("predates RAM holds", str(e.exception))
+        self.assertEqual(calls[-1], {"release": "abc123"})
+
     def test_history_size_text(self):
         hs = self.j._history_size
         pilot = {"cpus": 1, "ram": 4 * GB, "gpus": 2, "gpu_mem": 0}
@@ -445,6 +486,122 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(hs({"pilot": 0, "size": ["not", "a", "size"]}), "0 CPU, 0.0 GB")
 
 
+class HoldMeasure(unittest.TestCase):
+    """A hold's own use and the GPU process list, from a fake /proc, cgroup tree and driver output."""
+
+    def setUp(self):
+        self.j = load()
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.proc, self.cg = os.path.join(self.root, "proc"), os.path.join(self.root, "cgroup")
+        os.makedirs(self.proc)
+        os.makedirs(self.cg)
+        self.m = self.j.Measure(proc=self.proc, cgroup_root=self.cg, gpu_file=os.path.join(self.root, "none.json"))
+
+    def process(self, pid, cgroup, pss=None, rss=None):
+        d = os.path.join(self.proc, str(pid))
+        os.makedirs(d)
+        with open(os.path.join(d, "cgroup"), "w") as f:
+            f.write("0::%s\n" % cgroup)
+        if pss is not None:
+            with open(os.path.join(d, "smaps_rollup"), "w") as f:
+                f.write("Rss: %d kB\nPss_Anon: %d kB\nPss_File: 99 kB\nPss_Shmem: 0 kB\n" % (pss // 512, pss // 1024))
+        if rss is not None:
+            with open(os.path.join(d, "status"), "w") as f:
+                f.write("Name:\tsvc\nRssAnon:\t%d kB\nRssFile:\t99 kB\nRssShmem:\t0 kB\n" % (rss // 1024))
+
+    def cgroup(self, path, use):
+        d = os.path.join(self.cg, path.lstrip("/"))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "memory.current"), "w") as f:
+            f.write("%d\n" % use)
+        with open(os.path.join(d, "memory.stat"), "w") as f:
+            f.write("anon %d\nactive_file 0\ninactive_file 0\n" % use)
+
+    def own(self, holds):
+        loop = self.j.Loop.__new__(self.j.Loop)
+        loop.m = self.m
+        return loop.hold_ram(holds, {h["id"]: [h["cgroup"]] for h in holds if h.get("cgroup")},
+                             {h["id"]: set(h["pids"]) for h in holds if h.get("pids")})
+
+    def test_pss_is_summed_when_every_process_can_be_read(self):
+        self.process(11, "/a", pss=2 * GiB, rss=5 * GiB)
+        self.process(12, "/a", pss=1 * GiB, rss=5 * GiB)
+        self.assertEqual(self.m.pids_ram([11, 12]), 3 * GiB)
+
+    def test_a_process_that_cannot_be_read_gives_a_lower_bound(self):
+        self.process(11, "/a", pss=1 * GiB, rss=4 * GiB)
+        self.process(12, "/a", rss=3 * GiB)  # another user's process: no smaps_rollup
+        self.assertEqual(self.m.pids_ram([11, 12]), 4 * GiB)  # the biggest single process, not 4 + 3
+        self.process(13, "/a", pss=6 * GiB, rss=6 * GiB)
+        self.assertEqual(self.m.pids_ram([11, 12, 13]), 7 * GiB)  # the readable ones' sum, 1 + 6, is larger
+
+    def test_two_holds_on_one_cgroup_count_it_once(self):
+        self.cgroup("/system.slice/model.service", 30 * GiB)
+        own = self.own([{"id": "a", "start": 1, "ram": 1, "cgroup": "/system.slice/model.service"},
+                        {"id": "b", "start": 2, "ram": 1, "cgroup": "/system.slice/model.service"}])
+        self.assertEqual(own, {"a": 30 * GiB, "b": 0})
+
+    def test_nested_cgroups_count_once_in_either_order(self):
+        self.cgroup("/s/model.service", 30 * GiB)
+        self.cgroup("/s/model.service/worker", 10 * GiB)
+        outer = {"id": "o", "ram": 1, "cgroup": "/s/model.service"}
+        inner = {"id": "i", "ram": 1, "cgroup": "/s/model.service/worker"}
+        self.assertEqual(self.own([dict(outer, start=1), dict(inner, start=2)]), {"o": 30 * GiB, "i": 0})
+        self.assertEqual(self.own([dict(outer, start=2), dict(inner, start=1)]), {"o": 20 * GiB, "i": 10 * GiB})
+
+    def test_a_process_hold_and_a_cgroup_hold_on_it_count_it_once(self):
+        self.cgroup("/s/model.service", 30 * GiB)
+        self.process(11, "/s/model.service", pss=8 * GiB)
+        cg = {"id": "c", "ram": 1, "cgroup": "/s/model.service"}
+        pid = {"id": "p", "ram": 1, "pids": [11]}
+        self.assertEqual(self.own([dict(cg, start=1), dict(pid, start=2)]), {"c": 30 * GiB, "p": 0})
+        self.assertEqual(self.own([dict(cg, start=2), dict(pid, start=1)]), {"c": 22 * GiB, "p": 8 * GiB})
+        self.assertEqual(self.own([dict(pid, start=1), dict(pid, id="q", start=2)]), {"p": 8 * GiB, "q": 0})
+
+    def test_a_gpu_process_without_its_memory_is_still_on_the_card(self):
+        class Done:
+            def __init__(self, rc, out):
+                self.returncode, self.stdout = rc, out
+        apps = {"rc": 0}
+
+        def run(args, **kw):
+            if args[1].startswith("--query-gpu"):
+                return Done(0, "0, %s, RTX 2070, 8192, 4096, 10\n" % CARD)
+            return Done(apps["rc"], "%s, 11, [N/A]\n%s, 12, 300\n" % (CARD, CARD) if apps["rc"] == 0 else "")
+        real = self.j.subprocess.run
+        self.j.subprocess.run = run
+        try:
+            c = self.j._nvidia_smi_cards()[0]
+            self.assertEqual(c["procs"], {11: 0, 12: 300 << 20})
+            self.assertTrue(c.get("procs_ok", True))
+            apps["rc"] = 9  # the process query failed
+            c = self.j._nvidia_smi_cards()[0]
+            self.assertEqual((c["procs"], c["procs_ok"]), ({}, False))
+        finally:
+            self.j.subprocess.run = real
+
+    def test_a_unit_lookup_that_times_out_is_unknown_not_gone(self):
+        def run(args, **kw):
+            raise subprocess.TimeoutExpired(args, 5)
+        real = self.j.subprocess.run
+        self.j.subprocess.run = run
+        try:
+            self.assertIsNone(self.j._hold_cgroups({"unit": "model.service"}))
+        finally:
+            self.j.subprocess.run = real
+
+    def test_nvml_keeps_a_process_whose_memory_is_not_available(self):
+        n = self.j._Nvml.__new__(self.j._Nvml)
+
+        def fn(h, count, arr):
+            arr[0].pid, arr[0].usedGpuMemory = 11, 5 << 20
+            arr[1].pid, arr[1].usedGpuMemory = 12, (1 << 64) - 1  # NVML_VALUE_NOT_AVAILABLE
+            count._obj.value = 2
+            return 0
+        self.assertEqual(n._procs(fn, None), {11: 5 << 20, 12: 0})
+
+
 class RecordsFile(unittest.TestCase):
     """The records database, opened by the loop and by host operations at the same time."""
 
@@ -464,6 +621,7 @@ class RecordsFile(unittest.TestCase):
             try:
                 c = sqlite3.connect(os.path.join(d, "admission.sqlite"))
                 c.execute("CREATE TABLE jobs (%s, PRIMARY KEY (token))" % ", ".join(old))
+                c.execute("CREATE TABLE holds (id PRIMARY KEY, name, card, size, start, ended, how)")  # before ram
                 c.commit()
                 c.close()
                 ps = [subprocess.Popen([sys.executable, "-c", opener, JOB, d], stderr=subprocess.PIPE, text=True)
@@ -480,6 +638,10 @@ class RecordsFile(unittest.TestCase):
                 have = {r[1] for r in c.execute("PRAGMA table_info(jobs)")}
                 c.close()
                 self.assertEqual(have, set(j.RECORD_FIELDS))
+                c = sqlite3.connect(os.path.join(d, "admission.sqlite"))
+                have = {r[1] for r in c.execute("PRAGMA table_info(holds)")}
+                c.close()
+                self.assertEqual(have, set(j.HOLD_FIELDS))
             finally:
                 shutil.rmtree(d)
 
@@ -621,7 +783,7 @@ class LoopTests(Base):
         self.assertEqual(self.status(tid), "Stashed")
         with open(os.path.join(self.settings["state_dir"], "room.json")) as f:
             snap = json.load(f)
-        self.assertIn("needs 4.0 GB RAM, 2.0 GB free", snap["held"][0]["reason"])
+        self.assertIn("needs 6.0 GB RAM (its limit, 1.5 times its size), 2.0 GB free", snap["held"][0]["reason"])
         self.host.set(avail=8 * GB)
         loop.samples = []  # the old low readings leave the window
         self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
@@ -719,12 +881,12 @@ class LoopTests(Base):
         now = [time.time()]
         self.host.set(avail=12 * GB)
         loop = self.loop(clock=lambda: now[0])
-        first = self.submit_sized("sleep 60", cpus=1, ram=6 * GB)  # runs, and is counted at 6 GB
+        first = self.submit_sized("sleep 60", cpus=1, ram=4 * GB)  # runs, and is counted at its 6 GB limit
         self.assertTrue(self.cycles(loop, lambda: self.status(first["data"]["id"]) == "Running"))
-        big = self.submit_sized("echo big", cpus=1, ram=8 * GB)    # 5 GB free: short, but fits once first ends
+        big = self.submit_sized("echo big", cpus=1, ram=4 * GB)    # 5 GB free: short, but fits once first ends
         self.assertTrue(big["ok"], big)
         now[0] += 120  # past the one-minute fairness wait
-        small = self.submit_sized("echo small", cpus=1, ram=2 * GB)  # fits, but takes RAM the big one needs
+        small = self.submit_sized("echo small", cpus=1, ram=2 * GB)  # fits (3 GB), but takes RAM the big one needs
         for _ in range(3):
             self.host.tick()
             loop.cycle()
@@ -745,6 +907,14 @@ class LoopTests(Base):
         small = self.submit_sized("echo small", cpus=1, ram=2 * GB)
         self.assertTrue(self.cycles(loop, lambda: self.status(small["data"]["id"]) == "Done"))
         self.assertEqual(self.status(big["data"]["id"]), "Stashed")
+
+    def test_a_job_whose_limit_could_never_fit_is_refused_at_submit(self):
+        r = self.submit_sized("true", cpus=1, ram=50 * GB)  # 64 GB host, 1 GB headroom: its 75 GB limit never fits
+        self.assertFalse(r["ok"], r)
+        self.assertIn("needs 75.0 GB RAM (its limit, 1.5 times its size)", r["error"])
+        r = self.submit_sized("true", cpus=1, ram=40 * GB)  # a 60 GB limit fits an empty host
+        self.assertTrue(r["ok"], r)
+        self.d.pueue("remove", str(r["data"]["id"]))
 
     def test_a_removed_held_job_is_recorded_and_forgotten(self):
         now = [time.time()]
@@ -779,10 +949,10 @@ class LoopTests(Base):
         loop.cycle()
         room = self.job("room", "local", **self.env())
         self.assertIn("held", room.stdout)
-        self.assertIn("needs 4.0 GB RAM, 2.0 GB free", room.stdout)
+        self.assertIn("needs 6.0 GB RAM (its limit, 1.5 times its size), 2.0 GB free", room.stdout)
         ls = self.job("ls", "local", **self.env())
         row = [x for x in ls.stdout.splitlines() if x.split()[1:2] == [str(tid)]]
-        self.assertTrue(row and "Held" in row[0] and "needs 4.0 GB RAM" in row[0], ls.stdout)
+        self.assertTrue(row and "Held" in row[0] and "needs 6.0 GB RAM" in row[0], ls.stdout)
         w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(tid), "--poll", "0.3"], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=self.d.env(**self.env()))
         time.sleep(1.5)
@@ -791,7 +961,7 @@ class LoopTests(Base):
         self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
         out, err = w.communicate(timeout=60)
         self.assertEqual(w.returncode, 0, out + err)
-        self.assertIn("held: needs 4.0 GB RAM", err)
+        self.assertIn("held: needs 6.0 GB RAM", err)
         self.assertIn("cli-ran", out)
 
     def test_an_admission_alert_ends_the_wait(self):
@@ -893,6 +1063,370 @@ class LoopTests(Base):
         self.assertAlmostEqual(g["outside"], 0.4 * GB, delta=1e6)  # only the driver's reserve
         self.assertAlmostEqual(g["room"], 24 * GB - 0.5 * GB - 0.4 * GB - 8 * GB, delta=1e6)
 
+    def test_a_ram_hold_keeps_jobs_out_of_its_ram(self):
+        loop = self.loop()  # 50 GB available, 1 GB headroom: 49 GB of room
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "40G", "--name", "model-server", "--cgroup", "/system.slice/model.service")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        hid = p.stdout.strip()
+        p = self.hold("--ram", "20G", "--name", "second")
+        self.assertNotEqual(p.returncode, 0)  # granted since the snapshot: 9 GB left
+        self.assertIn("RAM free to hold", p.stdout + p.stderr)
+        r = self.submit_sized("echo ram-job", cpus=1, ram=15 * GB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertEqual(self.status(tid), "Stashed")
+        self.assertAlmostEqual(loop.room["ram"]["room"], 9 * GB, delta=MiB)
+        room = self.job("room", "local", **self.env()).stdout
+        self.assertIn("(40.0 GB held for services)", room)
+        self.assertIn("hold %s (model-server): 40.0 GB of RAM" % hid, room)
+        self.assertEqual(self.job("release", "local", hid, **self.env()).returncode, 0)
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
+        self.assertIn("ram-job", self.wait(tid, tok).stdout)
+
+    def test_a_ram_holds_own_use_is_not_counted_twice(self):
+        cg = os.path.join(self.host.root, "cgroup")
+        svc = os.path.join(cg, "system.slice", "model.service")
+        os.makedirs(svc)
+
+        def service_uses(n):
+            with open(os.path.join(svc, "memory.current"), "w") as f:
+                f.write("%d\n" % (n + GB))  # 1 GB of it file cache, which does not count
+            with open(os.path.join(svc, "memory.stat"), "w") as f:
+                f.write("anon %d\nactive_file %d\ninactive_file 0\n" % (n, GB))
+        service_uses(0)
+        m = self.j.Measure(proc=self.host.proc, gpu_file=self.host.gpu_file, cgroup_root=cg)
+        loop = self.j.Loop(self.settings, measure=m)
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "40G", "--name", "model", "--cgroup", "/system.slice/model.service")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        service_uses(30 * GB)  # the model loads into its hold: 30 GB less available
+        self.host.set(avail=20 * GB)
+        loop.samples = []
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertAlmostEqual(loop.room["ram"]["room"], (20 + 30 - 1 - 40) * GB, delta=2 * MiB)
+        service_uses(45 * GB)  # past its hold: counted at its use
+        self.host.set(avail=5 * GB)
+        loop.samples = []
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertAlmostEqual(loop.room["ram"]["room"], (5 + 45 - 1 - 45) * GB, delta=2 * MiB)
+
+    def test_a_hold_alone_on_its_card_may_use_the_headroom(self):
+        self.model_card()  # 24 GB, 0.4 GB driver, 0.5 GB headroom: 23.1 GB of room for jobs
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "23.5G", "--name", "alone")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.job("release", "local", p.stdout.strip(), **self.env()).returncode, 0)
+        r = self.submit_sized("sleep 30", cpus=1, ram=100 * MiB, gpus=1, gpu_mem=1 * GB)
+        tid = r["data"]["id"]
+        try:
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+            self.host.tick()
+            loop.cycle()
+            p = self.hold("--gpu", "0", "--mem", "22.5G", "--name", "beside-a-job")  # 22.1 GB free with the headroom kept
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("GPU 0 on", p.stdout + p.stderr)
+            self.assertIn("(counted at %s, its limit)" % self.j._gbs(self.j.ram_limit(self.settings, 100 * MiB)),
+                          self.job("room", "local", **self.env()).stdout)
+        finally:
+            self.job("kill", "local", str(tid))
+
+    def test_a_hold_without_room_exits_206_and_admission_unavailable_exits_205(self):
+        self.model_card()
+        p = self.hold("--gpu", "0", "--mem", "2G", "--name", "early")  # no snapshot yet: the loop has not run
+        self.assertEqual(p.returncode, 205, p.stdout + p.stderr)
+        self.assertIn("WRAPPER_ERROR", p.stdout)
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        for args in (["--gpu", "0", "--mem", "30G"], ["--ram", "60G"]):
+            p = self.hold("--name", "too-big", *args)
+            self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+            self.assertIn("NO_ROOM", p.stdout)
+
+    def test_a_ram_only_hold_does_not_hide_its_services_gpu_use(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "20G", "--name", "model", "--cgroup", "/system.slice/model.service")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.model_card(model_used=10 * GB)  # the service also loads 10 GB onto the card
+        loop.samples = []
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertAlmostEqual(loop.room["gpus"][CARD]["room"], 24 * GB - 0.5 * GB - 10.4 * GB, delta=1e6)
+
+    def test_a_hold_beside_a_job_released_this_cycle_keeps_the_headroom(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        r = self.submit_sized("sleep 30", cpus=1, ram=100 * MiB, gpus=1, gpu_mem=1 * GB)
+        tid = r["data"]["id"]
+        try:
+            self.host.tick()
+            loop.cycle()  # releases it; the snapshot is written in the same cycle
+            self.assertNotEqual(self.status(tid), "Stashed")
+            p = self.hold("--gpu", "0", "--mem", "22.5G", "--name", "beside-a-job")  # 22.1 GB with the headroom kept
+            self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+        finally:
+            self.job("kill", "local", str(tid))
+
+    def test_the_headroom_stays_for_another_hold_or_another_gpu_user(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "5G", "--name", "first")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        p = self.hold("--gpu", "0", "--mem", "18.5G", "--name", "second")  # 18.1 GB left with the headroom kept
+        self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+        self.model_card(model_used=2 * GB)  # a process no hold or job names uses the card
+        loop.samples = []
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        for h in list(loop.holds):
+            self.job("release", "local", h["id"], **self.env())
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "21.3G", "--name", "beside-a-user")  # 21.1 GB with the headroom kept
+        self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+
+    def test_jobs_after_a_lone_hold_keep_the_headroom(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--gpu", "0", "--mem", "23.5G", "--name", "fills-the-card")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        r = self.submit_sized("echo late", cpus=1, ram=100 * MiB, gpus=1, gpu_mem=int(0.05 * GB))
+        tid = r["data"]["id"]
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertEqual(self.status(tid), "Stashed")
+
+    def test_a_ram_hold_on_a_process_ends_with_it(self):
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        svc = subprocess.Popen(["sleep", "60"])
+        try:
+            os.makedirs(os.path.join(self.host.proc, str(svc.pid)), exist_ok=True)
+            with open(os.path.join(self.host.proc, str(svc.pid), "stat"), "w") as f:
+                with open("/proc/%d/stat" % svc.pid) as real:
+                    f.write(real.read())
+            p = self.hold("--ram", "30G", "--name", "svc", "--while-pid", str(svc.pid))
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            with open(os.path.join(self.host.proc, str(svc.pid), "smaps_rollup"), "w") as f:
+                f.write("Pss_Anon: %d kB\nPss_Shmem: 0 kB\n" % (10 * GB // 1024))  # the service loads 10 GB
+            self.host.set(avail=40 * GB)
+            self.host.tick()
+            loop.cycle()
+            self.assertEqual(loop.samples[-1]["hold_ram"], {p.stdout.strip(): 10 * GB // 1024 * 1024})
+            self.assertAlmostEqual(loop.room["ram"]["room"], 19 * GB, delta=2 * MiB)  # 40 + its 10 - 1 - 30
+            self.host.set(avail=50 * GB)
+            os.remove(os.path.join(self.host.proc, str(svc.pid), "stat"))  # the process has exited
+            for _ in range(2):
+                self.host.tick()
+                loop.cycle()
+            self.assertEqual(loop.holds, [])
+            self.assertAlmostEqual(loop.room["ram"]["room"], 49 * GB, delta=2 * MiB)
+        finally:
+            svc.kill()
+            svc.wait()
+
+    def test_a_hold_granted_during_a_cycle_counts_as_a_hold_on_its_card(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        orig, got = loop.sample, {}
+
+        def sample_then_hold(*a, **k):
+            out = orig(*a, **k)
+            got["first"] = self.hold("--gpu", "0", "--mem", "5G", "--name", "first")
+            return out
+        loop.sample = sample_then_hold
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(got["first"].returncode, 0, got["first"].stderr)
+        p = self.hold("--gpu", "0", "--mem", "18.5G", "--name", "second")  # 18.1 GB left with the headroom kept
+        self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+
+    def test_two_ram_holds_on_one_service_count_its_use_once(self):
+        cg = os.path.join(self.host.root, "cgroup")
+        svc = os.path.join(cg, "system.slice", "model.service")
+        os.makedirs(svc)
+
+        def service_uses(n):
+            with open(os.path.join(svc, "memory.current"), "w") as f:
+                f.write("%d\n" % n)
+            with open(os.path.join(svc, "memory.stat"), "w") as f:
+                f.write("anon %d\nactive_file 0\ninactive_file 0\n" % n)
+        service_uses(0)
+        loop = self.j.Loop(self.settings, measure=self.j.Measure(proc=self.host.proc, gpu_file=self.host.gpu_file,
+                                                                   cgroup_root=cg))
+        self.host.tick()
+        loop.cycle()
+        for name in ("old", "again"):  # the service registers again before its old hold ends
+            p = self.hold("--ram", "20G", "--name", name, "--cgroup", "/system.slice/model.service")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        service_uses(15 * GB)
+        self.host.set(avail=35 * GB)
+        loop.samples = []
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertAlmostEqual(loop.room["ram"]["room"], (35 + 15 - 1 - 40) * GB, delta=2 * MiB)
+
+    def test_a_ram_hold_waits_for_a_loop_running_this_job(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        adm = self.j.Admission(self.settings)
+        adm.write_json(adm.path("heartbeat"), dict(adm.read_json(adm.path("heartbeat")), version="0.5.0"))
+        p = self.hold("--ram", "1G", "--name", "svc")
+        self.assertEqual(p.returncode, 205, p.stdout + p.stderr)  # the old loop would not count it
+        self.assertIn("runs job 0.5.0", p.stdout)
+        p = self.hold("--gpu", "0", "--mem", "1G", "--name", "gpu-only")  # an old loop counts GPU holds
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "1G", "--name", "svc")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_a_snapshot_from_before_other_users_were_counted_gives_no_headroom(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        adm = self.j.Admission(self.settings)
+        snap = adm.read_json(adm.path("room.json"))
+        for g in snap["room"]["gpus"].values():
+            g.pop("others")
+        adm.write_json(adm.path("room.json"), snap)
+        p = self.hold("--gpu", "0", "--mem", "23.5G", "--name", "alone")  # 23.1 GB with the headroom kept
+        self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+
+    def test_a_card_whose_processes_cannot_be_read_gives_no_headroom(self):
+        used = int(0.4 * GB)
+        self.host.set(cards=[{"index": 0, "uuid": CARD, "name": "RTX 3090", "total": 24 * GB, "free": 24 * GB - used,
+                              "procs_ok": False}])
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(loop.room["gpus"][CARD]["others"], 1)
+        p = self.hold("--gpu", "0", "--mem", "23.5G", "--name", "alone")
+        self.assertEqual(p.returncode, 206, p.stdout + p.stderr)
+
+    def test_a_job_released_before_limits_were_recorded_counts_at_the_limit_it_runs_under(self):
+        loop = self.loop()
+        q = {"token": "t" * 32, "released": time.time(), "size": {"cpus": 1.0, "ram": 4 * GB, "gpus": 0, "gpu_mem": 0},
+             "gpus": [], "ram_counted": 4 * GB, "gpu_counted": {}, "memory_max": 6 * GB}
+        self.assertEqual(loop._counted(q, time.time())["ram_counted"], 6 * GB)
+        q.pop("memory_max")  # released by a loop that did not record it
+        assign = loop.adm.assign_path(q["token"])
+        with open(assign, "w") as f:
+            f.write("JOB_MEMORY_MAX=%d\nCUDA_VISIBLE_DEVICES=\nJOB_GPU_UUIDS=\n" % (7 * GB))  # set at an older factor
+        self.assertEqual(loop._counted(q, time.time())["ram_counted"], 7 * GB)
+        os.remove(assign)
+        self.assertEqual(loop._counted(q, time.time())["ram_counted"], self.j.ram_limit(self.settings, 4 * GB))
+        q["pilot"] = True  # a pilot with no record of its limit: counted at what it was counted at
+        self.assertEqual(loop._counted(q, time.time())["ram_counted"], 4 * GB)
+
+    def test_a_unit_hold_whose_lookup_fails_is_kept(self):
+        cg = os.path.join(self.host.root, "cgroup")
+        os.makedirs(os.path.join(cg, "system.slice", "model.service"))
+        loop = self.j.Loop(self.settings, measure=self.j.Measure(proc=self.host.proc, gpu_file=self.host.gpu_file,
+                                                                   cgroup_root=cg))
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "4G", "--name", "svc", "--unit", "model.service")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        real, answer = self.j._hold_cgroups, {"cgs": ["/system.slice/model.service"]}
+        self.j._hold_cgroups = lambda h: answer["cgs"]
+        try:
+            self.host.tick()
+            loop.cycle()  # seen
+            answer["cgs"] = None  # systemd could not be asked
+            for _ in range(2):
+                self.host.tick()
+                loop.cycle()
+            self.assertEqual([h["name"] for h in loop.holds], ["svc"])
+            answer["cgs"] = []  # the unit has no cgroup: it is gone
+            for _ in range(2):
+                self.host.tick()
+                loop.cycle()
+            self.assertEqual(loop.holds, [])
+        finally:
+            self.j._hold_cgroups = real
+
+    def test_the_loop_restarts_into_changed_settings(self):
+        adm = self.j.Admission(self.settings)
+
+        def ram_room():
+            snap = adm.read_json(adm.path("room.json")) or {}
+            return ((snap.get("room") or {}).get("ram") or {}).get("room")
+
+        def until(ok, what):
+            deadline = time.monotonic() + 60
+            while not ok():
+                self.assertLess(time.monotonic(), deadline, what)
+                self.host.tick()
+                time.sleep(0.2)
+        p = subprocess.Popen([sys.executable, JOB, "_admit"], env=self.d.env(**self.env()), stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, text=True)
+        try:
+            until(lambda: ram_room() is not None and abs(ram_room() - 49 * GB) < 10 * MiB, "no room with 1 GB headroom")
+            self.write_settings(ram_headroom_gb=11)
+            until(lambda: abs(ram_room() - 39 * GB) < 10 * MiB, "the loop did not take up the new headroom")
+            with open(self.cfg, "w") as f:
+                f.write("{ not json")
+            beat = adm.read_json(adm.path("heartbeat"))["t"]
+            until(lambda: adm.read_json(adm.path("heartbeat"))["t"] > beat + 1, "the loop stopped on bad settings")
+            self.assertIsNone(p.poll())
+        finally:
+            p.kill()
+            _, err = p.communicate(timeout=30)
+        self.assertIn("the changed settings are not valid", err)
+
+    def test_a_hold_cgroup_must_be_absolute(self):
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.hold("--ram", "1G", "--name", "svc", "--cgroup", "system.slice/model.service")
+        self.assertEqual(p.returncode, 205, p.stdout + p.stderr)
+        self.assertIn("starting with /", p.stdout)
+
+    def test_hold_options_need_gpu_with_mem_or_ram(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        for args in (["--name", "x"], ["--name", "x", "--gpu", "0"], ["--name", "x", "--mem", "1G"], ["--ram", "1G"]):
+            p = self.hold(*args)
+            self.assertNotEqual(p.returncode, 0, args)
+            self.assertIn("needs --name", p.stdout + p.stderr)
+        p = self.hold("--name", "both", "--gpu", "0", "--mem", "2G", "--ram", "2G")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("GPU 0 RAM 2.0 GB", p.stderr)
+
     def test_a_hold_ends_when_its_time_to_live_runs_out(self):
         self.model_card()
         now = [time.time()]
@@ -943,7 +1477,7 @@ class LoopTests(Base):
         self.assertEqual(self.record(tok)["how"], "stop-at")
         big = self.submit_sized("true", cpus=1, ram=500 * GB, stop_at=time.time() - 1)
         self.assertFalse(big["ok"])  # cannot run even when empty: refused at once, not held
-        held = self.submit_sized("true", cpus=1, ram=48 * GB, stop_at=time.time() + 1)
+        held = self.submit_sized("true", cpus=1, ram=40 * GB, stop_at=time.time() + 1)  # a 60 GB limit: fits when empty
         self.host.set(avail=10 * GB)
         time.sleep(1.2)
         self.assertTrue(self.cycles(loop, lambda: (self.record(held["data"]["token"]) or {}).get("how")
@@ -1079,14 +1613,14 @@ class LoopTests(Base):
         loop = self.loop()
         self.host.tick()
         loop.cycle()
-        a = self.submit_sized("sleep 20", cpus=1, ram=4 * GB)
+        a = self.submit_sized("sleep 20", cpus=1, ram=3 * GB)  # counted at its 4.5 GB limit
         self.host.tick()
         loop.cycle()
         self.assertNotEqual(self.status(a["data"]["id"]), "Stashed")
         try:
             with open(os.path.join(self.state, "room.json")) as f:
-                self.assertLess(json.load(f)["room"]["ram"]["room"], 1.1 * GB)
-            b = self.submit_sized("true", cpus=1, ram=4 * GB, fit_now=True)
+                self.assertLess(json.load(f)["room"]["ram"]["room"], 0.6 * GB)
+            b = self.submit_sized("true", cpus=1, ram=3 * GB, fit_now=True)
             self.assertFalse(b["ok"])
         finally:
             self.job("kill", "local", str(a["data"]["id"]))
@@ -1155,7 +1689,7 @@ class LoopTests(Base):
         loop = self.loop()
         q = {"token": "c" * 32, "released": 0, "started": 1000.0, "size": {"cpus": 4, "ram": 8 * GB},
              "constraints": {"in_containers": True}, "ram_counted": 8 * GB, "gpu_counted": {"g": GB}}
-        self.assertEqual(loop._counted(q, 1000.0 + 599)["ram_counted"], 8 * GB)
+        self.assertEqual(loop._counted(q, 1000.0 + 599)["ram_counted"], self.j.ram_limit(self.settings, 8 * GB))  # its limit
         c = loop._counted(q, 1000.0 + 600)
         self.assertEqual((c["ram_counted"], c["size"]["cpus"], c["gpu_counted"]), (0, 0.0, {}))
 
@@ -1192,7 +1726,7 @@ class LoopTests(Base):
         self.assertIn(tok, p.stdout)
         self.assertIn("explicit: 1 CPU, 0.1 GB", p.stdout)
         rec = self.record(tok)
-        self.assertEqual(rec["ram_counted"], 100 * MiB)  # a sized job is counted at its size
+        self.assertEqual(rec["ram_counted"], self.j.ram_limit(self.settings, 100 * MiB))  # a job counts at its limit
         self.assertEqual(rec["memory_max"], self.j._whole_pages(max(int(100 * MiB * 1.5), self.j.SCOPE_MIN_MEMORY)))
         p = self.job("history", "local", "--json", "--task", "nothing-like-this", **self.env())
         self.assertEqual(json.loads(p.stdout)["local"]["jobs"], [])
