@@ -722,7 +722,35 @@ def host_probe(req):
     tail = req.get("tail_lines")
     if tail:
         s["tail"] = _tail(path, int(tail))
+    _probe_admission(s, req)
     return s
+
+
+def _probe_admission(s, req):
+    """Add what the admission loop says about this job: why it is held, new alerts, a stopped loop."""
+    try:
+        settings = _admission_settings()
+    except JobError:
+        return
+    if settings is None or not s.get("token"):
+        return
+    adm = Admission(settings)
+    q = adm.read_json(adm.path("queue", s["token"] + ".json"))
+    if q is not None:
+        s["held"] = q.get("state") == "held"
+        s["held_reason"] = q.get("reason")
+    try:
+        with open(adm.path("alerts", s["token"] + ".jsonl"), encoding="utf-8") as f:
+            alerts = [json.loads(line) for line in f if line.strip()]
+    except (OSError, ValueError):
+        alerts = []
+    s["alert_count"] = len(alerts)
+    cursor = req.get("alert_cursor")
+    if isinstance(cursor, int) and 0 <= cursor < len(alerts):
+        s["alerts"] = alerts[cursor:]
+    if s.get("held"):
+        age = _heartbeat_age(adm)
+        s["admission_stale"] = age is None or age > _heartbeat_limit(settings)
 
 
 def _tail(path, n):
@@ -755,6 +783,8 @@ def host_ls(req):
     for s in out:
         if s["status"] == "Done" and s.get("token"):
             s["scope"] = _scope_result(s["token"])
+        elif s["status"] == "Stashed" and s.get("token"):
+            _probe_admission(s, {})
     return {"tasks": out, "groups": st.get("groups", {}), "hostname": socket.gethostname()}
 
 
@@ -1943,7 +1973,8 @@ def host_room(req):
     snap = adm.read_json(adm.path("room.json")) or {}
     age = _heartbeat_age(adm)
     snap.update({"admission": True, "hostname": socket.gethostname(), "heartbeat_age": age,
-                 "stale": age is None or age > _heartbeat_limit(settings)})
+                 "stale": age is None or age > _heartbeat_limit(settings), "settings": settings,
+                 "paths": [x for x in (req.get("paths") or []) if isinstance(x, str) and os.path.exists(x)]})
     return snap
 
 
@@ -2096,23 +2127,196 @@ def _parse_env(items):
 
 
 def submit(args, command):
-    """Queue the command; retried safely when the connection drops (the token makes it idempotent)."""
+    """Queue the command, on args.host or, for auto, on the host admission places it on."""
+    adm = _admission_request(args)
+    if args.host == "auto":
+        if adm is None:
+            raise JobError("auto needs a size: --pilot, --like TOKEN, --small, or --cpus/--ram/--gpus/--gpu-mem")
+        if getattr(args, "only_hosts", None):
+            adm["hosts"] = args.only_hosts
+        host, tid, token = place(args, command, adm)
+        args.host = host
+        return {"id": tid, "token": token}
+    tid, token = submit_to(args, args.host, command, adm)
+    return {"id": tid, "token": token}
+
+
+def submit_to(args, host, command, adm):
+    """Queue on one host; retried safely when the connection drops (the token makes it idempotent)."""
     token = uuid.uuid4().hex
     req = {"command": command, "task": args.task, "group": args.group, "cwd": args.cwd,
            "session": _session(), "from": socket.gethostname(), "token": token,
            "env": _parse_env(args.env), "normal_priority": bool(args.normal_priority)}
-    if args.cwd is None and HOSTS.get(args.host) is None:
+    if adm is not None:
+        req["admission"] = adm
+    if args.cwd is None and HOSTS.get(host) is None:
         req["cwd"] = os.getcwd()
     last = None
     for attempt in range(4):
         try:
-            return call(args.host, "submit", req)
+            r = call(host, "submit", req)
+            return r["id"], r["token"]
         except Unreachable as e:
             last = e
-            sys.stderr.write("job: %s unreachable while queueing (%s); retrying\n" % (args.host, e))
+            sys.stderr.write("job: %s unreachable while queueing (%s); retrying\n" % (host, e))
             time.sleep(15 * (attempt + 1))
     raise Unreachable("%s; the job may or may not have been queued: check 'job ls %s' for task %s"
-                      % (last, args.host, args.task))
+                      % (last, host, args.task))
+
+
+SIZE_UNITS = {"": 1, "K": 10 ** 3, "M": 10 ** 6, "G": 10 ** 9, "T": 10 ** 12,
+              "KI": 1 << 10, "MI": 1 << 20, "GI": 1 << 30, "TI": 1 << 40}
+HELD_NOTICE_S = 600
+
+
+def _parse_size(text):
+    """'20G' (10^9), '512Mi' (2^20), '1.5T' or plain bytes, to whole bytes."""
+    t = text.strip().upper().rstrip("B")
+    i = len(t)
+    while i and not (t[i - 1].isdigit() or t[i - 1] == "."):
+        i -= 1
+    num, unit = t[:i], t[i:]
+    try:
+        value = float(num)
+    except ValueError:
+        value = None
+    if value is None or unit not in SIZE_UNITS or value < 0:
+        raise argparse.ArgumentTypeError("not a size: %r (examples: 20G, 512Mi, 1.5T)" % text)
+    return int(value * SIZE_UNITS[unit])
+
+
+def _admission_request(args):
+    """The size and constraints the caller gave, or None when none were given."""
+    a = {}
+    for k in ("cpus", "ram", "gpus", "gpu_mem", "gpu_share", "like", "gpu_model", "data", "stop_at", "max_minutes"):
+        v = getattr(args, k, None)
+        if v is not None:
+            a[k] = v
+    for k in ("pilot", "small", "in_containers", "restartable"):
+        if getattr(args, k, False):
+            a[k] = True
+    if a.get("stop_at"):
+        if _parse_time(a["stop_at"]) is None:
+            raise JobError("--stop-at needs a time like 2026-11-10T08:00-05:00")
+        a["stop_at"] = _parse_time(a["stop_at"]).isoformat()
+    return a or None
+
+
+def _rooms(hosts, timeout=60, paths=()):
+    """{host: snapshot or error text} from each host's admission loop, asked in parallel."""
+    out = {}
+
+    def ask(h):
+        try:
+            out[h] = call(h, "room", {"paths": list(paths)}, timeout=timeout)
+        except (JobError, Unreachable) as e:
+            out[h] = str(e)
+
+    threads = [threading.Thread(target=ask, args=(h,)) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 5)
+    return out
+
+
+def _placement_hosts():
+    return ["local"] + [h for h in LISTED if h != "local"] if "local" not in LISTED else list(LISTED)
+
+
+def place(args, command, adm):
+    """`auto`: try each admission host with room now (fit_now), else hold the job on the best host."""
+    names = _placement_hosts()
+    rooms = _rooms(names, paths=[adm["data"]] if adm.get("data") else [])
+    usable, skipped = [], []
+    for h in names:
+        r = rooms.get(h)
+        if not isinstance(r, dict):
+            skipped.append("%s (%s)" % (h, r))
+        elif not r.get("admission"):
+            continue
+        elif r.get("stale") or not r.get("room"):
+            skipped.append("%s (its admission loop is not running)" % h)
+        else:
+            usable.append(h)
+    if skipped:
+        sys.stderr.write("job: auto skipped %s\n" % "; ".join(skipped))
+    if not usable:
+        raise JobError("no admission host is available for auto")
+    want_host = set(adm.pop("hosts", []) or [])
+    if want_host:
+        usable = [h for h in usable if h in want_host]
+
+    def order(h):
+        r = rooms[h]
+        probe = {"size": _probe_size(adm), "pilot": bool(adm.get("pilot")), "constraints": adm}
+        try:
+            ok = fits(r["settings"], r["room"], probe)[0] if r.get("settings") else False
+        except (KeyError, TypeError):
+            ok = False
+        return (not ok, -int(bool(adm.get("data")) and adm["data"] in (r.get("paths") or [])), len(r.get("held") or []))
+
+    usable.sort(key=order)
+    for h in usable:
+        try:
+            tid, token = submit_to(args, h, command, dict(adm, fit_now=True))
+            sys.stderr.write("job: auto placed the job on %s\n" % h)
+            return h, tid, token
+        except JobError as e:
+            if "no room" not in str(e):
+                raise
+    h = usable[0]
+    tid, token = submit_to(args, h, command, adm)
+    sys.stderr.write("job: no host has room now; the job is held on %s until it fits\n" % h)
+    return h, tid, token
+
+
+def _probe_size(adm):
+    small = {"cpus": 1.0, "ram": 4 * 10 ** 9}
+    return {"cpus": float(adm.get("cpus") or small["cpus"]), "ram": int(adm.get("ram") or small["ram"]),
+            "gpus": int(adm.get("gpus") or (1 if adm.get("gpu_mem") else 0)), "gpu_mem": int(adm.get("gpu_mem") or 0),
+            "gpu_share": float(adm.get("gpu_share") or 0), "disk_mb_s": 0}
+
+
+def cmd_room(args):
+    hosts = args.hosts or _placement_hosts()
+    rooms = _rooms(hosts)
+    if args.json:
+        print(json.dumps(rooms, indent=1, default=str))
+        return 0
+    for h in hosts:
+        r = rooms.get(h)
+        if not isinstance(r, dict):
+            print("%s: unreachable (%s)" % (h, r))
+            continue
+        if not r.get("admission"):
+            print("%s: not an admission host" % h)
+            continue
+        if r.get("stale") or not r.get("room"):
+            age = r.get("heartbeat_age")
+            print("%s: admission loop not running%s" % (h, "" if age is None else " (heartbeat %s old)" % _fmt_dur(age)))
+            continue
+        room = r["room"]
+        cap = r.get("capacity") or {}
+        print("%s: snapshot %s old; CPU %.1f busy of %s threads, %.1f free to admit; RAM %s free to admit; "
+              "memory pressure %.1f%%" % (h, _fmt_dur(r.get("heartbeat_age") or 0), room["cpu"]["outside"]
+                                           + room["cpu"]["committed"], cap.get("threads", "?"),
+                                           max(0.0, room["cpu"]["room"]), _gbs(max(0, room["ram"]["room"])),
+                                           room["psi"]))
+        for name, busy in sorted(room.get("disks", {}).items()):
+            print("  disk %s busy %.0f%%" % (name, busy))
+        for gid, g in sorted(room.get("gpus", {}).items(), key=lambda kv: kv[1]["index"]):
+            print("  GPU %d %s: %s free to admit of %s; outside use %s; busy %.0f%%" % (
+                g["index"], g["name"], _gbs(max(0, g["room"])), _gbs(g["total"]), _gbs(g["outside"]), g["util"]))
+        for j in r.get("jobs") or []:
+            print("  running %s (%s): %g CPU, %s RAM%s" % (j["token"][:8], j["task"], j["size"]["cpus"],
+                                                          _gbs(j["size"]["ram"]),
+                                                          ", GPU %s" % ",".join(x[:12] for x in j["gpus"])
+                                                          if j.get("gpus") else ""))
+        for j in r.get("held") or []:
+            print("  held %s (%s) for %s: %s" % (j["token"][:8], j["task"], _fmt_dur(j["waited_s"]),
+                                                 j.get("reason") or "not checked yet"))
+    return 0
 
 
 def verdict_of(s):
@@ -2236,6 +2440,9 @@ class Waiter:
         self.err_since = None
         self.told_queued = False
         self.told_notoken = False
+        self.alert_cursor = None  # admission alerts already seen; a new wait starts at the current end
+        self.told_held = None
+        self.told_stale = False
 
     def _outcome(self, verdict, code, s, note=None, tail=True):
         """The verdict is already decided; a last probe only refreshes what is shown (status, tail)."""
@@ -2257,6 +2464,8 @@ class Waiter:
 
     def step(self):
         req = {"id": self.tid, "token": self.token}
+        if self.alert_cursor is not None:
+            req["alert_cursor"] = self.alert_cursor
         if self.check and self.offset is not None:
             req["log_offset"] = self.offset
         try:
@@ -2299,6 +2508,23 @@ class Waiter:
                                       "outright)" % why, tail=False)
         self.token = self.token or s.get("token")
         status, size = s.get("status"), s.get("log_size", 0)
+        if "alert_count" in s:
+            if self.alert_cursor is None:
+                self.alert_cursor = s["alert_count"]
+            elif s.get("alerts"):
+                self.alert_cursor += len(s["alerts"])
+                return self._outcome("ALERT", EXIT["ALERT"], s, note="admission: %s; the job keeps its place" %
+                                     "; ".join(a["message"] for a in s["alerts"]))
+        if status == "Stashed" and s.get("held"):
+            now = time.monotonic()
+            if self.told_held is None or now - self.told_held >= HELD_NOTICE_S:
+                self.told_held = now
+                sys.stderr.write("job: %s#%s held: %s\n" % (self.host, self.tid,
+                                                             s.get("held_reason") or "waiting for the next check"))
+            if s.get("admission_stale") and not self.told_stale:
+                self.told_stale = True
+                return self._outcome("ALERT", EXIT["ALERT"], s, note="the admission loop on %s is not running, so "
+                                     "the job stays held until it runs again" % self.host)
 
         if self.check:
             if self.offset is None:
@@ -2521,9 +2747,11 @@ def cmd_ls(args):
             if state == "Done":
                 v, c, _ = scope_verdict(*verdict_of(s), s.get("scope"))
                 state = v if v != "FAILED" else "FAILED(%d)" % c
+            what = (s.get("summary") or s.get("command") or "")[:60]
+            if s.get("held"):
+                state, what = "Held", "[%s] %s" % (s.get("held_reason") or "not checked yet", what)
             rows.append((h, str(s["id"]), s.get("label") or "-", state, _fmt_dur(_runtime(s)),
-                         s.get("group") or "", s.get("session") or "unknown",
-                         (s.get("summary") or s.get("command") or "")[:60]))
+                         s.get("group") or "", s.get("session") or "unknown", what))
     head = ("HOST", "ID", "TASK", "STATUS", "RUN TIME", "GROUP", "SESSION", "COMMAND")
     if rows:
         widths = [max(len(r[i]) for r in rows + [head]) for i in range(len(head))]
@@ -2579,6 +2807,23 @@ def build_parser():
                        help="pass this variable to the job (repeatable); only a small fixed set is passed otherwise")
         q.add_argument("--normal-priority", action="store_true",
                        help="run the job at normal CPU and disk priority instead of nice 19 / ionice idle")
+        a = q.add_argument_group("size and constraints, for admission hosts and auto (docs/admission.md)")
+        a.add_argument("--pilot", action="store_true", help="a first run to measure the job (time-limited)")
+        a.add_argument("--max-minutes", type=int, default=None, metavar="N", help="a pilot's time limit")
+        a.add_argument("--like", default=None, metavar="TOKEN|HOST#ID", help="size it from that earlier job's peaks")
+        a.add_argument("--small", action="store_true", help="the host's small size")
+        a.add_argument("--cpus", type=float, default=None, metavar="N", help="CPU threads")
+        a.add_argument("--ram", type=_parse_size, default=None, metavar="SIZE", help="RAM, e.g. 20G or 512Mi")
+        a.add_argument("--gpus", type=int, default=None, metavar="N", help="GPUs on one host")
+        a.add_argument("--gpu-mem", type=_parse_size, default=None, metavar="SIZE", help="GPU memory per GPU")
+        a.add_argument("--gpu-share", type=float, default=None, metavar="PCT", help="share of the GPU's time")
+        a.add_argument("--gpu-model", default=None, metavar="TEXT", help="only GPUs whose name contains TEXT")
+        a.add_argument("--data", default=None, metavar="PATH", help="the data it reads (names its disk)")
+        a.add_argument("--stop-at", default=None, metavar="TIME", help="stop it then (YYYY-MM-DDTHH:MM+-HH:MM)")
+        a.add_argument("--in-containers", action="store_true", help="its work runs in containers")
+        a.add_argument("--restartable", action="store_true", help="it may run on hosts that can be reclaimed")
+        a.add_argument("--host", dest="only_hosts", action="append", default=None, metavar="NAME",
+                       help="with auto: only this host (repeatable)")
         if name == "run":
             waitopts(q)
 
@@ -2594,6 +2839,10 @@ def build_parser():
     q.add_argument("hosts", nargs="*", help="hosts to list (default: all)")
     q.add_argument("--all", action="store_true", help="include finished jobs older than --recent")
     q.add_argument("--recent", type=float, default=24.0, metavar="H", help="hide finished jobs older than H hours (default 24)")
+
+    q = sub.add_parser("room", help="free room on admission hosts")
+    q.add_argument("hosts", nargs="*", help="hosts to show (default: all)")
+    q.add_argument("--json", action="store_true", help="print the hosts' snapshots as JSON")
 
     q = sub.add_parser("group", help="create a group or set its parallel limit")
     q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
@@ -2634,12 +2883,13 @@ def main(argv=None):
                 and n.split(".")[0].lower() == args.host.split(".")[0].lower()]
         if mine:  # this machine's name in another case, or its full name
             args.host = mine[0]
-    if getattr(args, "host", None) is not None and args.host not in HOSTS:
+    auto = args.cmd in ("run", "submit") and args.host == "auto"  # admission chooses the host
+    if getattr(args, "host", None) is not None and args.host not in HOSTS and not auto:
         sys.stdout.write("job: WRAPPER_ERROR unknown host %r; known hosts: %s (add it to %s)\njob: exit %d\n"
                          % (args.host, ", ".join(HOSTS), HOSTS_FILE, EXIT["WRAPPER_ERROR"]))
         return EXIT["WRAPPER_ERROR"]
     handlers = {"run": cmd_run, "submit": lambda a: cmd_run(a, queue_only=True), "wait": cmd_wait,
-                "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill}
+                "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill, "room": cmd_room}
     try:
         return handlers[args.cmd](args)
     except JobError as e:

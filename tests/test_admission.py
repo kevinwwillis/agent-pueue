@@ -487,6 +487,87 @@ class LoopTests(Base):
         self.assertFalse(os.path.exists(os.path.join(self.settings["state_dir"], "queue",
                                                      r["data"]["token"] + ".json")))
 
+    # -- the client ------------------------------------------------------------------------------------------
+
+    def test_sizes_parse(self):
+        self.assertEqual(self.j._parse_size("20G"), 20 * 10 ** 9)
+        self.assertEqual(self.j._parse_size("512Mi"), 512 * MiB)
+        self.assertEqual(self.j._parse_size("1.5T"), 15 * 10 ** 11)
+        self.assertEqual(self.j._parse_size("4096"), 4096)
+        with self.assertRaises(Exception):
+            self.j._parse_size("lots")
+
+    def test_sized_submit_is_held_shown_and_released(self):
+        self.host.set(avail=3 * GB)
+        loop = self.loop()
+        p = self.job("submit", "local", "T-cli", "--cpus", "1", "--ram", "4G", "--", "echo", "cli-ran", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        tid = int(p.stdout.strip())
+        self.host.tick()
+        loop.cycle()
+        room = self.job("room", "local", **self.env())
+        self.assertIn("held", room.stdout)
+        self.assertIn("needs 4.0 GB RAM, 2.0 GB free", room.stdout)
+        ls = self.job("ls", "local", **self.env())
+        row = [x for x in ls.stdout.splitlines() if x.split()[1:2] == [str(tid)]]
+        self.assertTrue(row and "Held" in row[0] and "needs 4.0 GB RAM" in row[0], ls.stdout)
+        w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(tid), "--poll", "0.3"], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=self.d.env(**self.env()))
+        time.sleep(1.5)
+        self.host.set(avail=8 * GB)
+        loop.samples = []
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
+        out, err = w.communicate(timeout=60)
+        self.assertEqual(w.returncode, 0, out + err)
+        self.assertIn("held: needs 4.0 GB RAM", err)
+        self.assertIn("cli-ran", out)
+
+    def test_an_admission_alert_ends_the_wait(self):
+        self.d.pueue("group", "add", "palert")
+        self.host.set(avail=2 * GB)
+        p = self.job("submit", "local", "T-alert", "--group", "palert", "--cpus", "1", "--ram", "4G", "--", "true",
+                     **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        tid = int(p.stdout.strip())
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()  # held for room; the loop is running
+        w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(tid), "--poll", "0.3"], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=self.d.env(**self.env()))
+        time.sleep(1.5)
+        self.assertIsNone(w.poll(), "a held job is not a verdict")
+        self.d.pueue("pause", "--group", "palert")
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        try:
+            out, err = w.communicate(timeout=60)
+        finally:
+            self.d.pueue("start", "--group", "palert")
+        self.assertEqual(w.returncode, 201, out + err)
+        self.assertIn("job: ALERT", out)
+        self.assertIn("its pueue group palert is paused", out)
+
+    def test_auto_places_on_a_host_with_room_or_holds(self):
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()  # a fresh heartbeat and room snapshot
+        sub = subprocess.Popen([sys.executable, JOB, "run", "auto", "T-auto", "--cpus", "1", "--ram", "200M",
+                                "--poll", "0.3", "--", "echo", "auto-ran"], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, env=self.d.env(**self.env()))
+        self.assertTrue(self.cycles(loop, lambda: sub.poll() is not None, n=80))
+        out, err = sub.communicate(timeout=30)
+        self.assertEqual(sub.returncode, 0, out + err)
+        self.assertIn("auto placed the job on local", err)
+        self.assertIn("auto-ran", out)
+        self.host.set(avail=2 * GB)
+        loop.samples = []
+        self.host.tick()
+        loop.cycle()
+        p = self.job("submit", "auto", "T-auto2", "--cpus", "1", "--ram", "4G", "--", "true", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("held on local", p.stderr)
+
     def test_invalid_settings_refuse_every_submit(self):
         with open(self.cfg, "w") as f:
             f.write('{"ram_headroom": 1}')
