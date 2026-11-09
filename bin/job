@@ -32,7 +32,7 @@ import time
 import traceback
 import uuid
 
-VERSION = "0.6.2"
+VERSION = "0.7.0"
 PROTOCOL = 3
 # Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
 # option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
