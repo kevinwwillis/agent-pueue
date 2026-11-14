@@ -1,10 +1,10 @@
 ---
 id: TASK-001
 title: job kill leaves the job's child processes running
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-06T21:10:00Z'
-updated_date: '2026-11-14T17:41:00Z'
+updated_date: '2026-11-14T19:24:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -19,13 +19,16 @@ Reported 2026-11-06 16:09 ET by the MARVELS optics lead session (via the MARVELS
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Reproduced with a job that forks children
+- [x] #1 Reproduced with a job that forks children
 - [ ] #2 job kill ends every descendant process on local, sttp1 and sttp2
-- [ ] #3 A test covers it
+- [x] #3 A test covers it
+- [x] #4 Help says kill a running job or remove a queued or held one; job kill reports processes ended and any left
+- [x] #5 A job removed by job kill before it ran ends KILLED, removed by job kill
+- [x] #6 job kill HOST --task NAME, refused for other sessions' jobs unless --all-sessions
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Audit 2026-11-14 item 15 (Kevin: fix now): also kill help text says only 'running'; removing a queued job makes its waiting job run end GONE 204 (shown as failed) - end it KILLED 'removed by job kill'; kill prints only 'killed'; add --task NAME.
+2026-11-14 14:17 ET, commit b5a1574. Reproduced locally: timeout 300 sh -c ... survived job kill (pueue kills only the job's process group; timeout makes its own). Fix: processes found by token and descendants (with start times) before pueue kill, SIGKILL any still alive for up to 3 s; exit 205 if any is left. #2 (sttp1, sttp2) needs the remote test, not run per the brief. Tests: KillTests (5).
 <!-- SECTION:NOTES:END -->

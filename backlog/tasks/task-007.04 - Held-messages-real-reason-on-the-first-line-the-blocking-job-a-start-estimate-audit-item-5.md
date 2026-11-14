@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-11-14T17:41:00Z'
+updated_date: '2026-11-14T18:20:00Z'
 labels: []
 dependencies: []
 parent_task_id: TASK-007
@@ -18,3 +19,17 @@ ordinal: 18000
 <!-- SECTION:DESCRIPTION:BEGIN -->
 First held line often reads 'waiting for the next check'; 'waiting behind an older job' names no job; no estimate.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [x] #1 The first held line comes from the submit's own reason (snapshot-based; 'measuring the host' without a snapshot), never 'waiting for the next check'
+- [x] #2 Waiting behind an older job names it (task id and token) and what it needs
+- [x] #3 With projected ends, the reason estimates when enough room should free; otherwise it says none is known and why
+- [ ] #4 Remote test (tests.test_remote against a real host) passes
+<!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-11-14 13:20 ET, commit ca5a01f: built. Estimate: running jobs holding the lacking resource in order of projected end until what they free covers the lack (GPU: as many cards as still needed); a job with no projected end on the way gives 'none known'. Times are in the host's zone; snapshot carries start_estimate. job submit prints the held line. Tests: start_estimate unit test; LoopTests first-held-line test; reason text asserted in the fairness test.
+<!-- SECTION:NOTES:END -->

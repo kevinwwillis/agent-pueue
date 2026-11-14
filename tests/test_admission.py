@@ -7,6 +7,9 @@ fake GPU list, while jobs run in real systemd user scopes (skipped where those d
 Run: python3 -m unittest discover -s tests -v
 """
 
+import contextlib
+import fcntl
+import io
 import json
 import os
 import shutil
@@ -14,10 +17,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
-from test_job import JOB, Base
+from test_job import JOB, Base, own_tmpdir, remove_own_dir
 from test_scope import SCOPES
 
 GB, MiB, GiB = 10 ** 9, 1 << 20, 1 << 30
@@ -60,16 +64,10 @@ class RoomRules(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import tempfile
         cls.j = load()
-        cls.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        cls.tmp = own_tmpdir()
+        cls.addClassCleanup(remove_own_dir, cls.tmp)
         cls.s = settings(cls.j, cls.tmp)
-
-    @classmethod
-    def tearDownClass(cls):
-        import shutil
-        if cls.tmp.startswith("/tmp/jobt."):
-            shutil.rmtree(cls.tmp)
 
     def room(self, samples, inflight=(), now=None):
         return self.j.compute_room(self.s, samples, list(inflight), [], now or samples[-1]["t"])
@@ -209,14 +207,9 @@ class RoomRulesCycle2(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.j = load()
-        cls.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        cls.tmp = own_tmpdir()
+        cls.addClassCleanup(remove_own_dir, cls.tmp)
         cls.s = settings(cls.j, cls.tmp)
-
-    @classmethod
-    def tearDownClass(cls):
-        import shutil
-        if cls.tmp.startswith("/tmp/jobt."):
-            shutil.rmtree(cls.tmp)
 
     def test_gpu_use_on_a_card_the_job_was_not_given_still_counts(self):
         tok = "d" * 32
@@ -253,14 +246,9 @@ class RoomRulesCycle2(unittest.TestCase):
 
 class Settings(unittest.TestCase):
     def setUp(self):
-        import tempfile
         self.j = load()
-        self.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
-
-    def tearDown(self):
-        import shutil
-        if self.tmp.startswith("/tmp/jobt."):
-            shutil.rmtree(self.tmp)
+        self.tmp = own_tmpdir()
+        self.addCleanup(remove_own_dir, self.tmp)
 
     def write(self, text):
         p = os.path.join(self.tmp, "a.json")
@@ -308,9 +296,10 @@ class ClientTests(unittest.TestCase):
         self.args = argparse.Namespace(host="auto", only_hosts=None)
         room = {"cpu": {"room": 8, "placed_room": 8, "iowait": 0, "outside": 0, "committed": 0},
                 "ram": {"room": 10 * GB}, "gpus": {}, "disks": {}, "pressure_ok": True, "psi": 0}
+        tmp = own_tmpdir()
+        self.addCleanup(remove_own_dir, tmp)
         self.snap = lambda **kw: dict({"admission": True, "stale": False, "room": room, "held": [], "paths": [],
-                                       "settings": settings(self.j, tempfile.mkdtemp(prefix="jobt.", dir="/tmp"))},
-                                      **kw)
+                                       "settings": settings(self.j, tmp)}, **kw)
         self.refuse = {}
 
         def submit_to(args, host, command, adm):
@@ -390,15 +379,14 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(self.j._ram_at_total(flat))
 
     def fake_ssh(self, script):
-        d = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        d = own_tmpdir()
+        self.addCleanup(remove_own_dir, d)
         with open(os.path.join(d, "ssh"), "w") as f:
             f.write("#!/bin/sh\ncat > /dev/null\n" + script + "\n")
         os.chmod(os.path.join(d, "ssh"), 0o755)
         old = os.environ["PATH"]
         os.environ["PATH"] = d + ":" + old
         self.addCleanup(lambda: os.environ.__setitem__("PATH", old))
-        import shutil
-        self.addCleanup(shutil.rmtree, d)
 
     def test_a_host_that_gives_no_reply_is_unreachable_not_a_refusal(self):
         self.fake_ssh("echo 'Killed' >&2; exit 137")
@@ -412,8 +400,8 @@ class ClientTests(unittest.TestCase):
         self.assertNotIsInstance(e.exception, self.j.Unreachable)
 
     def test_sizes_of_nothing_are_refused(self):
-        tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
-        self.addCleanup(__import__("shutil").rmtree, tmp)
+        tmp = own_tmpdir()
+        self.addCleanup(remove_own_dir, tmp)
         s = settings(self.j, tmp)
         adm = self.j.Admission(s)
         cap = {"mem_total": 64 * GB, "threads": 8, "gpus": []}
@@ -424,7 +412,8 @@ class ClientTests(unittest.TestCase):
             self.assertNotIn("admission setting", str(e.exception))
 
     def test_job_use_measures_the_disk_rate(self):
-        root = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        root = own_tmpdir()
+        self.addCleanup(remove_own_dir, root)
         try:
             scope = os.path.join(root, "scope")
             os.makedirs(os.path.join(scope, "job"))
@@ -646,23 +635,215 @@ class RecordsFile(unittest.TestCase):
                 shutil.rmtree(d)
 
 
+class ResizeRules(unittest.TestCase):
+    """TASK-007.01: the oversize ALERT's suggestion, the resize floor and how a resize shows (no daemon)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.j = load()
+        cls.tmp = own_tmpdir()
+        cls.addClassCleanup(remove_own_dir, cls.tmp)
+        cls.s = settings(cls.j, cls.tmp, ram_hard_factor=1.25)
+
+    def test_new_settings_have_defaults_and_are_checked(self):
+        self.assertEqual((self.s["oversize_after_min"], self.s["oversize_fraction"], self.s["resize_margin"]),
+                         (30, 0.5, 1.25))
+        for bad in ({"oversize_fraction": 0}, {"oversize_fraction": 1.5}, {"resize_margin": 0.9},
+                    {"oversize_after_min": 0.5}):
+            with self.assertRaises(self.j.JobError):
+                settings(self.j, self.tmp, **bad)
+
+    def test_the_suggestion_is_the_like_size_and_covers_the_floor(self):
+        # the audit's job: 64 GB asked, 26.5 GB used; --like would give 26.5 x 1.25 = 33.1 GB
+        got = self.j._resize_suggestion(self.s, 26.5 * GB, 20 * GB)
+        self.assertEqual(self.j._size_arg(got), "33.2G")
+        self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._parse_size("33.2G")),
+                                self.j._resize_floor(self.s, 26.5 * GB, 20 * GB))
+        # a job using more now than its peak times the margin is never offered a limit below its use
+        self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._resize_suggestion(self.s, 10 * GB, 40 * GB)), 40 * GB)
+
+    def test_the_exit_137_hint_is_only_for_a_size_that_was_not_measured(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=5 * GB)], [], [], 100)
+        ok, why = self.j.fits(self.s, r, held(ram=8 * GB))
+        self.assertFalse(ok)
+        self.assertNotIn("exit 137", why)  # the reason itself, which younger jobs embed, has no hint
+        lack = self.j._lack(self.s, r, held(ram=8 * GB))
+        hint = self.j._ram_hint(held(ram=8 * GB, size_source="explicit"), lack)
+        self.assertIn("ends in exit 137", hint)
+        self.assertIn("--pilot, then --like", hint)
+        self.assertIsNone(self.j._ram_hint(held(ram=8 * GB, size_source="like"), lack))  # sized from a measured run
+        self.assertIsNone(self.j._ram_hint(held(ram=8 * GB, size_source="explicit"), {"cpu": 1.0}))  # not short of RAM
+        self.assertIsNone(self.j._ram_hint(held(pilot=True), {"ram": GB}))
+
+    def test_a_pilot_needs_its_ram_floor(self):
+        self.assertEqual(self.s["pilot"]["ram_floor_gb"], 16)
+        r = self.j.compute_room(self.s, [sample(100, avail=11 * GB)], [], [], 100)  # 10 GB of room
+        ok, why = self.j.fits(self.s, r, held(pilot=True))
+        self.assertFalse(ok)
+        self.assertIn("a pilot needs at least 16.0 GB of RAM room (pilot.ram_floor_gb), 10.0 GB free", why)
+        r = self.j.compute_room(self.s, [sample(100, avail=17 * GB)], [], [], 100)
+        self.assertTrue(self.j.fits(self.s, r, held(pilot=True))[0])
+        cap = {"mem_total": 12 * GB, "threads": 8, "gpus": []}
+        self.assertIn("a pilot needs at least 16.0 GB", self.j.fits_empty(self.s, cap, held(pilot=True)))
+
+    def test_a_pilot_stopped_at_its_time_limit_has_its_own_verdict(self):
+        v = self.j.scope_verdict("KILLED", 137, {"how": "killed", "stopped_by": "pilot time limit"})
+        self.assertEqual(v[:2], ("PILOT_TIME_LIMIT", 207))
+        self.assertNotIn(207, [c for k, c in self.j.EXIT.items() if k != "PILOT_TIME_LIMIT"])
+        self.assertEqual(self.j.scope_verdict("KILLED", 137, {"how": "killed", "stopped_by": "stop-at"})[:2],
+                         ("KILLED", 137))
+
+    def test_a_start_estimate_from_projected_ends(self):
+        est = self.j.start_estimate
+        running = [(2000.0, {"ram": 3 * GB, "cpu": 2}, "T-b"), (1000.0, {"ram": 3 * GB, "cpu": 1}, "T-a")]
+        self.assertEqual(est({"ram": 2 * GB}, running), ((1000.0, "T-a"), None))
+        self.assertEqual(est({"ram": 5 * GB, "cpu": 1}, running), ((2000.0, "T-b"), None))
+        got, why = est({"ram": 5 * GB}, running + [(None, {"ram": GB}, "T-c")])
+        self.assertEqual(got, (2000.0, "T-b"))  # enough frees before the job without a projected end matters
+        got, why = est({"ram": 7 * GB}, running + [(None, {"ram": GB}, "T-c")])
+        self.assertIsNone(got)
+        self.assertIn("no projected end", why)
+        self.assertIn("not held by running jobs", est({"ram": 10 * GB}, running)[1])
+        self.assertIn("busy disk", est({"disk:sda": 0.0}, running)[1])
+        gpu = [(500.0, {"gpu:a": 4 * GB}, "T-a"), (300.0, {"gpu:b": 4 * GB}, "T-b")]
+        self.assertEqual(est({"gpu:a": 2 * GB, "gpu:b": GB}, gpu, 1, 0)[0], (300.0, "T-b"))  # either card will do
+        self.assertEqual(est({"gpu:a": 2 * GB, "gpu:b": GB}, gpu, 2, 0)[0], (500.0, "T-a"))  # it needs both
+
+    def test_a_busy_gpu_does_not_hide_an_estimate_for_another_card(self):
+        est = self.j.start_estimate
+        gpu = [(300.0, {"gpu:b": 4 * GB}, "T-b")]
+        self.assertEqual(est({"gpu:a": 0.0, "gpu:b": GB}, gpu, 1, 0)[0], (300.0, "T-b"))
+        got, why = est({"gpu:a": 0.0, "gpu:b": GB}, gpu, 2, 0)
+        self.assertIsNone(got)
+        self.assertIn("1 of the GPUs it could use is busy", why)
+
+    def test_a_pilot_short_only_of_cpu_gets_a_cpu_estimate(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=40 * GB, busy=7.5)], [], [], 100)
+        lack = self.j._lack(self.s, r, held(cpus=2, pilot=True))
+        self.assertEqual(set(lack), {"cpu"})  # it has its RAM floor, so it lacks no RAM
+        got, why = self.j.start_estimate(lack, [(900.0, {"ram": GB, "cpu": 2}, "T-a")])
+        self.assertEqual(got, (900.0, "T-a"), why)
+
+    def test_a_pilot_lacks_the_ram_it_is_short_of_its_floor(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=11 * GB)], [], [], 100)  # 10 GB of room, floor 16 GB
+        self.assertAlmostEqual(self.j._lack(self.s, r, held(pilot=True))["ram"], 6 * GB, delta=1e6)
+
+    def test_an_estimate_past_its_projected_end_says_any_time_now(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=5 * GB)], [], [], 100)
+        q = held(ram=8 * GB)
+        evil = "T-\x1b[31mred\x07" + "x" * 200
+        text = self.j.Loop._estimate_text(None, q, r, {"ram": GB}, [(1000.0, {"ram": 2 * GB}, evil)], 5000.0)
+        self.assertIn("past its projected end", text)
+        self.assertIn("any time now", text)
+        self.assertNotIn("should free about", text)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x07", text)
+        self.assertIn("T-[31mred" + "x" * 48 + "...", text)  # cut to 60 characters
+        text = self.j.Loop._estimate_text(None, q, r, {"ram": GB}, [(9000.0, {"ram": 2 * GB}, "T-a")], 5000.0)
+        self.assertIn("should free about", text)
+
+    def test_the_suggestion_always_parses_to_an_accepted_limit(self):
+        # a floor of 5.125 GB wants 4.1 GB at 1.25x, and "4.1G" parses to 4099999999 bytes, one under
+        for kernel_peak in range(10 ** 9, 6 * 10 ** 9, 7777777):
+            n = self.j._resize_suggestion(self.s, GB, 0, kernel_peak)
+            self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._parse_size(self.j._size_arg(n))),
+                                    self.j._resize_floor(self.s, GB, 0, kernel_peak), kernel_peak)
+        self.assertGreaterEqual(self.j._resize_floor(self.s, GB, 0, 5 * GB), 5 * GB)  # memory.peak counts
+
+    def test_a_held_resize_restarts_the_fairness_measure(self):
+        adm = self.j.Admission(self.s)
+        q = {"token": "c" * 32, "size": {"cpus": 1, "ram": 8 * GB}, "fair_base": {"ram": GB}, "fair_base_at": 100.0,
+             "fair_passed": {"d" * 32: {"ram": 1}}, "state": "held"}
+        adm.write_json(adm.resize_path(q["token"]), {"size": {"cpus": 1, "ram": 2 * GB},
+                                                     "resized": [{"t": 50.0}]})
+        self.assertEqual(adm.overlay(dict(q))["fair_base"], {"ram": GB})  # a resize older than the measure
+        adm.write_json(adm.resize_path(q["token"]), {"size": {"cpus": 1, "ram": 2 * GB},
+                                                     "resized": [{"t": 50.0}, {"t": 200.0}]})
+        got = adm.overlay(dict(q))
+        self.assertNotIn("fair_base", got)
+        self.assertNotIn("fair_passed", got)
+        os.remove(adm.resize_path(q["token"]))
+
+    def test_like_last_prefers_the_newest_run_that_exited_0(self):
+        adm = self.j.Admission(self.s)
+        cap = {"mem_total": 64 * GB, "threads": 8, "gpus": []}
+        con = adm.db()
+        rows = [("1" * 32, "T-last", "exit", 0, 1000.0, 2 * GB), ("2" * 32, "T-last", "pilot time limit", None, 2000.0,
+                                                                   GB // 2)]
+        for tok, task, how, ex, ended, peak in rows:
+            con.execute("INSERT INTO jobs (token, task, how, exit, ended, peak_ram, peak_cpu, peak_samples, gpus) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 1.0, 10, '[]')", (tok, task, how, ex, ended, peak))
+        con.execute("INSERT INTO jobs (token, task, how, exit, ended, peak_ram, peak_cpu, peak_samples, gpus) "
+                    "VALUES (?, 'T-pilot-only', 'pilot time limit', NULL, 3000.0, ?, 1.0, 10, '[]')", ("3" * 32, GB))
+        con.commit()
+        con.close()
+        size, source, _, like_from = self.j._size_from(self.s, adm, cap, {"task": "T-last", "admission": {"like": "last"}})
+        self.assertEqual(like_from, "1" * 32)  # the older complete run, not the newer pilot
+        self.assertEqual(size["ram"], int(2 * GB * 1.25))
+        like_from = self.j._size_from(self.s, adm, cap, {"task": "T-pilot-only", "admission": {"like": "last"}})[3]
+        self.assertEqual(like_from, "3" * 32)  # no run exited 0: the pilot
+        self.assertIn("pilot stopped at its time limit", self.j._like_source_text(adm, "3" * 32))
+
+    def test_what_a_held_job_lacks(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=5 * GB, busy=7.0, gpus={CARD: card(20 * GB)})], [], [], 100)
+        lack = self.j._lack(self.s, r, held(cpus=3, ram=4 * GB, gpus=1, gpu_mem=6 * GB))
+        self.assertAlmostEqual(lack["ram"], self.j.ram_limit(self.s, 4 * GB) - 4 * GB, delta=1e6)
+        self.assertAlmostEqual(lack["cpu"], 2.0)
+        self.assertAlmostEqual(lack["gpu:" + CARD], 6 * GB - 3.5 * GB, delta=1e6)
+        self.assertEqual(self.j._lack(self.s, r, held(cpus=1, ram=GB)), {})
+        self.assertEqual(settings(self.j, self.tmp)["fairness_small_fraction"], 0.1)
+
+    def test_history_shows_the_size_it_ended_with_and_that_it_was_resized(self):
+        j = {"pilot": 0, "size": {"cpus": 4, "ram": 32 * GB, "gpus": 0, "gpu_mem": 0},
+             "resized": [{"t": 1.0, "state": "released", "from": {"cpus": 8, "ram": 64 * GB},
+                          "to": {"cpus": 4, "ram": 32 * GB}}]}
+        self.assertEqual(self.j._history_size(j), "4 CPU, 32.0 GB, resized from 8 CPU, 64.0 GB")
+
+    def test_an_oversize_alert_gives_the_exact_command(self):
+        w = self.j.Waiter("h1", 14, token="f" * 32)
+        w.alert_cursor = 0
+        alert = {"kind": "oversize", "message": "oversized: ...", "resize": {"ram": "33.2G"}}
+        self.j.call = lambda host, op, req, timeout=120: {"found": True, "status": "Running", "token": "f" * 32,
+                                                          "alert_count": 1, "alerts": [alert], "log_size": 0}
+        o = w.step()
+        self.assertEqual(o["verdict"], "ALERT")
+        self.assertIn("job resize h1 14 --token %s --ram 33.2G" % ("f" * 32), o["note"])
+
+    def test_resize_on_a_host_that_predates_it(self):
+        import argparse
+
+        def old_host(host, op, req, timeout=120):
+            raise self.j.JobError("h1: no reply from job on the host (exit 2): usage: job ... invalid choice")
+        self.j.call = old_host
+        with self.assertRaises(self.j.JobError) as e:
+            self.j.cmd_resize(argparse.Namespace(host="h1", id=3, token=None, ram=GB, cpus=None))
+        self.assertIn("predates job resize", str(e.exception))
+
+
 class FakeHost:
-    """A fake /proc (stat, meminfo, pressure, diskstats) and GPU list that a test can change between cycles."""
+    """A fake /proc (stat, meminfo, pressure, vmstat, diskstats) and GPU list that a test can change between
+    cycles."""
 
     def __init__(self, root, threads=8):
         self.root, self.threads = root, threads
         self.proc = os.path.join(root, "proc")
         os.makedirs(os.path.join(self.proc, "pressure"), exist_ok=True)
         self.gpu_file = os.path.join(root, "gpus.json")
+        self.cgroups = os.path.join(root, "cgroup")
+        os.makedirs(self.cgroups, exist_ok=True)
         self.ticks = 0
-        self.set(avail=50 * GB, busy=0.0, cards=[])
+        self.fake_psi = {}  # {cgroup dir: [full10, full60, total]}: a stalling cgroup's stall time grows each tick
+        self.set(avail=50 * GB, busy=0.0, cards=[], allocstall=0)
 
-    def set(self, avail=None, busy=None, psi=None, cards=None, procs=None):
+    def set(self, avail=None, busy=None, psi=None, cards=None, procs=None, allocstall=None):
         if avail is not None:
             with open(os.path.join(self.proc, "meminfo"), "w") as f:
                 f.write("MemTotal: %d kB\nMemAvailable: %d kB\n" % (64 * GB // 1024, avail // 1024))
         if busy is not None:
             self.busy = busy
+        if allocstall is not None:  # global direct reclaim so far: unchanged, the host is not in global reclaim
+            with open(os.path.join(self.proc, "vmstat"), "w") as f:
+                f.write("nr_free_pages 1000\nallocstall_normal 0\nallocstall_movable %d\n" % allocstall)
         with open(os.path.join(self.proc, "pressure", "memory"), "w") as f:
             f.write("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
                     "full avg10=%.2f avg60=0.00 avg300=0.00 total=0\n" % (psi or 0.0))
@@ -674,7 +855,13 @@ class FakeHost:
         self.tick()
 
     def tick(self):
-        """Advance the CPU counters by one second at the current busy level."""
+        """Advance the CPU counters by one second at the current busy level, and the stall time of each stalling
+        fake cgroup."""
+        for d, v in self.fake_psi.items():
+            v[2] += int(v[0] * 10000)
+            with open(os.path.join(d, "memory.pressure"), "w") as f:
+                f.write("some avg10=%.2f avg60=%.2f avg300=0.00 total=%d\nfull avg10=%.2f avg60=%.2f avg300=0.00 "
+                        "total=%d\n" % (v[0], v[1], v[2], v[0], v[1], v[2]))
         self.ticks += 100
         busy = int(self.busy * 100) * (self.ticks // 100)
         total = self.threads * self.ticks
@@ -719,13 +906,17 @@ class LoopTests(Base):
     def env(self):
         return {"JOB_ADMISSION_CONFIG": self.cfg, "JOB_TEST_PROC": self.host.proc, "JOB_TEST_GPUS": self.host.gpu_file}
 
-    def loop(self, clock=time.time):
-        m = self.j.Measure(proc=self.host.proc, gpu_file=self.host.gpu_file)
+    def loop(self, clock=time.time, psi_root=None):
+        # memory pressure is read from a fake cgroup tree (empty unless a test fills it, so the fake /proc figure is
+        # used), never this machine's: its real pressure would make the tests depend on what else runs here
+        m = self.j.Measure(proc=self.host.proc, gpu_file=self.host.gpu_file, psi_root=psi_root or self.host.cgroups)
         return self.j.Loop(self.settings, measure=m, clock=clock)
 
-    def submit_sized(self, command, protocol=5, **admission):
+    def submit_sized(self, command, protocol=5, group=None, **admission):
         req = {"protocol": protocol, "command": command, "task": "T-adm", "cwd": self.d.dir, "session": "test",
                "from": "test", "env": {}, "admission": admission}
+        if group:
+            req["group"] = group
         p = subprocess.run([sys.executable, JOB, "_host", "submit"], input=json.dumps(req), capture_output=True,
                            text=True, env=self.d.env(**self.env()), timeout=60)
         return json.loads(p.stdout.strip().splitlines()[-1])
@@ -838,7 +1029,10 @@ class LoopTests(Base):
         self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
         rec = self.record(tok)
         self.assertEqual(rec["how"], "pilot time limit")
-        self.assertIn("stopped this pilot at its time limit, as planned", self.wait(tid, tok).stdout)
+        w = self.wait(tid, tok)
+        self.assertIn("stopped this pilot at its time limit, as planned", w.stdout)
+        self.assertEqual(w.returncode, 207, w.stdout)  # its own verdict, not 137 (an out-of-memory kill)
+        self.assertIn("job: PILOT_TIME_LIMIT local#%d" % tid, w.stdout)
         self.assertGreaterEqual(rec["peak_ram"], 60 * MiB)
         r2 = self.submit_sized("echo sized", like=tok)
         self.assertTrue(r2["ok"], r2)
@@ -846,6 +1040,37 @@ class LoopTests(Base):
             q = json.load(f)
         self.assertEqual(q["size_source"], "like")
         self.assertGreaterEqual(q["size"]["ram"], 60 * MiB * 1.25)
+        # --like last: the last good run of the same task id here, named with its peaks
+        r3 = self.submit_sized("echo sized-last", like="last")
+        self.assertTrue(r3["ok"], r3)
+        self.assertIn("no run of T-adm here exited 0, so it is sized from the newest pilot that reached its time limit, #%d of session "
+                      "test (pilot stopped at its time limit" % tid, r3["data"]["sized"])
+        self.assertIn("peaks", r3["data"]["sized"])
+        with open(os.path.join(self.settings["state_dir"], "queue", r3["data"]["token"] + ".json")) as f:
+            self.assertEqual(json.load(f)["like_from"], tok)
+        for r in (r2, r3):
+            self.d.pueue("remove", str(r["data"]["id"]))
+
+    def test_like_last_without_a_good_run_is_refused(self):
+        r = self.submit_sized("true", like="last")
+        self.assertFalse(r["ok"], r)
+        self.assertIn("--like last: no run of T-adm", r["error"])
+
+    def test_a_pilot_waits_for_its_ram_floor(self):
+        self.write_settings(pilot={"max_minutes": 1, "ram_floor_gb": 8})
+        self.host.set(avail=6 * GB)  # 5 GB of room, under the 8 GB floor
+        loop = self.loop()
+        r = self.submit_sized("echo pilot-ran", pilot=True)
+        tid = r["data"]["id"]
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertEqual(self.status(tid), "Stashed")
+        with open(os.path.join(self.state, "room.json")) as f:
+            self.assertIn("a pilot needs at least 8.0 GB of RAM room", json.load(f)["held"][0]["reason"])
+        self.host.set(avail=10 * GB)
+        loop.samples = []
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
 
     def test_like_refuses_a_run_killed_for_memory(self):
         loop = self.loop()
@@ -875,6 +1100,16 @@ class LoopTests(Base):
         with open(os.path.join(self.settings["state_dir"], "alerts", r["data"]["token"] + ".jsonl")) as f:
             alerts = [json.loads(x) for x in f]
         self.assertEqual([a["kind"] for a in alerts], ["group_paused"])
+        self.assertIn("job resume", alerts[0]["message"])
+        self.assertNotIn("pueue start", alerts[0]["message"])
+        self.assertEqual(alerts[0]["resume"], {"group": "padm"})
+        w = self.j.Waiter("local", r["data"]["id"], token=r["data"]["token"])
+        w.alert_cursor = 0
+        self.j.call = lambda h, op, req, **kw: {"found": True, "status": "Stashed", "id": r["data"]["id"],
+                                                 "alert_count": 1, "alerts": alerts, "token": r["data"]["token"]}
+        out = w.step()
+        self.assertEqual(out["verdict"], "ALERT")
+        self.assertIn("job resume local --group padm", out["note"])
         self.d.pueue("start", "--group", "padm")
 
     def test_older_job_short_of_room_blocks_younger_after_the_fairness_wait(self):
@@ -988,7 +1223,7 @@ class LoopTests(Base):
             self.d.pueue("start", "--group", "palert")
         self.assertEqual(w.returncode, 201, out + err)
         self.assertIn("job: ALERT", out)
-        self.assertIn("its pueue group palert is paused", out)
+        self.assertIn("its pueue group palert on local is paused; start it with: job resume local --group palert", out)
 
     def test_auto_places_on_a_host_with_room_or_holds(self):
         loop = self.loop()
@@ -1249,6 +1484,81 @@ class LoopTests(Base):
         finally:
             svc.kill()
             svc.wait()
+
+    def fake_process(self, pid, start):
+        d = os.path.join(self.host.proc, str(pid))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "stat"), "w") as f:
+            f.write("%d (svc) S 1 %d %d 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 %d 0 0\n" % (pid, pid, pid, start))
+        return d
+
+    def test_a_reload_right_after_its_process_exits_is_not_refused_against_its_own_dead_hold(self):
+        loop = self.loop()
+        self.host.set(avail=50 * GB)
+        self.host.tick()
+        loop.cycle()
+        d = self.fake_process(6161, 100)
+        first = self.hold("--ram", "30G", "--name", "svc", "--while-pid", "6161")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.host.tick()
+        loop.cycle()  # the snapshot now counts the hold: 49 - 30 = 19 GB left
+        self.assertAlmostEqual(loop.room["ram"]["room"], 19 * GB, delta=2 * MiB)
+        os.remove(os.path.join(d, "stat"))  # the service exits and reloads at once, before the loop's next cycle
+        self.fake_process(6162, 200)
+        again = self.hold("--ram", "30G", "--name", "svc", "--while-pid", "6162")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        holds = os.listdir(os.path.join(self.state, "holds"))
+        self.assertEqual(holds, [again.stdout.strip() + ".json"])  # the dead hold was ended, not left to the loop
+        con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"))
+        how = con.execute("SELECT how FROM holds WHERE id = ?", (first.stdout.strip(),)).fetchone()[0]
+        con.close()
+        self.assertEqual(how, "process 6161 exited")
+        big = self.hold("--ram", "25G", "--name", "other")  # the live hold still counts: 19 GB is left
+        self.assertEqual(big.returncode, 206, big.stdout + big.stderr)
+
+    def test_a_reload_after_the_loop_itself_ended_the_dead_hold_is_not_refused(self):
+        loop = self.loop()
+        self.host.set(avail=50 * GB)
+        self.host.tick()
+        loop.cycle()
+        d = self.fake_process(6181, 100)
+        first = self.hold("--ram", "30G", "--name", "svc", "--while-pid", "6181")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.host.tick()
+        loop.cycle()
+        self.assertAlmostEqual(loop.room["ram"]["room"], 19 * GB, delta=2 * MiB)
+        os.remove(os.path.join(d, "stat"))  # the service exits; the loop's next cycle ends its hold
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(loop.holds, [])
+        self.assertAlmostEqual(loop.room["ram"]["room"], 49 * GB, delta=2 * MiB)  # what it counted came back
+        self.fake_process(6182, 200)
+        again = self.hold("--ram", "30G", "--name", "svc", "--while-pid", "6182")  # the reload, right after
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+
+    def test_the_grant_asks_systemd_outside_the_queue_lock(self):
+        with open(JOB) as f:
+            src = f.read()
+        body = src[src.index("def host_hold(req):"):src.index("def _gone_hold_cgroups(adm):")]
+        self.assertLess(body.index("_gone_hold_cgroups(adm)"), body.index('adm.lock("queue.lock")'))
+        dead = src[src.index("def _end_dead_holds("):src.index("def _holds(adm):")]
+        self.assertNotIn("_hold_cgroups(", dead)
+
+    def test_a_gpu_hold_whose_process_exited_is_credited_back_on_its_card(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        d = self.fake_process(6171, 100)
+        first = self.hold("--gpu", "0", "--mem", "18G", "--name", "model", "--while-pid", "6171")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.host.tick()
+        loop.cycle()
+        refused = self.hold("--gpu", "0", "--mem", "18G", "--name", "model2")
+        self.assertEqual(refused.returncode, 206, refused.stdout + refused.stderr)
+        os.remove(os.path.join(d, "stat"))
+        again = self.hold("--gpu", "0", "--mem", "18G", "--name", "model")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
 
     def test_a_hold_granted_during_a_cycle_counts_as_a_hold_on_its_card(self):
         self.model_card()
@@ -1943,6 +2253,390 @@ class LoopTests(Base):
                 svc.kill()
             subprocess.run(["systemctl", "--user", "reset-failed", unit], env=env, capture_output=True)
 
+    # -- TASK-007.01: oversized jobs and job resize ------------------------------------------------------------
+
+    def queue_file(self, tok):
+        with open(os.path.join(self.state, "queue", tok + ".json")) as f:
+            return json.load(f)
+
+    def test_an_oversized_running_job_alerts_and_shrinks(self):
+        self.write_settings(oversize_after_min=1)
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized("python3 -c 'b = bytearray(60 * 1024 * 1024); import time; time.sleep(300)'",
+                              cpus=2, ram=400 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        try:
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+            self.assertTrue(self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= 60 * MiB
+                                        and loop.peaks[tok]["n"] >= 3, n=40))
+            w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(tid), "--token", tok, "--poll", "0.3"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                 env=self.d.env(**self.env()))
+            time.sleep(1.5)
+            now[0] += 61  # past oversize_after_min
+            self.host.tick()
+            loop.cycle()
+            out, err = w.communicate(timeout=60)
+            self.assertEqual(w.returncode, 201, out + err)
+            self.assertIn("oversized", out)
+            m = __import__("re").search(r"exact command: job resize local %d --token %s --ram (\S+)\)" % (tid, tok), out)
+            self.assertTrue(m, out)
+            suggest = m.group(1)
+            room = self.job("room", "local", **self.env()).stdout
+            self.assertIn("oversized: its RAM peaked at", room)
+            self.assertIn("job resize local %d --token %s --ram %s" % (tid, tok, suggest), room)
+            # refused: growing, and a limit under the measured peak times resize_margin
+            p = self.job("resize", "local", str(tid), "--ram", "500Mi", **self.env())
+            self.assertEqual(p.returncode, 205, p.stdout)
+            self.assertIn("can only shrink", p.stdout)
+            p = self.job("resize", "local", str(tid), "--ram", "40Mi", **self.env())
+            self.assertIn("the smallest size accepted", p.stdout)
+            p = self.job("resize", "local", str(tid), "--token", "0" * 32, "--ram", suggest, **self.env())
+            self.assertIn("belongs to a different job", p.stdout)
+            # the suggested size is accepted: the limit is lowered at once, the count from the next cycle
+            p = self.job("resize", "local", str(tid), "--token", tok, "--ram", suggest, "--cpus", "1", **self.env())
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            new = self.j._parse_size(suggest)
+            limit = self.j.ram_limit(self.settings, new)
+            with open(os.path.join(loop.m.scopes()[tok], "job", "memory.max")) as f:
+                self.assertEqual(int(f.read()), limit)
+            self.host.tick()
+            loop.cycle()
+            with open(os.path.join(self.state, "room.json")) as f:
+                j = [x for x in json.load(f)["jobs"] if x["token"] == tok][0]
+            self.assertEqual(j["ram_counted"], limit)
+            self.assertEqual(j["size"]["ram"], new)
+            self.assertEqual(j["size"]["cpus"], 1)
+            self.assertEqual(self.queue_file(tok)["memory_max"], limit)  # the loop keeps it in the queue file too
+        finally:
+            self.job("kill", "local", str(tid))
+        self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+        rec = self.record(tok)
+        self.assertEqual(rec["memory_max"], limit)
+        self.assertEqual(json.loads(rec["size"])["ram"], new)
+        h = self.job("history", "local", "--token", tok, **self.env()).stdout
+        self.assertIn("resized from 2 CPU, 0.4 GB", h)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "resize", tok + ".json")))
+
+    def test_a_held_job_is_resized_in_place(self):
+        self.host.set(avail=3 * GB)
+        loop = self.loop()
+        r = self.submit_sized("echo resized-held", cpus=1, ram=4 * GB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        submitted = self.queue_file(tok)["submitted"]
+        con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"))
+        con.execute("INSERT INTO jobs (token, task, pueue_id, ended, peak_ram, peak_samples) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("e" * 32, "T-adm", 99, time.time() - 600, 1.5 * GB, 50))
+        con.commit()
+        con.close()
+        try:
+            p = self.job("resize", "local", str(tid), "--ram", "1G", **self.env())
+            self.assertEqual(p.returncode, 205, p.stdout)
+            self.assertIn("below the RAM peak of 1.5 GB of an earlier run of T-adm here (#99, token %s" % ("e" * 32),
+                          p.stdout)
+            p = self.job("resize", "local", str(tid), "--ram", "100G", **self.env())
+            self.assertIn("even when it is empty", p.stdout)
+            p = self.job("resize", "local", str(tid), "--ram", "1.6G", **self.env())
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("keeps its place", p.stdout)
+            self.host.set(avail=4 * GB)  # 3 GB room: the old size (6 GB limit) would not fit, the new (2.4 GB) does
+            loop.samples = []
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
+            self.assertEqual(self.wait(tid, tok).returncode, 0)
+            self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+            rec = self.record(tok)
+            self.assertEqual(rec["submitted"], submitted)  # its place in the queue did not change
+            self.assertEqual(rec["memory_max"], self.j.ram_limit(self.settings, int(1.6 * GB)))
+            self.assertEqual(json.loads(rec["resized"])[0]["from"]["ram"], 4 * GB)
+        finally:
+            if self.status(tid) != "Done":
+                self.d.pueue("remove", str(tid))
+
+    def test_a_pilot_is_not_resized(self):
+        self.host.set(avail=3 * GB)
+        r = self.submit_sized("true", pilot=True)
+        self.assertTrue(r["ok"], r)
+        try:
+            p = self.job("resize", "local", str(r["data"]["id"]), "--ram", "1G", **self.env())
+            self.assertEqual(p.returncode, 205, p.stdout)
+            self.assertIn("is a pilot", p.stdout)
+        finally:
+            self.d.pueue("remove", str(r["data"]["id"]))
+
+    # -- TASK-007.04: held messages ----------------------------------------------------------------------------
+
+    def test_the_first_held_line_gives_the_real_reason(self):
+        self.host.set(avail=3 * GB)
+        r = self.submit_sized("true", cpus=1, ram=4 * GB)  # no loop has run here: no heartbeat, no snapshot
+        self.assertIn("the admission loop on this host is not running", r["data"]["held_reason"])
+        self.d.pueue("remove", str(r["data"]["id"]))
+        adm = self.j.Admission(self.settings)
+        adm.write_json(adm.path("heartbeat"), {"t": time.time()})  # a loop that runs, before its first snapshot
+        r = self.submit_sized("true", cpus=1, ram=4 * GB)
+        self.assertIn("the admission loop is measuring this host", r["data"]["held_reason"])
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.job("submit", "local", "T-held", "--cpus", "1", "--ram", "4G", "--", "true", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        tid = int(p.stdout.strip())
+        self.assertIn("held: needs 6.0 GB RAM (its limit, 1.5 times its size)", p.stderr)
+        ls = self.job("ls", "local", **self.env()).stdout
+        self.assertNotIn("not looked at", ls)
+        for x in (r["data"]["id"], tid):
+            self.d.pueue("remove", str(x))
+
+    # -- TASK-007.02: small younger jobs pass the fairness rule ------------------------------------------------
+
+    def test_a_small_younger_job_passes_an_older_one_that_waits(self):
+        now = [time.time()]
+        self.host.set(avail=12 * GB)
+        loop = self.loop(clock=lambda: now[0])
+        first = self.submit_sized("sleep 60", cpus=1, ram=4 * GB)  # runs, counted at its 6 GB limit: 5 GB left
+        self.assertTrue(self.cycles(loop, lambda: self.status(first["data"]["id"]) == "Running"))
+        big = self.submit_sized("echo big", cpus=1, ram=4 * GB)    # lacks 1 GB of RAM
+        now[0] += 120  # past the one-minute fairness wait
+        # each tiny job is counted at 60 MB, under a tenth of what the oldest lacks; two of them are not
+        tiny = [self.submit_sized("sleep 30", cpus=0.1, ram=40 * 10 ** 6) for _ in range(2)]
+        try:
+            for _ in range(3):
+                self.host.tick()
+                loop.cycle()
+            self.assertEqual(self.status(big["data"]["id"]), "Stashed")
+            self.assertIn(self.status(tiny[0]["data"]["id"]), ("Running", "Done", "Queued"))
+            self.assertEqual(self.status(tiny[1]["data"]["id"]), "Stashed")
+            with open(os.path.join(self.state, "room.json")) as f:
+                reasons = {h["token"]: h["reason"] for h in json.load(f)["held"]}
+            why = reasons[tiny[1]["data"]["token"]]
+            # TASK-007.04: it names the older job and what that job needs, and says no start can be estimated
+            self.assertIn("waiting behind an older job, T-adm (token %s), that needs: needs 6.0 GB RAM"
+                          % big["data"]["token"], why)
+            self.assertIn("start estimate: none known: a running job that holds that room has no projected end", why)
+            self.assertNotIn("exit 137", why)  # the older job's hint is its own, said once
+        finally:
+            for r in [first] + tiny:
+                self.job("kill", "local", str(r["data"]["id"]))
+            self.d.pueue("remove", str(big["data"]["id"]))
+
+    # -- review 1 of TASK-007.01-04 ------------------------------------------------------------------------------
+
+    def running_job(self, command="python3 -c 'b = bytearray(60 * 1024 * 1024); import time; time.sleep(300)'",
+                    min_peak=60 * MiB, **over):
+        """A job sized 2 CPU, 400 MiB, running and measured at least 3 times, with a loop on a settable clock."""
+        self.write_settings(oversize_after_min=1, **over)
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized(command, cpus=2, ram=400 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.addCleanup(lambda: self.job("kill", "local", str(tid)))
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+        self.assertTrue(self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= min_peak
+                                    and loop.peaks[tok]["n"] >= 3, n=40))
+        return loop, tid, tok, now
+
+    def drop(self, tid):
+        """Remove a test's held task, if it is still there."""
+        subprocess.run(["pueue", "-c", self.d.cfg, "remove", str(tid)], capture_output=True)
+
+    def memory_max(self, loop, tok):
+        with open(os.path.join(loop.m.scopes()[tok], "job", "memory.max")) as f:
+            return int(f.read())
+
+    def counted(self, tok):
+        with open(os.path.join(self.state, "room.json")) as f:
+            return [x for x in json.load(f)["jobs"] if x["token"] == tok][0]["ram_counted"]
+
+    def test_an_out_of_memory_verdict_names_the_limit_it_ended_under(self):
+        loop, tid, tok, now = self.running_job(
+            "python3 -c 'import time; b = bytearray(60 * 1024 * 1024); time.sleep(12); "
+            "c = bytearray(300 * 1024 * 1024); c[::4096] = b\"x\" * len(c[::4096]); time.sleep(100)'")
+        p = self.job("resize", "local", str(tid), "--ram", "100Mi", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        limit = self.j.ram_limit(self.settings, 100 * MiB)
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done", n=120))
+        p = self.wait(tid, tok)
+        self.assertIn("over its RAM limit of %s" % self.j._gb(limit), p.stdout)
+        self.assertNotIn(self.j._gb(self.j.ram_limit(self.settings, 400 * MiB)), p.stdout)
+        self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+        final = self.j._read_kv(os.path.join(self.j.STATE_DIR, "results", tok + ".final"))
+        self.assertLess(abs(int(final["memory.max"]) - limit), 65536)  # the shim read the limit at its end
+        self.assertEqual(self.record(tok)["memory_max"], int(final["memory.max"]))
+        self.assertEqual(self.record(tok)["how"], "memory limit")
+
+    def test_a_cpus_only_resize_never_raises_the_ram_limit(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        self.host.tick()
+        loop.cycle()
+        counted = self.counted(tok)
+        self.write_settings(oversize_after_min=1, ram_hard_factor=2.0)  # changed since the job was released
+        p = self.job("resize", "local", str(tid), "--cpus", "1", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(self.counted(tok), counted)
+        # a --ram whose limit by the new factor is above the limit it runs under is refused
+        p = self.job("resize", "local", str(tid), "--ram", "350Mi", **self.env())
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("never raised", p.stdout)
+        self.assertEqual(self.memory_max(loop, tok), was)
+
+    def test_a_running_resize_whose_scope_is_not_found_is_refused_and_changes_nothing(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        self.host.tick()
+        loop.cycle()
+        counted = self.counted(tok)
+        env = dict(self.env(), JOB_TEST_CGROUP="/nonexistent")
+        p = self.job("resize", "local", str(tid), "--ram", "300Mi", **env)
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("not among this user's job scopes", p.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "resize", tok + ".json")))
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(self.counted(tok), counted)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        # and a recorded count below the cgroup's real limit (as that resize left it) counts at the real limit
+        q = self.queue_file(tok)
+        q.update(memory_max=150 * MiB, ram_counted=150 * MiB)
+        with open(os.path.join(self.state, "queue", tok + ".json"), "w") as f:
+            json.dump(q, f)
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(self.memory_max(loop, tok), was)
+        self.assertGreaterEqual(self.counted(tok), was)
+
+    def test_the_running_floor_counts_the_kernels_peak_and_cpus_their_measured_use(self):
+        loop, tid, tok, now = self.running_job(
+            "python3 -c 'b = bytearray(200 * 1024 * 1024); b[::4096] = b\"x\" * len(b[::4096]); del b; "
+            "c = bytearray(20 * 1024 * 1024); import time; time.sleep(300)'", min_peak=15 * MiB)
+        # the spike came and went between samples: the record knows only the use now
+        con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"))
+        con.execute("UPDATE jobs SET peak_ram = ?, peak_cpu = 1.5 WHERE token = ?", (30 * MiB, tok))
+        con.commit()
+        con.close()
+        was = self.memory_max(loop, tok)
+        p = self.job("resize", "local", str(tid), "--ram", "80Mi", **self.env())  # limit 120 MiB, over 1.25 x 30 MiB
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("memory.peak", p.stdout)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        p = self.job("resize", "local", str(tid), "--cpus", "1", **self.env())
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("under its measured CPU use, 1.50 threads", p.stdout)
+
+    def test_a_job_ends_under_the_queue_lock_so_a_resize_cannot_outlive_it(self):
+        import threading
+        loop = self.loop()
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.assertTrue(self.cycles(loop, lambda: self.queue_file(tok)["state"] == "released"))
+        for _ in range(200):  # it ends; no cycle runs, so the loop has not ended it yet
+            if self.status(tid) == "Done":
+                break
+            time.sleep(0.05)
+        time.sleep(0.5)
+        adm = self.j.Admission(self.settings)
+        fd = adm.lock("queue.lock")  # a resize in progress
+        t = threading.Thread(target=lambda: (self.host.tick(), loop.cycle()))
+        try:
+            t.start()
+            time.sleep(1.5)
+            self.assertTrue(os.path.exists(os.path.join(self.state, "queue", tok + ".json")))  # the end waits
+            adm.write_json(adm.resize_path(tok), {"size": {"cpus": 1, "ram": 50 * MiB}, "resized": [{"t": 1.0}]})
+        finally:
+            os.close(fd)
+        t.join(60)
+        self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "queue", tok + ".json")))
+        self.assertFalse(os.path.exists(adm.resize_path(tok)))
+        self.assertIsNotNone(self.record(tok)["ended"])
+        # an orphan resize file (from a host before this fix) is swept
+        adm.write_json(adm.resize_path("f" * 32), {"size": {}})
+        self.host.tick()
+        loop.cycle()
+        self.assertFalse(os.path.exists(adm.resize_path("f" * 32)))
+
+    def test_a_failed_resize_changes_nothing(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        os.environ.update(self.env())  # host_resize runs in this process
+        self.addCleanup(os.environ.pop, "JOB_ADMISSION_CONFIG", None)
+        real = self.j.Admission.record
+
+        def failing(adm, con, row):
+            if "resized" in row:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(adm, con, row)
+        self.j.Admission.record = failing
+        try:
+            with self.assertRaises(self.j.JobError) as e:
+                self.j.host_resize({"id": tid, "ram": 300 * MiB})
+        finally:
+            self.j.Admission.record = real
+        self.assertIn("was not resized", str(e.exception))
+        self.assertEqual(self.memory_max(loop, tok), was)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "resize", tok + ".json")))
+        self.assertIsNone(self.record(tok)["resized"])
+
+    def test_a_held_resize_wakes_the_loop(self):
+        self.host.set(avail=3 * GB)
+        r = self.submit_sized("true", cpus=1, ram=4 * GB)
+        self.addCleanup(self.drop, r["data"]["id"])
+        q = os.path.join(self.state, "queue")
+        os.utime(q, (1.0, 1.0))
+        p = self.job("resize", "local", str(r["data"]["id"]), "--ram", "1G", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertGreater(os.path.getmtime(q), 1.0)
+
+    def test_the_first_held_line_follows_the_loops_order(self):
+        # a paused group, and a full one
+        self.d.pueue("group", "add", "rv-paused")
+        self.d.pueue("pause", "--group", "rv-paused")
+        self.d.pueue("group", "add", "rv-full")
+        self.d.pueue("parallel", "1", "--group", "rv-full")
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB, group="rv-paused")
+        self.addCleanup(self.drop, r["data"]["id"])
+        self.assertIn("its group rv-paused is paused", r["data"]["held_reason"])
+        busy = self.d.pueue("add", "--group", "rv-full", "--", "sleep", "60")
+        self.addCleanup(lambda: self.d.pueue("kill", "--group", "rv-full"))
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB, group="rv-full")
+        self.addCleanup(self.drop, r["data"]["id"])
+        self.assertIn("its group rv-full is full", r["data"]["held_reason"])
+        self.assertTrue(busy)
+
+    def test_the_first_held_line_says_when_the_fairness_rule_holds_a_job(self):
+        now = [time.time()]
+        self.host.set(avail=12 * GB)
+        loop = self.loop(clock=lambda: now[0])
+        first = self.submit_sized("sleep 60", cpus=1, ram=4 * GB)  # runs, counted at its 6 GB limit: 5 GB left
+        self.addCleanup(lambda: self.job("kill", "local", str(first["data"]["id"])))
+        self.assertTrue(self.cycles(loop, lambda: self.status(first["data"]["id"]) == "Running"))
+        big = self.submit_sized("echo big", cpus=1, ram=4 * GB)  # lacks 1 GB of RAM
+        self.addCleanup(self.drop, big["data"]["id"])
+        self.assertIn("ends in exit 137", big["data"]["held_hint"])  # its size was not measured
+        now[0] += 120
+        self.host.tick()
+        loop.cycle()
+        # fits the 5 GB room (3 GB limit), but takes far over a tenth of the 1 GB the oldest lacks
+        r = self.submit_sized("echo young", cpus=1, ram=2 * GB)
+        self.addCleanup(self.drop, r["data"]["id"])
+        self.assertIn("waiting behind an older job, T-adm (token %s)" % big["data"]["token"], r["data"]["held_reason"])
+        self.assertNotIn("exit 137", r["data"]["held_reason"])
+
+    def test_scopes_of_jobs_this_loop_did_not_admit_are_outside_use(self):
+        loop = self.loop()
+        r = self.submit_sized("sleep 30", cpus=1, ram=100 * MiB)
+        self.addCleanup(lambda: self.job("kill", "local", str(r["data"]["id"])))
+        tok = r["data"]["token"]
+        other = "a" * 32
+        got = loop.own_scopes({tok: "/x", other: "/y"})
+        self.assertEqual(got, {tok: "/x"})
+
     def test_admission_status(self):
         p = self.job("admission", "local", "status", **self.env())
         self.assertIn("settings valid", p.stdout)
@@ -1954,6 +2648,776 @@ class LoopTests(Base):
         r = self.submit_sized("true", cpus=1, ram=100 * MiB)
         self.assertFalse(r["ok"])
         self.assertIn("unknown setting ram_headroom", r["error"])
+
+
+    # -- TASK-003.09: memory pressure outside the jobs' own limits; undersized jobs ---------------------------------
+
+    def fake_pressure(self, rel, full10, full60=0.0):
+        d = os.path.join(self.host.cgroups, rel.strip("/"))
+        os.makedirs(d, exist_ok=True)
+        self.host.fake_psi[d] = [full10, full60, 0]
+        self.host.tick()
+
+    def stalled_at_its_limit(self, loop, tok, full10=30.0, full60=30.0):
+        """Make the loop read the job's own scope as stalled against its own limit (the kernel's figures, faked)."""
+        real_pressure, real_events = loop.m.cgroup_pressure, loop.m.limit_events
+        events, total = [0], [0]
+
+        def pressure(path):
+            if tok in path:
+                total[0] += 100000  # its stall time grows, sample by sample
+                return {"some": {"avg10": str(full10), "avg60": str(full60), "total": str(total[0])},
+                        "full": {"avg10": str(full10), "avg60": str(full60), "total": str(total[0])}}
+            return real_pressure(path)
+
+        def limit_events(path):
+            if tok in path:
+                events[0] += 5  # its use reached its memory.max again since the last sample
+                return events[0]
+            return real_events(path)
+        loop.m.cgroup_pressure, loop.m.limit_events = pressure, limit_events
+
+    def test_a_job_stalled_against_its_own_limit_holds_no_one_and_alerts_its_owner(self):
+        self.fake_pressure("system.slice", 0.2)
+        self.fake_pressure("user.slice/user-4242.slice", 0.5)  # under 1%: nothing outside the jobs is stalled
+        loop, tid, tok, now = self.running_job()
+        self.stalled_at_its_limit(loop, tok)
+        self.host.set(psi=22.4)  # the system-wide figure counts the job's own stall
+        w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(tid), "--token", tok, "--poll", "0.3"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.d.env(**self.env()))
+        time.sleep(1.5)
+        self.host.tick()
+        loop.cycle()
+        self.host.tick()
+        loop.cycle()
+        out, err = w.communicate(timeout=60)
+        self.assertEqual(w.returncode, 201, out + err)
+        self.assertIn("undersized: over the last minute it spent 30% of its time stalled", out)
+        self.assertIn("not host memory pressure", out)
+        room = loop.room
+        self.assertTrue(room["pressure_ok"], room)
+        self.assertEqual((room["psi"], room["psi_source"], room["psi_where"]), (0.5, "cgroups", "/user.slice/user-4242.slice"))
+        # another job is released although the system-wide figure is 22.4%
+        r = self.submit_sized("sleep 30", cpus=1, ram=100 * MiB)
+        self.addCleanup(lambda: self.job("kill", "local", str(r["data"]["id"])))
+        self.assertTrue(self.cycles(loop, lambda: self.status(r["data"]["id"]) in ("Running", "Done"), n=20))
+        text = self.job("room", "local", **self.env()).stdout
+        self.assertIn("undersized: 30% of its time stalled against its own RAM limit", text)
+        self.assertIn("memory pressure 0.5% (in /user.slice/user-4242.slice", text)
+        self.assertIn("system-wide 22.4%", text)
+        with open(os.path.join(self.state, "alerts", tok + ".jsonl")) as f:
+            self.assertEqual([json.loads(x)["kind"] for x in f], ["undersized"])  # once per job
+
+    def test_real_pressure_outside_the_jobs_still_holds_jobs(self):
+        self.fake_pressure("system.slice", 1.0)
+        self.fake_pressure("user.slice/user-4242.slice", 35.0)  # another user's notebook stalls: RAM is short
+        self.host.set(psi=40.0)  # and so the system-wide figure is high too
+        loop = self.loop()
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB)
+        self.addCleanup(self.drop, r["data"]["id"])
+        for _ in range(3):
+            self.host.tick()
+            loop.cycle()
+        self.assertEqual(self.status(r["data"]["id"]), "Stashed")
+        reason = self.queue_file(r["data"]["token"])["reason"]
+        self.assertIn("memory pressure 35.0% (in /user.slice/user-4242.slice", reason)
+
+    # -- review 3 of the admission work ------------------------------------------------------------------------------
+
+    def test_a_held_resize_reads_the_gpus_before_it_takes_the_queue_lock(self):
+        self.host.set(avail=3 * GB)
+        r = self.submit_sized("true", cpus=1, ram=4 * GB)
+        tid = r["data"]["id"]
+        self.addCleanup(self.drop, tid)
+        fifo = os.path.join(self.d.dir, "gpus-%d.fifo" % time.monotonic_ns())
+        os.mkfifo(fifo)  # a GPU query that does not answer until the test writes to it
+        saved = {k: os.environ.get(k) for k in ("JOB_TEST_GPUS", "JOB_TEST_PROC")}
+        os.environ.update(JOB_TEST_GPUS=fifo, JOB_TEST_PROC=self.host.proc)
+        out = {}
+        th = threading.Thread(target=lambda: out.update(r=self.j.host_resize({"id": tid, "ram": 2 * GB})))
+        th.start()
+        try:
+            time.sleep(1.0)
+            fd = os.open(os.path.join(self.state, "queue.lock"), os.O_RDWR | os.O_CREAT)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                free = True
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                free = False
+            os.close(fd)
+            with open(fifo, "w") as f:
+                f.write(json.dumps({"cards": []}))
+            th.join(30)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertTrue(free, "the queue lock was held while the GPUs were read")
+        self.assertEqual(out["r"]["size"]["ram"], 2 * GB)
+
+    def test_the_first_held_line_and_fit_now_see_a_busy_data_disk(self):
+        self.write_settings(disk_busy_max_pct=50)
+        adm = self.j.Admission(self.settings)
+        now = time.time()
+        samples = [dict(sample(now - 20 + i, avail=50 * GB), disks={"sda": 100.0}) for i in range(3)]
+        room = self.j.compute_room(self.settings, samples, [], [], now)
+        adm.write_json(adm.path("room.json"), {"t": now, "written": now, "room": room, "held": [], "jobs": [],
+                                               "holds": [], "warmup": None, "fairness": None})
+        adm.write_json(adm.path("heartbeat"), {"t": now})
+        job = held(cpus=1, ram=1 * GB, group="sched", data_disk="sda")
+        job["size"]["disk_mb_s"] = 500.0
+        reason, _ = self.j._submit_reason(self.settings, adm, job, None)
+        self.assertIn("disk sda is busy", reason)
+        self.assertFalse(self.j._simulate_fit(self.settings, adm, job)[0])
+
+    def test_the_first_held_line_says_no_loop_runs_when_none_ever_ran(self):
+        adm = self.j.Admission(self.settings)
+        reason, _ = self.j._submit_reason(self.settings, adm, held(group="sched"), None)
+        self.assertIn("is not running", reason)
+
+    def test_a_job_whose_peak_reached_its_limit_gets_no_alert_and_is_not_shrunk(self):
+        if subprocess.run(["stat", "-f", "-c", "%T", "/var/tmp"], capture_output=True, text=True).stdout.strip() in (
+                "tmpfs", "ramfs"):
+            self.skipTest("/var/tmp is in memory here, so its pages are not file cache")
+        d = tempfile.mkdtemp(prefix="jobt.", dir="/var/tmp")  # on disk: reading it back fills the page cache
+        self.addCleanup(_remove_var_tmp_dir, d)
+        cmd = ("python3 -c \"import os,time; f=open('%s/big','wb'); [f.write(b'x'*1048576) for _ in range(900)]; "
+               "f.close(); os.system('cat %s/big > /dev/null; cat %s/big > /dev/null'); time.sleep(300)\"" % (d, d, d))
+        loop, tid, tok, now = self.running_job(cmd, min_peak=1 * MiB)
+        cg = os.path.join(loop.m.scopes()[tok], "job")
+        for _ in range(60):  # until the 900 MB file has been read through the 600 MiB limit
+            self.host.tick()
+            loop.cycle()
+            if (self.j._read_cg_int(cg, "memory.peak") or 0) >= 0.9 * self.memory_max(loop, tok):
+                break
+            time.sleep(0.5)
+        self.assertGreaterEqual(self.j._read_cg_int(cg, "memory.peak"), 0.9 * self.memory_max(loop, tok))
+        now[0] += 3600
+        self.host.tick()
+        loop.cycle()
+        # memory.peak at its limit: what filled it is unknown (cache, or an anonymous spike that squeezed the cache
+        # out), so the floor is the whole memory.peak and nothing can be given back
+        self.assertIsNone(self.queue_file(tok).get("oversize"))
+        self.assertNotIn("oversize", self.queue_file(tok).get("alerted") or [])
+        was = self.memory_max(loop, tok)
+        p = self.job("resize", "local", str(tid), "--ram", "300Mi", **self.env())
+        self.assertEqual(p.returncode, 205, p.stdout + p.stderr)
+        self.assertIn("reached 90% of its limit", p.stdout)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        self.assertEqual(self.status(tid), "Running")
+
+    def test_a_failed_shrink_never_puts_back_a_limit_above_the_recorded_one(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        cg = os.path.join(loop.m.scopes()[tok], "job")
+        os.environ.update(self.env())
+        self.addCleanup(os.environ.pop, "JOB_ADMISSION_CONFIG", None)
+        adm = self.j.Admission(self.settings)
+        mine = self.j.ram_limit(self.settings, 300 * MiB)
+        recorded = self.j._whole_pages(mine + (was - mine) // 2)
+        lower = self.j.ram_limit(self.settings, 250 * MiB)
+        for case in ("recorded lower", "memory.max set since"):
+            out = {}
+
+            def run():
+                try:
+                    out["r"] = self.j.host_resize({"id": tid, "ram": 300 * MiB})
+                except self.j.JobError as e:
+                    out["e"] = str(e)
+            fd = adm.lock("queue.lock")
+            th = threading.Thread(target=run)
+            th.start()
+            try:
+                for _ in range(200):
+                    if self.memory_max(loop, tok) == mine:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(self.memory_max(loop, tok), mine)
+                q = adm.read_queue(tok)
+                if case == "recorded lower":  # a resize recorded a limit between this one's and the old one
+                    q["memory_max"] = recorded
+                else:  # a resize set a lower memory.max (and recorded it) while this one waited for the lock
+                    q["memory_max"] = lower
+                    self.j._set_memory_max(cg, lower)
+                adm.save(q)
+            finally:
+                os.close(fd)
+            th.join(60)
+            self.assertIn("changed while it was being resized", out.get("e", ""), out)
+            self.assertEqual(self.memory_max(loop, tok), recorded if case == "recorded lower" else lower, case)
+            q = adm.read_queue(tok)  # back to where it was for the next case
+            q["memory_max"] = was
+            adm.save(q)
+            self.j._set_memory_max(cg, was)
+
+    def test_a_resize_in_the_middle_of_a_cycle_stays_in_the_record(self):
+        loop, tid, tok, now = self.running_job()
+        q = self.queue_file(tok)  # the cycle's copy, read before the resize
+        p = self.job("resize", "local", str(tid), "--ram", "300Mi", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        limit = self.j.ram_limit(self.settings, 300 * MiB)
+        con = loop.adm.db()
+        try:
+            loop.record_peaks(con, q, final=False)
+            con.commit()
+        finally:
+            con.close()
+        self.assertEqual(self.record(tok)["memory_max"], limit)
+        self.assertEqual(self.record(tok)["ram_counted"], limit)
+
+    def test_keeping_a_resized_limit_of_a_scope_that_ended_is_quiet(self):
+        loop = self.loop()
+        gone = os.path.join(self.d.dir, "gone-scope-%d" % time.monotonic_ns())
+        loop.scopes_now = {"e" * 32: gone}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop.keep_resized_limit({"token": "e" * 32, "resized": [{}], "memory_max": 100 * MiB})
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_job_being_released_is_not_said_to_have_ended(self):
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.addCleanup(self.drop, tid)
+        adm = self.j.Admission(self.settings)
+        q = adm.read_queue(tok)
+        q.update(state="released", released=time.time())  # marked released; pueue has not enqueued it yet
+        adm.save(q)
+        with self.assertRaises(self.j.JobError) as e:
+            self.j.host_resize({"id": tid, "ram": 50 * MiB})
+        self.assertIn("is being released by the admission loop now", str(e.exception))
+
+    # -- review 5 -------------------------------------------------------------------------------------------------
+
+    def test_only_a_held_resize_reads_the_hosts_capacity(self):
+        loop, tid, tok, now = self.running_job()
+        os.environ.update(self.env())  # host_resize runs in this process
+        self.addCleanup(os.environ.pop, "JOB_ADMISSION_CONFIG", None)
+        calls, real = [], self.j._capacity
+        self.j._capacity = lambda m: calls.append(1) or real(m)
+        try:
+            self.j.host_resize({"id": tid, "ram": 300 * MiB})
+        finally:
+            self.j._capacity = real
+        self.assertEqual(calls, [])  # a running shrink needs no could-it-ever-fit check, so no GPU query
+
+    def test_a_running_shrink_lowers_the_limit_before_the_queue_lock_and_checks_the_job_again_under_it(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        os.environ.update(self.env())
+        self.addCleanup(os.environ.pop, "JOB_ADMISSION_CONFIG", None)
+        adm = self.j.Admission(self.settings)
+        limit = self.j.ram_limit(self.settings, 300 * MiB)
+        for meanwhile in (True, False):
+            out = {}
+
+            def run():
+                try:
+                    out["r"] = self.j.host_resize({"id": tid, "ram": 300 * MiB})
+                except self.j.JobError as e:
+                    out["e"] = str(e)
+            fd = adm.lock("queue.lock")  # a submit or a cycle holds the lock
+            th = threading.Thread(target=run)
+            th.start()
+            try:
+                for _ in range(200):
+                    if self.memory_max(loop, tok) == limit:
+                        break
+                    time.sleep(0.05)
+                lowered = self.memory_max(loop, tok)
+                if meanwhile:  # another resize landed while this one waited for the lock
+                    q = adm.read_queue(tok)
+                    q["size"] = dict(q["size"], cpus=1.5)
+                    adm.save(q)
+            finally:
+                os.close(fd)
+            th.join(60)
+            self.assertEqual(lowered, limit, "the limit was not lowered before the queue lock")
+            if meanwhile:
+                self.assertIn("changed while it was being resized", out.get("e", ""), out)
+                self.assertEqual(self.memory_max(loop, tok), was)  # put back
+                self.assertIsNone(self.record(tok)["resized"])
+            else:
+                self.assertEqual(out["r"]["memory_max"], limit, out)
+                self.assertEqual(self.record(tok)["memory_max"], limit)
+
+    def test_a_running_shrink_waits_while_its_file_cache_is_read_back(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        adm = self.j.Admission(self.settings)
+        q = adm.read_queue(tok)
+        q["refault"] = -1  # its file refault count grew since the loop's last sample
+        adm.save(q)
+        p = self.job("resize", "local", str(tid), "--ram", "300Mi", **self.env())
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("workingset_refault_file grew", p.stdout)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        q.pop("refault")
+        adm.save(q)
+        p = self.job("resize", "local", str(tid), "--ram", "300Mi", **self.env())
+        self.assertIn("have not been sampled by the admission loop yet", p.stdout)
+        self.host.tick()
+        loop.cycle()  # the loop samples it again
+        p = self.job("resize", "local", str(tid), "--ram", "300Mi", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+
+def _remove_var_tmp_dir(path):
+    """Remove a folder a test made with tempfile.mkdtemp(prefix="jobt.", dir="/var/tmp"), and nothing else."""
+    if isinstance(path, str) and path.startswith("/var/tmp/jobt.") and os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+class PressureMeasure(unittest.TestCase):
+    """TASK-003.09: memory pressure outside the jobs' own limits, on a fake cgroup tree (no daemon)."""
+
+    USER = "/user.slice/user-1000.slice/user@1000.service"
+    TOK = "ab" * 16
+
+    def setUp(self):
+        self.j = load()
+        self.tmp = own_tmpdir()
+        self.addCleanup(remove_own_dir, self.tmp)
+        self.cg = os.path.join(self.tmp, "cgroup")
+        self.proc = os.path.join(self.tmp, "proc")
+        os.makedirs(os.path.join(self.proc, "pressure"))
+        self.write(os.path.join(self.proc, "pressure", "memory"), self.psi_text(22.4))
+        self.levels, self.totals = {}, {}  # {cgroup dir: (full avg10, whether its stall time grows)}, {dir: total}
+        self.scope = self.cg + self.USER + "/app.slice/agent-pueue-%s.scope" % self.TOK
+        self.set("/system.slice", 1.0)
+        self.set("/init.scope", 0.0)
+        self.set("/user.slice/user-1001.slice", 3.0)
+        self.set(self.USER + "/app.slice/pueued.service", 0.5)
+        self.set(self.USER + "/session.slice", 0.0)
+        self.set(self.scope[len(self.cg):], 0.0)
+        self.job(full=30.0, events=7, current=95 * MiB, limit=100 * MiB)
+        self.m = self.j.Measure(proc=self.proc, cgroup_root=self.cg, uid=1000)
+        self.allocstall(1000)
+        self.assertTrue(self.m.global_reclaim())  # the first reading can't tell: the safe side
+        self.assertFalse(self.m.global_reclaim())  # from here on, no global reclaim until the counters grow
+
+    def allocstall(self, n):
+        """/proc/vmstat with its allocstall_* counters summing to n (global direct reclaim so far)."""
+        self.write(os.path.join(self.proc, "vmstat"), "nr_free_pages 1000\nallocstall_dma 0\nallocstall_dma32 0\n"
+                   "allocstall_normal %d\nallocstall_movable %d\npgscan_kswapd 5\n" % (n // 2, n - n // 2))
+
+    @staticmethod
+    def psi_text(full10, full60=None, total=0):
+        full60 = full10 if full60 is None else full60
+        return ("some avg10=%.2f avg60=%.2f avg300=0.00 total=%d\nfull avg10=%.2f avg60=%.2f avg300=0.00 total=%d\n"
+                % (full10, full60, total, full10, full60, total))
+
+    def write(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+    def set(self, rel, full10, grows=None):
+        """A cgroup's full avg10; its stall time grows between samples while it stalls (grows=False: an avg10 still
+        decaying after its stall ended)."""
+        d = self.cg + rel
+        self.levels[d] = (full10, full10 > 0 if grows is None else grows)
+        self.totals.setdefault(d, 0)
+        self.write(d + "/memory.pressure", self.psi_text(full10, total=self.totals[d]))
+
+    def events(self, rel, n, current=None, limit=None):
+        d = self.cg + rel
+        self.write(d + "/memory.events", "low 0\nhigh 0\nmax %d\noom 0\noom_kill 0\n" % n)
+        if current is not None:
+            self.write(d + "/memory.current", "%d\n" % current)
+        if limit is not None:
+            self.write(d + "/memory.max", "%d\n" % limit)
+
+    def job(self, full, events, current, limit, grows=None):
+        rel = self.scope[len(self.cg):] + "/job"
+        self.set(rel, full, grows)
+        self.events(rel, events, current, limit)
+
+    def measure(self):
+        """A sample: the stall time of each stalling cgroup grows first, as the kernel's would over an interval."""
+        for d, (full10, grows) in self.levels.items():
+            if grows:
+                self.totals[d] += int(full10 * 1000) + 1
+            try:
+                self.write(d + "/memory.pressure", self.psi_text(full10, total=self.totals[d]))
+            except PermissionError:
+                pass  # made unreadable by the test
+        return self.m.pressure({self.TOK: self.scope})
+
+    def test_a_job_at_its_own_limit_is_not_host_pressure(self):
+        got = self.measure()  # first sight: it has reached its limit (memory.events max) and is at it now
+        self.assertEqual((got["psi"], got["source"], got["where"]), (3.0, "cgroups", "/user.slice/user-1001.slice"))
+        self.assertEqual(got["system"], 22.4)
+        self.assertEqual(got["jobs"][self.TOK], {"full10": 30.0, "full60": 30.0, "at_limit": True})
+        self.job(full=30.0, events=12, current=95 * MiB, limit=100 * MiB)  # reached it again since
+        got = self.measure()
+        self.assertEqual(got["psi"], 3.0)
+        self.assertTrue(got["jobs"][self.TOK]["at_limit"])
+
+    def test_a_job_stalled_below_its_limit_is_host_pressure(self):
+        self.job(full=20.0, events=0, current=20 * MiB, limit=100 * MiB)  # global reclaim reaches it
+        self.measure()
+        got = self.measure()
+        self.assertFalse(got["jobs"][self.TOK]["at_limit"])
+        self.assertEqual((got["psi"], got["where"]), (20.0, self.scope[len(self.cg):]))
+        self.job(full=20.0, events=7, current=95 * MiB, limit=100 * MiB)  # hit its limit long ago, not since
+        self.measure()
+        got = self.measure()
+        self.assertFalse(got["jobs"][self.TOK]["at_limit"])
+        self.assertEqual(got["psi"], 20.0)
+
+    def test_pressure_anywhere_outside_the_jobs_counts(self):
+        self.job(full=0.0, events=7, current=10 * MiB, limit=100 * MiB)  # the job does not stall
+        self.set(self.USER + "/app.slice/pueued.service", 12.0)  # this user's own non-job unit
+        got = self.measure()
+        self.assertEqual((got["psi"], got["where"]), (12.0, self.USER + "/app.slice/pueued.service"))
+        self.set("/system.slice", 15.0)
+        self.assertEqual(self.measure()["psi"], 15.0)
+
+    # -- review 5 -------------------------------------------------------------------------------------------------
+
+    def test_a_bursty_thrasher_does_not_leak_in_after_its_burst(self):
+        self.measure()  # first sight: at its limit
+        self.job(full=30.0, events=12, current=95 * MiB, limit=100 * MiB)
+        self.assertTrue(self.measure()["jobs"][self.TOK]["at_limit"])
+        # the burst is over: no new limit events and no new stall time, while its avg10 still decays from 30%
+        self.job(full=30.0, events=12, current=60 * MiB, limit=100 * MiB, grows=False)
+        got = self.measure()
+        self.assertFalse(got["jobs"][self.TOK]["at_limit"])
+        self.assertEqual((got["psi"], got["where"]), (3.0, "/user.slice/user-1001.slice"))
+
+    def test_a_member_stalled_at_its_own_limit_still_counts(self):
+        # Only jobs are ever left out. A cgroup outside the jobs at its own limit may be hiding a real shortage (its
+        # count is hierarchical, so one container at its limit would hide all of system.slice), so it counts.
+        self.job(full=0.0, events=7, current=10 * MiB, limit=100 * MiB)  # the job does not stall
+        self.set("/students.slice", 50.0)
+        self.events("/students.slice", 3, current=int(9.9 * GB), limit=10 * GB)
+        self.measure()
+        self.events("/students.slice", 9)  # it reached its limit again since the last sample
+        got = self.measure()
+        self.assertEqual((got["psi"], got["source"], got["cgroups"]), (22.4, "system", 50.0))
+        self.set("/students.slice", 0.0)
+
+    def test_a_real_shortage_is_not_hidden_by_one_container_at_its_limit(self):
+        # review 6 B1: a host-wide shortage (40%) while one container under system.slice touches its MemoryMax
+        self.write(os.path.join(self.proc, "pressure", "memory"), self.psi_text(40.0))
+        self.job(full=0.0, events=0, current=10 * MiB, limit=100 * MiB)
+        self.set("/user.slice/user-1001.slice", 0.0)
+        self.set(self.USER + "/app.slice/pueued.service", 0.0)
+        self.set("/system.slice", 40.0)
+        self.events("/system.slice/docker-x.scope", 0, current=10 ** 9, limit=10 ** 9)
+        self.events("/system.slice", 5)
+        self.measure()
+        self.events("/system.slice", 6)
+        got = self.measure()
+        self.assertEqual((got["psi"], got["where"]), (40.0, "/system.slice"))
+
+    def test_in_global_reclaim_nothing_is_left_out(self):
+        # review 6 B3: a job at its own limit while the whole host reclaims (allocstall grows): the system-wide figure
+        self.write(os.path.join(self.proc, "pressure", "memory"), self.psi_text(40.0))
+        for r in ("/system.slice", "/user.slice/user-1001.slice", self.USER + "/app.slice/pueued.service"):
+            self.set(r, 0.0)
+        self.job(full=40.0, events=100, current=99 * MiB, limit=100 * MiB)
+        self.measure()
+        self.job(full=40.0, events=130, current=99 * MiB, limit=100 * MiB)
+        got = self.measure()
+        self.assertTrue(got["jobs"][self.TOK]["at_limit"])
+        self.assertEqual((got["psi"], got["global"]), (0.0, False))  # no global reclaim: its own limit, left out
+        self.job(full=40.0, events=160, current=99 * MiB, limit=100 * MiB)
+        self.allocstall(1500)
+        got = self.measure()
+        self.assertTrue(got["jobs"][self.TOK]["at_limit"])
+        self.assertEqual((got["psi"], got["source"], got["global"], got["cgroups"]), (40.0, "system", True, None))
+        room = self.j.compute_room(settings(self.j, self.tmp), [dict(
+            sample(100), psi=got["psi"], psi_source=got["source"], psi_system=40.0, psi_global=True)], [], [], 100)
+        ok, why = self.j.fits(settings(self.j, self.tmp, memory_pressure_max_pct=5), room, held())
+        self.assertFalse(ok)
+        self.assertIn("the host is in global reclaim", why)
+
+    def test_global_reclaim_is_assumed_when_it_cannot_be_told(self):
+        os.unlink(os.path.join(self.proc, "vmstat"))
+        self.assertTrue(self.m.global_reclaim())
+        self.write(os.path.join(self.proc, "vmstat"), "nr_free_pages 1000\n")  # no allocstall counters
+        self.assertTrue(self.m.global_reclaim())
+        self.allocstall(7)
+        self.assertTrue(self.m.global_reclaim())  # first reading after a gap
+        self.assertFalse(self.m.global_reclaim())
+        got = self.measure()  # the job is at its own limit: left out outside global reclaim
+        self.assertEqual(got["psi"], 3.0)
+        os.unlink(os.path.join(self.proc, "vmstat"))
+        self.assertEqual((self.measure()["psi"], self.measure()["source"]), (22.4, "system"))
+
+    def test_the_figure_is_never_above_the_system_wide_one(self):
+        self.set("/system.slice", 40.0)
+        got = self.measure()
+        self.assertEqual((got["psi"], got["source"], got["cgroups"], got["cg_where"]),
+                         (22.4, "system", 40.0, "/system.slice"))
+        room = self.j.compute_room(settings(self.j, self.tmp), [dict(
+            sample(100), psi=got["psi"], psi_source=got["source"], psi_system=22.4, psi_cgroups=40.0,
+            psi_cg_where="/system.slice")], [], [], 100)
+        ok, why = self.j.fits(settings(self.j, self.tmp, memory_pressure_max_pct=5), room, held())
+        self.assertFalse(ok)
+        self.assertIn("system-wide, lower than the highest of the cgroups leaving out jobs stalled against their own "
+                      "RAM limits, 40.0% in /system.slice", why)
+
+    def test_a_cgroup_removed_between_open_and_read_is_gone_not_unreadable(self):
+        import errno
+        real = self.m.cgroup_pressure
+
+        def pressure(path):
+            if path.endswith("user-1001.slice"):
+                raise OSError(errno.ENODEV, "No such device")
+            return real(path)
+        self.m.cgroup_pressure = pressure
+        got = self.measure()
+        self.assertEqual((got["source"], got["unreadable"], got["psi"]), ("cgroups", 0, 1.0))
+
+    def test_the_cache_a_lower_limit_drops_leaves_hot_mapped_pages(self):
+        rel = "/user.slice/x.scope"
+        self.write(self.cg + rel + "/memory.current", "%d\n" % (10 * GB))
+        self.write(self.cg + rel + "/memory.stat", "anon %d\nactive_file %d\ninactive_file %d\nfile_mapped %d\n"
+                   "workingset_refault_file 17\n" % (2 * GB, 6 * GB, 2 * GB, 5 * GB))
+        # all file cache is 8 GB; of it, inactive (2 GB) and the active pages not mapped (1 GB) can go
+        self.assertEqual(self.m.cgroup_mem(rel), (2 * GB, 3 * GB, 10 * GB, 17))
+        self.assertEqual(self.j._droppable_cache({"active_file": "1", "inactive_file": "2", "file_mapped": "5"}), 2)
+
+
+
+    def test_an_unreadable_cgroup_falls_back_to_the_system_wide_figure(self):
+        if os.getuid() == 0:
+            self.skipTest("root reads every file")
+        os.chmod(self.cg + "/user.slice/user-1001.slice/memory.pressure", 0)
+        got = self.measure()
+        self.assertEqual((got["psi"], got["source"], got["unreadable"]), (22.4, "system", 1))
+        self.assertEqual(got["unreadable_paths"], ["/user.slice/user-1001.slice"])
+        room = self.j.compute_room(settings(self.j, self.tmp), [dict(
+            sample(100), psi=got["psi"], psi_source=got["source"], psi_unreadable=1, psi_system=22.4,
+            psi_unreadable_paths=got["unreadable_paths"])], [], [], 100)
+        ok, why = self.j.fits(settings(self.j, self.tmp, memory_pressure_max_pct=5), room, held())
+        self.assertFalse(ok)
+        self.assertIn("system-wide: 1 cgroup(s) could not be read: /user.slice/user-1001.slice", why)
+
+    def test_no_pressure_files_means_the_system_wide_figure(self):
+        m = self.j.Measure(proc=self.proc, cgroup_root=os.path.join(self.tmp, "empty"), uid=1000)
+        got = m.pressure({})
+        self.assertEqual((got["psi"], got["source"]), (22.4, "system"))
+
+    def test_an_undersize_threshold_setting_is_checked(self):
+        self.assertEqual(settings(self.j, self.tmp)["undersize_stall_pct"], 10.0)
+        with self.assertRaises(self.j.JobError):
+            settings(self.j, self.tmp, undersize_stall_pct=150)
+
+
+class ReviewThreeRules(unittest.TestCase):
+    """Review 3 of the admission work (no daemon)."""
+
+    def setUp(self):
+        self.j = load()
+        self.tmp = own_tmpdir()
+        self.addCleanup(remove_own_dir, self.tmp)
+        self.s = settings(self.j, self.tmp, ram_hard_factor=1.5)
+
+    def test_the_floor_takes_file_cache_off_a_sampled_peak_under_its_limit(self):
+        # limit 80 GB; memory.peak 60 GB, seen by sampling (memory.current was sampled at 60 GB), 40 GB of it file
+        # cache it still holds: the cache comes off, and the sampled RAM peak times resize_margin is the floor
+        floor = self.j._resize_floor(self.s, 26.5 * GB, 20 * GB, 60 * GB, 40 * GB, sampled_current=60 * GB,
+                                     limit=80 * GB)
+        self.assertAlmostEqual(floor, 26.5 * GB * 1.25)
+        n = self.j._resize_suggestion(self.s, 26.5 * GB, 20 * GB, 60 * GB, 40 * GB, sampled_current=60 * GB,
+                                      limit=80 * GB)
+        self.assertEqual(self.j._size_arg(n), "33.2G")
+        self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._parse_size("33.2G")), floor)
+        # anonymous growth between samples (little cache now) keeps its floor at the kernel's peak
+        self.assertGreaterEqual(self.j._resize_floor(self.s, 26.5 * GB, 26 * GB, 60 * GB, 1 * GB, limit=80 * GB),
+                                59 * GB)
+
+    def test_a_job_whose_peak_reached_its_limit_cannot_be_shrunk(self):
+        # sized 64 GB (limit 80 GB), sampled peak 26.5 GB, memory.peak at its 80 GB limit, 53 GB of it file cache now:
+        # what filled the limit at its peak is unknown, so the floor is the whole memory.peak
+        for limit in (80 * GB, 85 * GB, None):  # at it, at 94% of it, or not known
+            self.assertEqual(self.j._resize_floor(self.s, 26.5 * GB, 26 * GB, 80 * GB, 53 * GB,
+                                                  sampled_current=80 * GB, limit=limit), 80 * GB, limit)
+
+    def test_review_6_a_hidden_spike_under_a_cache_filled_limit_is_not_given_away(self):
+        # limit 100 GB, always cache-filled; anon sampled at 5 GB; an unsampled 40 GB anonymous spike squeezed the
+        # cache out and it refilled since: memory.peak and every sampled memory.current are 100 GB
+        floor = self.j._resize_floor(self.s, 5 * GB, 5 * GB, 100 * GB, 95 * GB, sampled_current=100 * GB,
+                                     limit=100 * GB)
+        self.assertGreaterEqual(floor, 40 * GB)
+
+    def test_dirty_and_writeback_pages_are_not_droppable(self):
+        self.assertEqual(self.j._droppable_cache({"inactive_file": 10, "active_file": 6, "file_mapped": 2,
+                                                  "file_dirty": 3, "file_writeback": 1}), 10)
+        self.assertEqual(self.j._droppable_cache({"inactive_file": 1, "file_dirty": 5}), 0)
+
+    def oversize_loop(self):
+        class M:  # enough of Measure for a Loop that is never cycled
+            proc, cg = "/nonexistent", "/nonexistent"
+
+            def disk_of(self, p):
+                return None
+
+            def meminfo(self):
+                return {"MemTotal": 64 * GB}
+
+            def gpus(self):
+                return []
+
+            def threads(self):
+                return 8
+
+            def cpu(self, now):
+                return None, None
+
+            def disks(self, now, names):
+                return {}
+        loop = self.j.Loop(self.s, measure=M(), clock=lambda: 10000.0)
+        loop.alerts = []
+        loop.adm.alert = lambda q, kind, msg, extra=None: loop.alerts.append((kind, msg, extra))
+        return loop
+
+    def oversized_job(self, **kw):
+        q = {"token": "f" * 32, "task": "T-o", "size": {"cpus": 1, "ram": 10 * GB, "gpus": 0, "gpu_mem": 0},
+             "started": 1000.0, "released": 1000.0, "memory_max": self.j.ram_limit(self.s, 10 * GB), "gpus": [],
+             "stall60": 0.0, "refault_grew": False}
+        q.update(kw)
+        return q
+
+    def test_a_rising_ram_trend_is_part_of_the_oversize_measure(self):
+        loop = self.oversize_loop()
+        p = {"ram": 1 * GB, "n": 10}
+        u = {"ram": GB, "cache": 0, "limit": None}
+        q = self.oversized_job()
+        loop.check_oversize(q, 10000.0, "Running", p, u)
+        self.assertEqual(q["oversize"]["suggest"], "1.3G")  # its peak times margins.ram, up to 0.1 GB
+        # its progress says it will hold 10 GB at its end: not oversized
+        q = self.oversized_job(progress=[[1, 10, 100, 1 * GB], [2, 20, 100, 2 * GB], [3, 30, 100, 3 * GB]])
+        loop.alerts.clear()
+        loop.check_oversize(q, 10000.0, "Running", p, u)
+        self.assertIsNone(q["oversize"])
+        self.assertEqual(loop.alerts, [])
+        # on course for 3.2 GB: still oversized, and the suggestion covers the trend, not the peak so far
+        q = self.oversized_job(progress=[[1, 10, 100, GB], [2, 20, 100, 1.25 * GB], [3, 30, 100, 1.5 * GB]])
+        loop.check_oversize(q, 10000.0, "Running", p, u)
+        self.assertGreaterEqual(self.j._parse_size(q["oversize"]["suggest"]), 3.25 * GB * 1.25 - 1e8)
+        self.assertIn("its progress trend projects", loop.alerts[-1][1])
+
+    def test_no_oversize_alert_when_a_raised_hard_factor_leaves_nothing_to_accept(self):
+        loop = self.oversize_loop()
+        # it runs under a 4 GB limit (the factor was lower at its release); the smallest size covering its floor,
+        # 3.8 GB, gives 5.7 GB at today's factor of 1.5, over that limit, so job resize would refuse any shrink
+        q = self.oversized_job(memory_max=4 * GB)
+        loop.check_oversize(q, 10000.0, "Running", {"ram": 3 * GB, "n": 10}, {"ram": GB, "cache": 0, "limit": 4 * GB})
+        self.assertIsNone(q["oversize"])
+        self.assertEqual(loop.alerts, [])
+
+    def test_the_like_source_text_never_raises(self):
+        class Broken:
+            def db(self):
+                raise sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.j._like_source_text(Broken(), "a" * 32), "?")
+
+    def test_like_last_and_the_held_floor_prefer_the_same_session(self):
+        adm = self.j.Admission(self.s)
+        con = adm.db()
+        for tok, session, ended, peak in (("1" * 32, "mine", 1000.0, 2 * GB), ("2" * 32, "other", 2000.0, 9 * GB)):
+            con.execute("INSERT INTO jobs (token, task, session, how, exit, ended, peak_ram, peak_cpu, peak_samples, "
+                        "gpus, pueue_id) VALUES (?, 'T-s', ?, 'exit', 0, ?, ?, 1.0, 10, '[]', 7)",
+                        (tok, session, ended, peak))
+        con.commit()
+        self.assertEqual(adm.find_last(con, "T-s", "mine")["token"], "1" * 32)  # not the newer run of another session
+        self.assertEqual(adm.find_last(con, "T-s", "new")["token"], "2" * 32)  # none of its own: the newest of any
+        self.assertIn("of session mine", self.j._like_source_text(adm, "1" * 32))
+        cap = {"mem_total": 64 * GB, "threads": 8, "gpus": []}
+        q = {"token": "3" * 32, "task": "T-s", "session": "mine", "constraints": {}}
+        new = {"cpus": 1, "ram": 3 * GB, "gpus": 0, "gpu_mem": 0, "gpu_share": 0, "disk_mb_s": 0}
+        change, used = self.j._resize_held(self.s, con, q, new, cap)  # over its own run's 2 GB, under the other's 9
+        self.assertEqual(used["session"], "mine")
+        with self.assertRaises(self.j.JobError) as e:
+            self.j._resize_held(self.s, con, q, dict(new, ram=GB), cap)
+        self.assertIn("session mine", str(e.exception))
+        con.close()
+
+class ReviewFiveRules(unittest.TestCase):
+    """Review 5 of the memory-pressure and peak changes (no daemon)."""
+
+    setUp = ReviewThreeRules.setUp
+    oversize_loop = ReviewThreeRules.oversize_loop
+    oversized_job = ReviewThreeRules.oversized_job
+
+    def test_a_spike_between_samples_keeps_the_whole_kernel_peak_as_the_floor(self):
+        # memory.peak 80 GB, but the highest memory.current the loop sampled was 30 GB: the peak came between
+        # samples, of unknown make-up (an anonymous spike that squeezed the cache out, the cache refilled since)
+        self.assertEqual(self.j._resize_floor(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=30 * GB,
+                                              limit=100 * GB), 80 * GB)
+        # within 2% of the sampled peak, and under 90% of its limit: seen by sampling, so its cache comes off
+        self.assertEqual(self.j._resize_floor(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=79 * GB,
+                                              limit=100 * GB), 27 * GB)
+        n = self.j._resize_suggestion(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=30 * GB,
+                                      limit=100 * GB)
+        self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._parse_size(self.j._size_arg(n))), 80 * GB)
+
+    def test_no_oversize_alert_while_it_stalls_or_its_file_cache_is_read_back(self):
+        p, u = {"ram": 1 * GB, "n": 10, "current": 2 * GB}, {"ram": GB, "need": GB, "cache": 0, "limit": None,
+                                                             "current": 2 * GB}
+        for blocked in ({"stall60": 2.5}, {"refault_grew": True}):
+            loop = self.oversize_loop()
+            q = self.oversized_job(**blocked)
+            loop.check_oversize(q, 10000.0, "Running", p, u)
+            self.assertIsNone(q["oversize"], blocked)
+            self.assertEqual(loop.alerts, [])
+        loop = self.oversize_loop()
+        q = self.oversized_job(stall60=0.5, refault_grew=False)
+        loop.check_oversize(q, 10000.0, "Running", p, u)
+        self.assertEqual([a[0] for a in loop.alerts], ["oversize"])
+        self.assertIn("stalled reclaiming memory in its own cgroup", self.j._shrink_blocked(2.5, False))
+        self.assertIn("workingset_refault_file grew", self.j._shrink_blocked(0.0, True))
+        self.assertIsNone(self.j._shrink_blocked(1.0, False))
+
+    def test_the_loop_keeps_whether_refaults_grew(self):
+        loop = self.oversize_loop()
+        q = {}
+        loop.track_memory(q, {"refault": 10, "psi": {"full60": 0.2}})
+        self.assertEqual((q["refault"], q["refault_grew"], q["stall60"]), (10, None, 0.2))  # first: not known yet
+        loop.track_memory(q, {"refault": 14, "psi": None})
+        self.assertEqual((q["refault"], q["refault_grew"], q["stall60"]), (14, True, None))
+        loop.track_memory(q, {"refault": 14, "psi": {"full60": 0.0}})
+        self.assertIs(q["refault_grew"], False)
+        loop.track_memory(q, {"refault": None, "psi": {"full60": 0.0}})  # a kernel without the counter
+        self.assertIsNone(q["refault_grew"])
+        loop.track_memory(q, None)  # not measured this cycle
+        self.assertEqual((q["refault_grew"], q["stall60"]), (None, None))
+
+    def test_a_shrink_and_the_oversize_alert_fail_closed_when_its_stall_cannot_be_read(self):
+        self.assertIn("could not be read", self.j._shrink_blocked(None, False))
+        self.assertIn("could not be read", self.j._shrink_blocked(0.0, None))
+        p, u = {"ram": 1 * GB, "n": 10, "current": 2 * GB}, {"ram": GB, "need": GB, "cache": 0, "limit": None,
+                                                             "current": 2 * GB}
+        for unknown in ({"stall60": None}, {"refault_grew": None}):
+            loop = self.oversize_loop()
+            q = self.oversized_job(**unknown)
+            loop.check_oversize(q, 10000.0, "Running", p, u)
+            self.assertIsNone(q["oversize"], unknown)
+            self.assertEqual(loop.alerts, [])
+
+    def test_the_undersized_alert_waits_for_a_host_with_ram_to_spare(self):
+        u = {"ram": GB, "cache": 0, "files": 0, "limit": 2 * GB,
+             "psi": {"full10": 30.0, "full60": 30.0, "at_limit": True}}
+        quiet = {"psi_global": False}
+        for last, fires in ((dict(quiet, psi_outside=2.0, avail=50 * GB), False),   # something outside the jobs stalls
+                            (dict(quiet, psi_outside=None, avail=50 * GB), False),  # not known
+                            (dict(quiet, psi_outside=0.0, avail=GB // 2), False),   # MemAvailable under the headroom
+                            ({"psi_global": True, "psi_outside": 0.0, "avail": 50 * GB}, False),  # global reclaim
+                            ({"psi_outside": 0.0, "avail": 50 * GB}, False),        # not known to be out of it
+                            (dict(quiet, psi_outside=0.0, avail=50 * GB), True)):
+            loop = self.oversize_loop()
+            loop.samples = [dict(sample(9999), **last)]
+            q = self.oversized_job()
+            loop.check_undersize(q, 10000.0, "Running", u)
+            self.assertEqual([a[0] for a in loop.alerts], ["undersized"] if fires else [], last)
+            self.assertEqual(q["undersized"] is not None, fires)
 
 
 if __name__ == "__main__":
