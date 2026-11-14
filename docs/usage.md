@@ -236,11 +236,14 @@ done
 `job wait gpu1 <id1> <id2> <id3>`. Do not wait on only the last id: in a group
 that runs several at a time, the last id can finish first.
 
-**The `default` group runs one job at a time** (pueue's default). A job submitted to it while another job runs there, yours or another
-session's, waits its turn; `job run` says so on stderr (`queued behind 1
-running job(s) in group default (limit 1)`). Use your own group for work that
-should run alongside others. `job group <host> default N` raises the shared
-limit for everyone; don't change it without a reason.
+**A job without `--group` runs in its session's own group** (`session-<session id>`, created when needed), which
+runs one job at a time. So your jobs without a group run one after another, and never wait behind another
+session's jobs. A job submitted while another of yours runs there waits its turn; `job run` says so on stderr
+(`queued behind 1 running job(s) in group session-... (limit 1)`). Use a group of your own (`job group`) for
+jobs that should run side by side. Session groups that hold no job and were last used over an hour ago are
+removed at a later submit. Jobs of a session without a session id (see "Sessions") share `session-unknown`. On
+admission hosts, a job without `--group` runs in the group `sched` instead (see below). pueue's `default` group
+is used only when you name it (`--group default`); it runs one job at a time and is shared by everyone.
 
 A queued or paused job waits without limit and does not count as stalled;
 `job ls` shows it as `Queued` or `Paused`.

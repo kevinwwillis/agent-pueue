@@ -708,5 +708,72 @@ class FreshDaemonTests(Base):
         self.assertTrue(out.startswith("job: "), out)
 
 
+class SessionGroupTests(Base):
+    """A job without --group on a host without admission runs in its session's own group (TASK-007.05)."""
+
+    def groups(self):
+        return json.loads(self.d.pueue("status", "--json").stdout)["groups"]
+
+    def task_group(self, tid):
+        return json.loads(self.d.pueue("status", "--json").stdout)["tasks"][str(tid)]["group"]
+
+    def test_sessions_do_not_queue_behind_each_other(self):
+        p = self.job("submit", "local", "T-sg-a", "--", "sleep 20", JOB_SESSION="sess-a")
+        a = int(p.stdout)
+        self.wait_status(a, "Running")
+        self.assertEqual(self.task_group(a), "session-sess-a")
+        r = self.job("run", "local", "T-sg-b", "--poll", "0.3", "--", "echo ran", JOB_SESSION="sess-b")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertLess(r.elapsed, 15)
+        self.assertNotIn("queued behind", r.stderr)
+        self.assertEqual(self.groups()["session-sess-b"]["parallel_tasks"], 1)
+        self.d.pueue("kill", str(a))
+
+    def test_a_sessions_own_jobs_run_one_at_a_time(self):
+        a = int(self.job("submit", "local", "T-sg-c", "--", "sleep 4", JOB_SESSION="sess-c").stdout)
+        self.wait_status(a, "Running")
+        r = self.job("run", "local", "T-sg-d", "--poll", "0.3", "--", "true", JOB_SESSION="sess-c")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("queued behind 1 running job(s) in group session-sess-c (limit 1)", r.stderr)
+        ls = self.job("ls", "local")
+        self.assertIn("session-sess-c", ls.stdout)
+
+    def test_a_named_group_and_default_still_work(self):
+        tid = self.submit("true", task="T-sg-def", extra=("--group", "default"))
+        self.assertEqual(self.task_group(tid), "default")
+
+    def test_an_idle_empty_session_group_is_removed_later(self):
+        tid = int(self.job("submit", "local", "T-sg-old", "--", "true", JOB_SESSION="sess-old").stdout)
+        self.wait_status(tid, "Done")
+        self.assertIn("session-sess-old", self.groups())
+        self.d.pueue("remove", str(tid))
+        mark = os.path.join(self.d.dir, "state", "agent-pueue", "session-groups", "session-sess-old")
+        self.assertTrue(os.path.exists(mark))
+        self.submit("true", task="T-sg-new")  # used within the hour: kept
+        self.assertIn("session-sess-old", self.groups())
+        old = time.time() - 7200
+        os.utime(mark, (old, old))
+        self.submit("true", task="T-sg-new2")
+        self.assertNotIn("session-sess-old", self.groups())
+        self.assertFalse(os.path.exists(mark))
+
+    def test_group_name_is_safe_and_distinct(self):
+        job = self.load_job()
+        a = job._session_group_name("local_1c37ef45-f90f-4cad-8955-445f2a6fb349")
+        b = job._session_group_name("local_1c37ef45-f90f-4cad-8955-000000000000")
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.startswith("session-local_1c37ef45"), a)
+        self.assertEqual(job._session_group_name("sess-a"), "session-sess-a")
+        self.assertTrue(all(c.isalnum() or c in "_-" for c in job._session_group_name("a b/c")))
+
+    def test_pueue_error_text_is_one_line(self):
+        job = self.load_job()
+        raw = ("Error: \n   0: \x1b[91mFailed to connect to the daemon\x1b[0m\n\nLocation:\n"
+               "   \x1b[35mpueue/src/bin/pueue.rs\x1b[0m:\x1b[35m91\x1b[0m\n\n"
+               "Backtrace omitted. Run with RUST_BACKTRACE=1 environment variable to display it.\n"
+               "Run with RUST_BACKTRACE=full to include source snippets.\n")
+        self.assertEqual(job._pueue_error_text(raw), "Failed to connect to the daemon")
+
+
 if __name__ == "__main__":
     unittest.main()

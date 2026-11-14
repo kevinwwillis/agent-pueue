@@ -19,9 +19,11 @@ import base64
 import ctypes
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import socket
 import sqlite3
@@ -158,8 +160,29 @@ def _pueue(args, env=None, check=True):
         raise JobError("cannot run pueue: %s" % e)
     if check and p.returncode != 0:
         raise JobError("pueue %s failed (exit %d): %s" % (
-            " ".join(args[:2]), p.returncode, (p.stderr or p.stdout).strip()[-2000:]))
+            " ".join(args[:2]), p.returncode, _pueue_error_text(p.stderr or p.stdout)))
     return p
+
+
+def _pueue_error_text(text):
+    """pueue's error output in one line: its messages without colors, source locations or backtrace hints."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text or "")
+    keep = []
+    skip = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s in ("Error:",) or s.startswith(("Backtrace omitted", "Run with RUST_BACKTRACE")):
+            continue
+        if s.startswith("Location:"):
+            skip = True
+            continue
+        if skip and ("/src/" in s or s.endswith(".rs") or ".rs:" in s):
+            continue
+        skip = False
+        if s[:1].isdigit() and ": " in s[:5]:
+            s = s.split(": ", 1)[1]  # "0: message"
+        keep.append(s[6:].strip() if s.startswith("Error:") else s)
+    return " ".join(keep)[-600:] or "no message"
 
 
 def _pueue_status():
@@ -568,6 +591,51 @@ def _stop_scope(token):
             pass
 
 
+SESSION_GROUP_PREFIX = "session-"
+SESSION_GROUP_IDLE_S = 3600
+
+
+def _session_group_name(session):
+    """The pueue group of a session's jobs that name no group: session- and the session id (cut to 24 characters,
+    with a short hash of the whole id when it was cut or had other characters)."""
+    clean = "".join(c if c.isascii() and (c.isalnum() or c in "_-") else "_" for c in session)
+    if len(clean) > 24 or clean != session or not clean:
+        clean = clean[:24] + "-" + hashlib.sha256(session.encode("utf-8", "replace")).hexdigest()[:6]
+    return SESSION_GROUP_PREFIX + clean
+
+
+def _session_group(st, session):
+    """Make sure the session's own group exists (runs one job at a time) and return its name. Groups job made for
+    sessions are remembered in STATE_DIR/session-groups (each submit touches its mark); one that holds no task and
+    was last used over SESSION_GROUP_IDLE_S ago is removed here."""
+    name = _session_group_name(session)
+    marks = os.path.join(STATE_DIR, "session-groups")
+    os.makedirs(marks, mode=0o700, exist_ok=True)
+    groups = st.setdefault("groups", {})
+    used = {t.get("group") for t in st.get("tasks", {}).values()}
+    for other in os.listdir(marks):
+        if other == name:
+            continue
+        try:
+            if time.time() - os.path.getmtime(os.path.join(marks, other)) < SESSION_GROUP_IDLE_S:
+                continue  # a submit may be about to add its job to it
+            if other in groups and other not in used:
+                _pueue(["group", "remove", other])
+                groups.pop(other, None)
+            if other not in groups:
+                os.remove(os.path.join(marks, other))
+        except (JobError, OSError):
+            pass  # a task arrived in it meanwhile, or another submit removed it: try again next time
+    with open(os.path.join(marks, name), "w"):
+        pass  # touched: in use now
+    if name not in groups:
+        p = _pueue(["group", "add", name], check=False)
+        if p.returncode != 0 and name not in _pueue_status().get("groups", {}):  # not a submit that raced us
+            raise JobError("could not create the pueue group %s: %s" % (name, _pueue_error_text(p.stderr or p.stdout)))
+        groups[name] = {"status": "Running", "parallel_tasks": 1}  # pueue's limit for a new group is 1
+    return name
+
+
 def host_submit(req, _admission_checked=False):
     command = req["command"]
     if not isinstance(req.get("normal_priority", False), bool):
@@ -605,7 +673,12 @@ def host_submit(req, _admission_checked=False):
     cwd = os.path.expanduser(req.get("cwd") or "~")
     if not os.path.isdir(cwd):
         raise JobError("working directory does not exist on %s: %s" % (socket.gethostname(), cwd))
-    group = req.get("group") or "default"
+    group = req.get("group")
+    if not group and not admitted:
+        # without --group, a job queues only behind its own session's jobs, not behind every session's in the shared
+        # default group (which runs one job at a time)
+        group = _session_group(st, req.get("session") or "unknown")
+    group = group or "default"
     if group != "default" and group not in st.get("groups", {}):
         raise JobError("pueue group %r does not exist on %s; create it with "
                        "'job group <host> %s <n>'" % (group, socket.gethostname(), group))
@@ -4271,7 +4344,9 @@ def build_parser():
         q = sub.add_parser(name, help="queue a command and wait for it" if name == "run" else "queue a command, print its id")
         q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
         q.add_argument("task", help="the task id the job belongs to (becomes the pueue label)")
-        q.add_argument("--group", default=None, help="pueue group (create it with 'job group')")
+        q.add_argument("--group", default=None,
+                       help="pueue group (create it with 'job group'); default: your session's own group, one job at "
+                            "a time (sched on admission hosts)")
         q.add_argument("--cwd", default=None, help="working directory on the host (default: here for local, home for remote)")
         q.add_argument("--script", default=None, metavar="FILE", help="read the command from FILE instead of after --")
         q.add_argument("--env", action="append", metavar="NAME[=VALUE]",
