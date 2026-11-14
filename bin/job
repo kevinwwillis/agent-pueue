@@ -97,6 +97,7 @@ EXIT = {
     "WRAPPER_ERROR": 205,
     "NO_ROOM": 206,
     "PILOT_TIME_LIMIT": 207,
+    "KILLED_BY_RESTART": 208,
 }
 # Outcomes that end a multi-job wait at once (the agent must look now).
 URGENT = ("STALLED", "ALERT", "UNREACHABLE", "GONE", "WRAPPER_ERROR")
@@ -191,6 +192,71 @@ def _pueue_status():
         return json.loads(p.stdout)
     except ValueError:
         raise JobError("pueue status --json returned no JSON: %r" % p.stdout[:300])
+
+
+def _pueue_setting(key):
+    """A shared setting from the pueue config file, or None when it is unset (null)."""
+    cfg = os.environ.get("JOB_PUEUE_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "pueue", "pueue.yml")
+    try:
+        with open(cfg, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith(key + ":"):
+                    val = s.split(":", 1)[1].strip().strip("'\"")
+                    if val and val not in ("null", "~"):
+                        return os.path.expanduser(val)
+    except OSError:
+        pass
+    return None
+
+
+def _daemon_start(proc="/proc"):
+    """When the running pueue daemon started (epoch seconds), from its pid file and /proc; None if unknown."""
+    dirs = [_pueue_setting("runtime_directory"), os.environ.get("XDG_RUNTIME_DIR"), "/run/user/%d" % os.getuid(),
+            _pueue_directory()]
+    for d in dirs:
+        if not d:
+            continue
+        try:
+            with open(os.path.join(d, "pueue.pid")) as f:
+                pid = int(f.read().strip())
+            with open(os.path.join(proc, str(pid), "stat")) as f:
+                ticks = int(f.read().rsplit(")", 1)[1].split()[19])  # start time, clock ticks after boot
+            with open(os.path.join(proc, "stat")) as f:
+                btime = next(int(x.split()[1]) for x in f if x.startswith("btime "))
+            return btime + ticks / float(os.sysconf("SC_CLK_TCK"))
+        except (OSError, ValueError, IndexError, StopIteration):
+            continue
+    return None
+
+
+RESTART_WINDOW_S = 24 * 3600  # a job killed this long before the daemon's start may have been ended by its stop
+
+
+def _killed_by(s):
+    """Who ended a Killed task: "job kill" (or the admission loop's reason), "daemon" when it was running when the
+    pueue daemon stopped, or None when unknown. A daemon restart is read from the times: the task started before
+    the daemon now running did, and ended at most RESTART_WINDOW_S before the daemon started (a stop kills its
+    running tasks then) or within two minutes after (a daemon that died marks them Killed when it starts again)."""
+    if s.get("result") != "Killed":
+        return None
+    tok = s.get("token")
+    results = os.path.join(STATE_DIR, "results")
+    if tok:
+        killed = _read_kv(os.path.join(results, tok + ".killed"))
+        if killed is not None:
+            return killed.get("stopped_by") or "job kill"
+        if os.path.exists(os.path.join(results, tok + ".jobkill")):
+            return "job kill"
+    d = _daemon_start()
+    start, end = _parse_time(s.get("start")), _parse_time(s.get("end"))
+    if d is None or start is None or end is None:
+        return None
+    s["daemon_start"] = d
+    if start.timestamp() < d and d - RESTART_WINDOW_S <= end.timestamp() <= d + 120:
+        return "daemon"
+    return None
 
 
 def _pueue_directory():
@@ -850,8 +916,10 @@ def host_probe(req):
     s["token_mismatch"] = False
     if s["status"] == "Done":
         s["scope"] = _scope_result(s["token"])
+        s["killed_by"] = _killed_by(s)
     g = st.get("groups", {}).get(s["group"]) or {}
     s["group_parallel"] = g.get("parallel_tasks")
+    s["group_status"] = g.get("status")
     s["group_running"] = sum(1 for x in st.get("tasks", {}).values()
                              if x.get("group") == s["group"] and "Running" in (x.get("status") or {}))
     s["clk_tck"] = os.sysconf("SC_CLK_TCK")
@@ -941,6 +1009,7 @@ def host_ls(req):
     for s in out:
         if s["status"] == "Done" and s.get("token"):
             s["scope"] = _scope_result(s["token"])
+            s["killed_by"] = _killed_by(s)
         elif s["status"] == "Stashed" and s.get("token"):
             _probe_admission(s, {})
         elif s["status"] == "Running" and s.get("token"):
@@ -1040,6 +1109,7 @@ def host_show(req):
             pass
     if s["status"] == "Done":
         s["scope"] = _scope_result(tok)
+        s["killed_by"] = _killed_by(s)
     try:
         settings = _admission_settings()
     except JobError:
@@ -4050,6 +4120,18 @@ def scope_verdict(verdict, code, scope):
     return verdict, code, "; ".join(notes) or None
 
 
+def _restart_verdict(verdict, code, note, s, host):
+    """KILLED_BY_RESTART for a job that was running when the pueue daemon stopped."""
+    if verdict != "KILLED" or s.get("killed_by") != "daemon":
+        return verdict, code, note
+    d = s.get("daemon_start")
+    when = " (it started again %s)" % _fmt_et(dt.datetime.fromtimestamp(d).astimezone()) if d else ""
+    why = ("it was still running when the pueue daemon on %s stopped%s; it did not end on its own. Submit it again; "
+           "if jobs wait in a paused group, start it with: job resume %s --group %s" % (
+               host, when, host, shlex.quote(str(s.get("group") or "default"))))
+    return "KILLED_BY_RESTART", EXIT["KILLED_BY_RESTART"], (note + "; " + why) if note else why
+
+
 def report(host, o, out):
     s, verdict, code = o["s"], o["verdict"], o["code"]
     label = s.get("label") or "-"
@@ -4074,8 +4156,9 @@ def report(host, o, out):
         lines.append("the job has also ended: %s exit %d" % (v, c))
     if verdict in URGENT and s.get("status") not in (None, "Done"):
         tok = (" --token %s" % s["token"]) if s.get("token") else ""
-        lines.append("the job was left running; reattach: job wait %s %s%s ; stop it: job kill %s %s%s"
-                     % (host, s.get("id"), tok, host, s.get("id"), tok))
+        lines.append("the job was left %s; reattach: job wait %s %s%s ; stop it: job kill %s %s%s"
+                     % ("running" if s.get("status") == "Running" else "as it is (%s)" % s.get("status"),
+                        host, s.get("id"), tok, host, s.get("id"), tok))
     tail = o.get("tail")
     if tail:
         lines.append("--- last %d log lines ---" % len(tail))
@@ -4117,6 +4200,7 @@ class Waiter:
         self.alert_cursor = None  # admission alerts already seen; a new wait starts at the current end
         self.told_held = None
         self.told_stale = False
+        self.told_paused = False
 
     def _outcome(self, verdict, code, s, note=None, tail=True):
         """The verdict is already decided; a last probe only refreshes what is shown (status, tail)."""
@@ -4247,10 +4331,18 @@ class Waiter:
         if status == "Done":
             verdict, code = verdict_of(s)
             verdict, code, note = scope_verdict(verdict, code, s.get("scope"))
+            verdict, code, note = _restart_verdict(verdict, code, note, s, self.host)
             return self._outcome(verdict, code, s, note=note)
 
         if status != "Running":  # queued, paused, stashed: not a stall
             self.samples = []
+            if status in ("Queued", "Paused") and s.get("group_status") == "Paused" and not self.told_paused:
+                self.told_paused = True
+                g = shlex.quote(str(s.get("group")))
+                return self._outcome("ALERT", EXIT["ALERT"], s, tail=False, note=(
+                    "its group %s on %s is paused, so the job will not %s until the group is started again (a pueue "
+                    "daemon restart pauses the groups that had running jobs). Start it with: job resume %s --group %s"
+                    % (g, self.host, "start" if status == "Queued" else "go on", self.host, g)))
             running, limit = s.get("group_running") or 0, s.get("group_parallel") or 0
             if status == "Queued" and not self.told_queued and limit and running >= limit:
                 self.told_queued = True
@@ -4413,9 +4505,49 @@ def _check_ok(args):
         args.check = os.path.abspath(args.check)
 
 
-def _waiter(args, tid, token):
-    return Waiter(args.host, tid, token=token, stall_min=args.stall, stall_cpu=args.stall_cpu,
-                  check=args.check, from_start=getattr(args, "from_start", True), tail=args.tail)
+CHECKS_DIR = os.path.join(STATE_DIR, "checks")  # --check scripts kept per job token, on the waiting machine
+
+
+def _keep_check(token, path):
+    """Keep a copy of a job's --check script, so a later `job wait` (after a restart cleared a temporary folder)
+    still runs it. Copies older than SCRIPT_KEEP_DAYS are removed."""
+    if not token or not path:
+        return
+    try:
+        os.makedirs(CHECKS_DIR, mode=0o700, exist_ok=True)
+        cutoff = time.time() - SCRIPT_KEEP_DAYS * 86400
+        for name in os.listdir(CHECKS_DIR):
+            q = os.path.join(CHECKS_DIR, name)
+            if os.path.getmtime(q) < cutoff:
+                os.remove(q)
+        dest = os.path.join(CHECKS_DIR, token)
+        with open(path, "rb") as f:
+            data = f.read()
+        with open(dest + ".tmp", "wb") as f:
+            f.write(data)
+        os.chmod(dest + ".tmp", 0o700)
+        os.replace(dest + ".tmp", dest)
+    except OSError as e:
+        sys.stderr.write("job: could not keep a copy of --check %s (%s); a later job wait needs --check again\n"
+                         % (path, e))
+
+
+def _kept_check(token):
+    p = os.path.join(CHECKS_DIR, token) if token else None
+    return p if p and os.path.isfile(p) and os.access(p, os.X_OK) else None
+
+
+def _waiter(args, tid, token, host=None):
+    check = args.check
+    if check:
+        if not getattr(args, "check_kept", False):
+            _keep_check(token, check)
+    elif _kept_check(token):
+        check = _kept_check(token)
+        sys.stderr.write("job: %s#%s: using the --check script kept with the job (%s)\n" % (
+            host or args.host, tid, check))
+    return Waiter(host or args.host, tid, token=token, stall_min=args.stall, stall_cpu=args.stall_cpu,
+                  check=check, from_start=getattr(args, "from_start", True), tail=args.tail)
 
 
 def cmd_run(args, queue_only=False):
@@ -4424,6 +4556,9 @@ def cmd_run(args, queue_only=False):
         _check_ok(args)
     sub = submit(args, command)
     tid, tok = sub["id"], sub["token"]
+    if not queue_only and args.check:
+        _keep_check(tok, args.check)  # before anything is printed: a wait lost from here on can reattach with it
+        args.check_kept = True
     again = "job wait %s %s --token %s" % (args.host, tid, tok)
     global QUEUED_HINT
     QUEUED_HINT = "the job %s#%s was queued and keeps running; reattach with: %s" % (args.host, tid, again)
@@ -4452,8 +4587,79 @@ def _id_token(text):
     return tid, tok or None
 
 
+def _ls_hosts(hosts=None):
+    """The hosts job ls and job wait --mine ask: each machine once (a listed name for this one replaces local)."""
+    if hosts:
+        return hosts
+    here = [h for h in LISTED if h != "local" and HOSTS[h] is None]
+    return [h for h in LISTED if not (h == "local" and here)]
+
+
+def _ls_all(hosts):
+    """{host: ls reply, or the exception}, asked in parallel."""
+    results = {}
+
+    def fetch(h):
+        try:
+            results[h] = call(h, "ls", {}, timeout=60)
+        except (JobError, Unreachable) as e:
+            results[h] = e
+
+    threads = [threading.Thread(target=fetch, args=(h,)) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def cmd_wait_mine(args):
+    """Wait on every unfinished job this session submitted, on every host."""
+    me = _session()
+    if me == "unknown":
+        raise JobError("this shell has no session id (JOB_SESSION, or Claude Code's session variables), so --mine "
+                       "cannot tell your jobs from others'; wait on them by id")
+    hosts = _ls_hosts()
+    results = _ls_all(hosts)
+    waiters, notes, unlisted = [], [], False
+    for h in hosts:
+        r = results.get(h)
+        if isinstance(r, Exception):
+            notes.append("%s could not be listed (%s); its jobs are not in this wait" % (h, r))
+            unlisted = True
+            continue
+        for s in r["tasks"]:
+            if s.get("session") != me:
+                continue
+            if s["status"] != "Done" and s.get("token"):
+                waiters.append(_waiter(args, s["id"], s["token"], host=h))
+            elif s["status"] == "Done" and s.get("killed_by") == "daemon":
+                end = _parse_time(s.get("end"))
+                if end and (dt.datetime.now(end.tzinfo) - end).total_seconds() < RESTART_WINDOW_S:
+                    notes.append("%s#%s (%s) ended KILLED_BY_RESTART at %s: it was running when the pueue daemon "
+                                 "there stopped; submit it again" % (h, s["id"], s.get("label"), _fmt_et(end)))
+    if not waiters:
+        print("job: no unfinished job of session %s on %s" % (me, ", ".join(hosts)))
+        for n in notes:
+            print("note: " + n)
+        code = EXIT["UNREACHABLE"] if unlisted else 0
+        print("job: %s exit %d" % ("UNREACHABLE" if unlisted else "NONE", code))
+        return code
+    sys.stderr.write("job: waiting on %d unfinished job(s) of session %s: %s\n" % (
+        len(waiters), me, " ".join(_ref(w) for w in waiters)))
+    return wait_all(None, waiters, poll=args.poll, notes=notes)
+
+
 def cmd_wait(args):
     _check_ok(args)
+    if args.mine:
+        if args.host or args.ids or args.token:
+            raise JobError("job wait --mine takes no host, id or --token")
+        return cmd_wait_mine(args)
+    if not args.host or not args.ids:
+        raise JobError("job wait needs a host and at least one job id (or --mine)")
+    if args.host not in HOSTS:
+        raise JobError("unknown host %r; known hosts: %s (add it to %s)" % (args.host, ", ".join(HOSTS), HOSTS_FILE))
     pairs = [_id_token(x) for x in args.ids]
     if args.token:
         if len(pairs) != 1:
@@ -4577,7 +4783,8 @@ def cmd_ls(args):
                     continue
             state = s["status"]
             if state == "Done":
-                v, c, _ = scope_verdict(*verdict_of(s), s.get("scope"))
+                v, c, n = scope_verdict(*verdict_of(s), s.get("scope"))
+                v, c, _ = _restart_verdict(v, c, n, s, h)
                 state = v if v != "FAILED" else "FAILED(%d)" % c
             what = (s.get("summary") or s.get("command") or "")[:60]
             if s.get("held"):
@@ -4587,8 +4794,8 @@ def cmd_ls(args):
                 what = "[%g of %g%s] %s" % (s["progress"][0], s["progress"][1], ", ends about %s" % dt.datetime.fromtimestamp(
                     end).astimezone().strftime("%Y-%m-%d %H:%M %Z") if end else "", what)
             rows.append((h, str(s["id"]), s.get("label") or "-", state, _fmt_dur(_runtime(s)),
-                         s.get("group") or "", s.get("session") or "unknown", what))
-    head = ("HOST", "ID", "TASK", "STATUS", "RUN TIME", "GROUP", "SESSION", "COMMAND")
+                         s.get("group") or "", s.get("session") or "unknown", s.get("token") or "-", what))
+    head = ("HOST", "ID", "TASK", "STATUS", "RUN TIME", "GROUP", "SESSION", "TOKEN", "COMMAND")
     if rows:
         widths = [max(len(r[i]) for r in rows + [head]) for i in range(len(head))]
         for r in [head] + rows:
@@ -4634,6 +4841,7 @@ def cmd_show(args):
     state = s.get("status")
     if state == "Done":
         v, c, note = scope_verdict(*verdict_of(s), s.get("scope"))
+        v, c, note = _restart_verdict(v, c, note, s, args.host)
         state = "Done: %s exit %d%s" % (v, c, " (%s)" % note if note else "")
     adm = s.get("admission") or {}
     if s.get("held"):
@@ -4726,7 +4934,8 @@ HELP_RULES = """rules (docs/usage.md has the rest):
   - never pipe job run or job wait (| tail, | head, | grep): the pipe's exit code replaces the job's, and the
     verdict can be cut off. Use --tail N for fewer log lines. The first and the last line carry the verdict.
   - run job run / job wait in the background; their exit is the wake-up. Lost the wait? Reattach with
-    job wait HOST ID --token T (job run printed it).
+    job wait HOST ID --token T (job run printed it; job ls shows tokens), or after a restart of this machine or
+    the app, job wait --mine: every unfinished job of this session on every host. --check scripts are kept.
   - a job without --group runs in your session's own group, one at a time; it never waits behind another
     session's jobs. For jobs side by side: job group HOST NAME N, then --group NAME.
   - on admission hosts every job needs a size: best --pilot first, then --like TOKEN (or --like last).
@@ -4796,8 +5005,10 @@ def build_parser():
             waitopts(q)
 
     q = sub.add_parser("wait", help="wait on one or more queued or finished jobs on one host", epilog=RUN_RULES)
-    q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
-    q.add_argument("ids", nargs="+", metavar="ID[:TOKEN]",
+    q.add_argument("host", nargs="?", default=None, help="local, or a name from %s" % HOSTS_FILE)
+    q.add_argument("--mine", action="store_true",
+                   help="every unfinished job this session submitted, on every host (after a restart)")
+    q.add_argument("ids", nargs="*", metavar="ID[:TOKEN]",
                    help="job ids; ID:TOKEN refuses an id that now belongs to another job")
     q.add_argument("--token", default=None, help="with one id: the token 'job submit' printed; refuses a reused id")
     q.add_argument("--from-start", action="store_true",

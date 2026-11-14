@@ -699,6 +699,28 @@ class FreshDaemonTests(Base):
         self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
         self.assertIn("job's own record", p.stdout)
 
+    def test_a_job_running_when_the_daemon_restarts_ends_killed_by_restart(self):
+        tid = int(self.job("submit", "local", "T-rs", "--", "sleep 60", JOB_SESSION="s-rs").stdout)
+        killed = self.submit("sleep 60", task="T-rs-k")
+        self.wait_status(tid, "Running")
+        self.wait_status(killed, "Running")
+        self.assertEqual(self.job("kill", "local", str(killed)).returncode, 0)
+        self.d.restart(down_for=1)
+        p = self.job("wait", "local", str(tid), "--poll", "0.3")
+        self.assertEqual(p.returncode, 208, p.stdout + p.stderr)
+        self.assertTrue(p.stdout.startswith("job: KILLED_BY_RESTART local#%d" % tid), p.stdout)
+        self.assertIn("pueue daemon on local stopped", p.stdout)
+        self.assertIn("job resume local --group", p.stdout)
+        self.assertNotIn("Traceback", p.stdout + p.stderr)
+        self.assertEqual(p.stdout.splitlines()[-1], "job: KILLED_BY_RESTART local#%d exit 208" % tid)
+        mine = self.job("wait", "--mine", JOB_SESSION="s-rs")
+        self.assertIn("ended KILLED_BY_RESTART", mine.stdout)
+        self.assertEqual(mine.returncode, 0, mine.stdout)
+        k = self.job("wait", "local", str(killed), "--poll", "0.3")
+        self.assertEqual(k.returncode, 137, k.stdout + k.stderr)
+        ls = self.job("ls", "local")
+        self.assertRegex(ls.stdout, r"\n\S+\s+%d\s+T-rs\s+KILLED_BY_RESTART" % tid)
+
     def test_wait_survives_a_daemon_restart(self):
         tid = self.submit("sleep 6", task="T-restart")
         self.wait_status(tid, "Running")
@@ -1013,6 +1035,90 @@ class KillTests(Base):
         h = " ".join(self.job("kill", "--help").stdout.split())
         self.assertIn("remove a queued or held one", h)
         self.assertIn("remove a queued or held one", " ".join(self.job("--help").stdout.split()))
+
+
+class RestartRecoveryTests(Base):
+    """job wait --mine, tokens in job ls, kept --check scripts, paused groups (TASK-007.08)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.d.pueue("group", "add", "rr")
+        cls.d.pueue("parallel", "8", "--group", "rr")
+
+    def test_wait_mine_waits_on_this_sessions_unfinished_jobs(self):
+        a = int(self.job("submit", "local", "T-mine", "--group", "rr", "--", "sleep 2", JOB_SESSION="s-mine").stdout)
+        b = int(self.job("submit", "local", "T-mine", "--group", "rr", "--", "sleep 3", JOB_SESSION="s-mine").stdout)
+        other = int(self.job("submit", "local", "T-mine", "--group", "rr", "--", "sleep 60",
+                             JOB_SESSION="s-notmine").stdout)
+        p = self.job("wait", "--mine", "--poll", "0.3", JOB_SESSION="s-mine")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(p.stdout.startswith("job: ALL ENDED local: 2 SUCCESS"), p.stdout)
+        self.assertEqual(p.stdout.splitlines()[-1], "job: SUCCESS local#%d,%d exit 0" % (a, b))
+        self.assertNotIn("local#%d" % other, p.stdout)
+        none = self.job("wait", "--mine", JOB_SESSION="s-mine")
+        self.assertEqual(none.returncode, 0, none.stdout)
+        self.assertIn("no unfinished job of session s-mine", none.stdout)
+        self.d.pueue("kill", str(other))
+
+    def test_wait_mine_needs_a_session(self):
+        env = self.d.env()
+        for k in ("JOB_SESSION", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
+            env.pop(k, None)
+        p = subprocess.run([sys.executable, JOB, "wait", "--mine"], capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("no session id", p.stdout)
+
+    def test_ls_shows_the_token(self):
+        sub = self.job("submit", "local", "T-lstok", "--", "true")
+        token = sub.stderr.split("--token ", 1)[1].split()[0]
+        ls = self.job("ls", "local")
+        self.assertIn("TOKEN", ls.stdout.splitlines()[0])
+        self.assertIn(token, ls.stdout)
+
+    def test_a_kept_check_runs_on_reattach_after_the_original_is_gone(self):
+        chk = os.path.join(self.d.dir, "gone-check.sh")
+        with open(chk, "w") as f:
+            f.write("#!/bin/sh\nif grep -q ERROR; then echo 'kept check saw ERROR'; exit 1; fi\n")
+        os.chmod(chk, 0o755)
+        run = subprocess.Popen([sys.executable, JOB, "run", "local", "T-kept", "--group", "rr", "--poll", "0.3",
+                                "--check", chk, "--", "sleep 3; echo ERROR late; sleep 60"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.d.env())
+        line = run.stderr.readline()
+        tid, token = int(line.split("#", 1)[1].split()[0]), line.split("--token ", 1)[1].split()[0]
+        run.kill()  # the wait is lost (an app restart); the job runs on
+        run.communicate()
+        os.remove(chk)  # its temporary folder is gone too
+        p = self.job("wait", "local", str(tid), "--token", token, "--poll", "0.3")
+        self.assertEqual(p.returncode, 201, p.stdout + p.stderr)
+        self.assertIn("kept check saw ERROR", p.stdout)
+        self.assertIn("using the --check script kept with the job", p.stderr)
+        self.d.pueue("kill", str(tid))
+
+    def test_a_paused_group_alerts_with_job_resume(self):
+        self.job("group", "local", "rrp", "1")
+        self.d.pueue("pause", "--group", "rrp")
+        tid = self.submit("true", task="T-rrp", extra=("--group", "rrp"))
+        p = self.job("wait", "local", str(tid), "--poll", "0.3")
+        self.assertEqual(p.returncode, 201, p.stdout + p.stderr)
+        self.assertIn("its group rrp on local is paused", p.stdout)
+        self.assertIn("job resume local --group rrp", p.stdout)
+        self.assertNotIn("pueue start", p.stdout)
+        self.job("resume", "local", "--group", "rrp")
+        self.assertEqual(self.job("wait", "local", str(tid), "--poll", "0.3").returncode, 0)
+
+    def test_killed_by_restart_needs_the_times_to_fit(self):
+        job = self.load_job()
+        job._daemon_start = lambda proc="/proc": 1_000_000.0
+
+        def task(start, end):
+            iso = lambda t: __import__("datetime").datetime.fromtimestamp(t).astimezone().isoformat()
+            return {"result": "Killed", "start": iso(start), "end": iso(end), "token": None}
+        self.assertEqual(job._killed_by(task(999_000, 999_990)), "daemon")       # stopped, started 10 s later
+        self.assertEqual(job._killed_by(task(999_000, 1_000_030)), "daemon")     # died; marked when it started
+        self.assertIsNone(job._killed_by(task(1_000_100, 1_000_200)))           # started under this daemon
+        self.assertIsNone(job._killed_by(task(800_000, 900_000)))               # ended over a day before
+        self.assertIsNone(job._killed_by(dict(task(999_000, 999_990), result="Failed")))
 
 
 if __name__ == "__main__":
