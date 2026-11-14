@@ -892,6 +892,7 @@ ADMISSION_DEFAULTS = {
     "pilot_sample_interval_s": 1,
     "warmup_s": None,                  # default: the longer of the two windows
     "fairness_wait_min": 30,
+    "fairness_small_fraction": 0.1,    # a younger job taking under this share of what the oldest lacks may start
     "oversize_after_min": 30,          # a running job whose RAM peak stays under oversize_fraction of its size
     "oversize_fraction": 0.5,          # this long gets one ALERT saying so, with the command to shrink it
     "resize_margin": 1.25,             # a running job's new RAM limit must cover its measured peak times this
@@ -957,6 +958,7 @@ def _admission_settings(path=None, nthreads=None):
               "oversize_after_min"):
         _num(s[k], k, lo=1, whole=True)
     _num(s["oversize_fraction"], "oversize_fraction", lo=0.01, hi=1.0)
+    _num(s["fairness_small_fraction"], "fairness_small_fraction", lo=0.0, hi=1.0)
     _num(s["resize_margin"], "resize_margin", lo=1.0, hi=10.0)
     if s["warmup_s"] is None:
         s["warmup_s"] = max(s["outside_window_s"], s["cpu_window_s"])
@@ -1388,6 +1390,11 @@ def compute_room(settings, samples, inflight, holds, now):
     return out
 
 
+def _pilot_ram_need(settings, size):
+    """The RAM room a pilot needs before it is released."""
+    return size["ram"]
+
+
 def ram_limit(settings, ram):
     """The hard RAM limit of a job sized `ram`. A job is counted at it, not at its size, so jobs that grow up to their
     limits together still leave ram_headroom free."""
@@ -1459,6 +1466,32 @@ def fits(settings, room, job, data_disk=None):
         chosen = [u for _, _, u in picked]
         gpu_counted = {u: (r if pilot else size["gpu_mem"]) for r, _, u in picked}
     return True, {"gpus": chosen, "ram_counted": ram_counted, "gpu_counted": gpu_counted}
+
+
+def _lack(settings, room, q):
+    """{resource: how much a held job lacks of it in this room}: "ram", "cpu", "gpu:<uuid>", "disk:<name>"."""
+    lack = {}
+    size = q["size"]
+    if q.get("pilot"):
+        lack["ram"] = max(0.0, _pilot_ram_need(settings, size) - room["ram"]["room"])
+    elif ram_limit(settings, size["ram"]) > room["ram"]["room"]:
+        lack["ram"] = ram_limit(settings, size["ram"]) - room["ram"]["room"]
+    cpu = max(size["cpus"] - room["cpu"]["room"], size["cpus"] - room["cpu"]["placed_room"])
+    if cpu > 1e-9:
+        lack["cpu"] = cpu
+    if size.get("gpus"):
+        model = (q.get("constraints") or {}).get("gpu_model")
+        need = settings["pilot"]["gpu_min_gb"] * GB if q.get("pilot") else size["gpu_mem"]
+        for u, g in room["gpus"].items():
+            if model and model.lower() not in g["name"].lower():
+                continue
+            if g["util"] > settings["gpu_busy_max_pct"]:
+                lack["gpu:" + u] = 0.0
+            elif g["room"] < need:
+                lack["gpu:" + u] = need - g["room"]
+    if q.get("data_disk"):
+        lack["disk:" + q["data_disk"]] = 0.0
+    return lack
 
 
 def fits_empty(settings, capacity, job):
@@ -2537,7 +2570,10 @@ class Loop:
         for t in st.get("tasks", {}).values():
             if _task_status(t) in ("Running", "Queued"):  # an enqueued job takes a slot as soon as one is free
                 running[t.get("group")] = running.get(t.get("group"), 0) + 1
-        blocked = None  # the resources the waiting oldest job is short of
+        blocked = blocker = None  # {resource: what the waiting oldest job lacks of it}, and that job
+        taken = {}  # what younger jobs released past it, and still in flight, take of each of those resources
+        small = self.s["fairness_small_fraction"]
+        inflight = {q["token"] for q in queue if q.get("state") == "released"}
         for q in queue:
             if q.get("state") != "held":
                 continue
@@ -2556,15 +2592,36 @@ class Loop:
                 self.adm.save(q)
                 continue
             ok, got = fits(self.s, room, q, q.get("data_disk"))
-            if ok and blocked is not None and blocked & self._resources(q, got):
-                ok, got = False, "waiting behind an older job that needs the same room"
+            if ok and blocked is not None:
+                hit = set(blocked) & self._resources(q, got)
+                need = self._need(q, got)
+                # A job that takes under a small share of what the oldest lacks barely delays it, and may start. The
+                # share is a budget kept with the oldest job over cycles: the jobs let past it that still run, together,
+                # take less than the share of the smaller of what it lacked when it was first blocked and what it
+                # lacks now, so a stream of small jobs cannot hold it back for long.
+                if hit and all(taken.get(r, 0) + need.get(r, math.inf) < small * blocked[r] for r in hit):
+                    passed = {r: need[r] for r in hit}
+                    for r in hit:
+                        taken[r] = taken.get(r, 0) + need[r]
+                    blocker.setdefault("fair_passed", {})[q["token"]] = passed
+                    self.adm.save(blocker)
+                elif hit:
+                    ok, got = False, "waiting behind an older job that needs the same room"
             if not ok:
                 q["reason"] = got
                 self.adm.save(q)
                 if (blocked is None and now - q["submitted"] >= 60 * self.s["fairness_wait_min"]
                         and fits(self.s, self.room_empty, q, q.get("data_disk"))[0]):
                     # it would fit once admitted jobs end, so younger jobs must not take that room
-                    blocked = self._short_of(room, q)
+                    blocked, blocker = self._short_of(room, q), q
+                    base = q.setdefault("fair_base", dict(blocked))
+                    for r in blocked:
+                        blocked[r] = min(blocked[r], base.get(r, blocked[r]))
+                    q["fair_passed"] = {tok: n for tok, n in (q.get("fair_passed") or {}).items() if tok in inflight}
+                    for n in q["fair_passed"].values():
+                        for r, v in n.items():
+                            taken[r] = taken.get(r, 0) + v
+                    self.adm.save(q)
                 continue
             if self.enqueue(con, now, q, t, got):
                 _take(room, q, got)
@@ -2577,23 +2634,17 @@ class Loop:
             r.add("disk:" + q["data_disk"])
         return r
 
+    def _need(self, q, got):
+        """What a job that fits takes of each resource it is counted on."""
+        need = {"ram": got["ram_counted"], "cpu": q["size"]["cpus"]}
+        need.update({"gpu:" + u: b for u, b in got["gpu_counted"].items()})
+        return need
+
     def _short_of(self, room, q):
-        """What a held job lacks now; an empty set when it is held for some other reason."""
-        short = set()
-        size = q["size"]
-        if ram_limit(self.s, size["ram"]) > room["ram"]["room"] or q.get("pilot"):
-            short.add("ram")
-        if size["cpus"] > room["cpu"]["room"]:
-            short.add("cpu")
-        if size.get("gpus"):
-            model = (q.get("constraints") or {}).get("gpu_model")
-            need = self.s["pilot"]["gpu_min_gb"] * GB if q.get("pilot") else size["gpu_mem"]
-            short |= {"gpu:" + u for u, g in room["gpus"].items()
-                      if (not model or model.lower() in g["name"].lower())
-                      and (g["room"] < need or g["util"] > self.s["gpu_busy_max_pct"])}
-        if q.get("data_disk"):
-            short.add("disk:" + q["data_disk"])
-        return short
+        """{resource: how much a held job lacks of it now}; empty when it is held for some other reason. A resource
+        it is short of in a way no amount measures (a busy GPU, a busy disk; a pilot, which takes all the RAM room)
+        lacks 0, so no younger job may take from it."""
+        return _lack(self.s, room, q)
 
     def enqueue(self, con, now, q, t, got):
         """Release one job: write its assignment, then pueue enqueue <id> (never without an id)."""

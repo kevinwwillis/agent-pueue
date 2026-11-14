@@ -112,6 +112,7 @@ standard-library Python 3.8. An example for a 32-thread host with 256 GB RAM (il
   "sample_interval_s": 15,
   "pilot_sample_interval_s": 1,
   "fairness_wait_min": 30,
+  "fairness_small_fraction": 0.1,
   "oversize_after_min": 30,
   "oversize_fraction": 0.5,
   "resize_margin": 1.25,
@@ -354,8 +355,14 @@ when the first job grows back. The record keeps the measured peaks, so the next 
 ### Fairness
 
 Release is oldest first. Once the oldest held job has waited `fairness_wait_min`, a younger job is released only
-if it takes nothing from a resource on which the oldest job is short; a resource is one GPU card, or one host's
-RAM, CPU or disk. A held job does not block others when it is held for a reason other than room (its group is
+if it takes nothing from a resource on which the oldest job is short, or takes little of it; a resource is one GPU
+card, or one host's RAM, CPU or disk. Little means: what the younger job is counted at on each such resource (RAM
+at its hard limit, CPU at its size, GPU memory at its size), added to what the younger jobs already let past the
+oldest and still in flight take there, stays under `fairness_small_fraction` of what the oldest lacks of it. What it
+lacks is the smaller of its shortfall now and its shortfall when it was first blocked, kept in its queue entry, so
+a stream of small jobs cannot set it back by more than that share. A resource it is short of in a way no amount
+measures (a GPU busy over `gpu_busy_max_pct`, a busy disk) and a pilot's RAM (it takes all the RAM room) lack 0, so
+no younger job takes from them, as before. A held job does not block others when it is held for a reason other than room (its group is
 full or paused), or when it would be short even with every admitted job on the host ended, because outside use
 and holds alone leave too little.
 

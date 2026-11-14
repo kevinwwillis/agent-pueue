@@ -684,6 +684,15 @@ class ResizeRules(unittest.TestCase):
         self.assertIn("ends in exit 137", why)
         self.assertIn("--pilot, then --like", why)
 
+    def test_what_a_held_job_lacks(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=5 * GB, busy=7.0, gpus={CARD: card(20 * GB)})], [], [], 100)
+        lack = self.j._lack(self.s, r, held(cpus=3, ram=4 * GB, gpus=1, gpu_mem=6 * GB))
+        self.assertAlmostEqual(lack["ram"], self.j.ram_limit(self.s, 4 * GB) - 4 * GB, delta=1e6)
+        self.assertAlmostEqual(lack["cpu"], 2.0)
+        self.assertAlmostEqual(lack["gpu:" + CARD], 6 * GB - 3.5 * GB, delta=1e6)
+        self.assertEqual(self.j._lack(self.s, r, held(cpus=1, ram=GB)), {})
+        self.assertEqual(settings(self.j, self.tmp)["fairness_small_fraction"], 0.1)
+
     def test_history_shows_the_size_it_ended_with_and_that_it_was_resized(self):
         j = {"pilot": 0, "size": {"cpus": 4, "ram": 32 * GB, "gpus": 0, "gpu_mem": 0},
              "resized": [{"t": 1.0, "state": "released", "from": {"cpus": 8, "ram": 64 * GB},
@@ -2118,6 +2127,33 @@ class LoopTests(Base):
             self.assertIn("is a pilot", p.stdout)
         finally:
             self.d.pueue("remove", str(r["data"]["id"]))
+
+    # -- TASK-007.02: small younger jobs pass the fairness rule ------------------------------------------------
+
+    def test_a_small_younger_job_passes_an_older_one_that_waits(self):
+        now = [time.time()]
+        self.host.set(avail=12 * GB)
+        loop = self.loop(clock=lambda: now[0])
+        first = self.submit_sized("sleep 60", cpus=1, ram=4 * GB)  # runs, counted at its 6 GB limit: 5 GB left
+        self.assertTrue(self.cycles(loop, lambda: self.status(first["data"]["id"]) == "Running"))
+        big = self.submit_sized("echo big", cpus=1, ram=4 * GB)    # lacks 1 GB of RAM
+        now[0] += 120  # past the one-minute fairness wait
+        # each tiny job is counted at 60 MB, under a tenth of what the oldest lacks; two of them are not
+        tiny = [self.submit_sized("sleep 30", cpus=0.1, ram=40 * 10 ** 6) for _ in range(2)]
+        try:
+            for _ in range(3):
+                self.host.tick()
+                loop.cycle()
+            self.assertEqual(self.status(big["data"]["id"]), "Stashed")
+            self.assertIn(self.status(tiny[0]["data"]["id"]), ("Running", "Done", "Queued"))
+            self.assertEqual(self.status(tiny[1]["data"]["id"]), "Stashed")
+            with open(os.path.join(self.state, "room.json")) as f:
+                reasons = {h["token"]: h["reason"] for h in json.load(f)["held"]}
+            self.assertIn("older job", reasons[tiny[1]["data"]["token"]])
+        finally:
+            for r in [first] + tiny:
+                self.job("kill", "local", str(r["data"]["id"]))
+            self.d.pueue("remove", str(big["data"]["id"]))
 
     def test_admission_status(self):
         p = self.job("admission", "local", "status", **self.env())

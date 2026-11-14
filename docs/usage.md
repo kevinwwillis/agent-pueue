@@ -267,6 +267,9 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   free; ...`); being held is not a verdict. A job needs room for its hard RAM limit, not just its size. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
   Don't shrink a held job's size below what it needs to get it started: it then ends in exit 137 at its limit. Size
   it from a measured run (`--pilot`, then `--like`).
+- Release is oldest first. Once the oldest held job has waited `fairness_wait_min` (30 minutes), younger jobs that
+  need the room it lacks wait behind it, except a small one: one counted at under a tenth
+  (`fairness_small_fraction`) of what the oldest still lacks of each resource they share.
 - `job resize HOST ID [--token T] --ram SIZE [--cpus N]` changes an admitted job's size. A held job may take any
   size the host could run, keeps its place in the queue, and is refused a RAM size below the highest RAM peak of an
   earlier finished run of the same task id there. A running job may only shrink: its RAM limit is lowered at once
