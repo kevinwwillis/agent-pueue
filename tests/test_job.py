@@ -930,5 +930,90 @@ class MultiWaitTests(Base):
         self.assertIn("PILOT_TIME_LIMIT", job.GOOD)
 
 
+class KillTests(Base):
+    """job kill ends the whole process tree, says what it did, removes queued jobs as KILLED, and kills by task
+    (TASK-001)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.d.pueue("group", "add", "kt")
+        cls.d.pueue("parallel", "8", "--group", "kt")
+
+    def pid_alive(self, pid):
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return False
+
+    def test_kill_ends_children_in_their_own_process_group(self):
+        pidfile = os.path.join(self.d.dir, "child.pid")
+        # timeout puts itself in its own process group, so pueue's kill of the job's group misses it and its child
+        tid = self.submit("timeout 300 sh -c 'echo $$ > %s; exec sleep 300'" % pidfile, task="T-ktree",
+                          extra=("--group", "kt"))
+        for _ in range(100):
+            if os.path.exists(pidfile) and _read(pidfile):
+                break
+            time.sleep(0.05)
+        child = int(_read(pidfile))
+        k = self.job("kill", "local", str(tid))
+        self.assertEqual(k.returncode, 0, k.stdout + k.stderr)
+        self.assertRegex(k.stdout, r"local#%d killed: [1-9][0-9]* process\(es\) of the job were running; none is left"
+                         % tid)
+        self.assertFalse(self.pid_alive(child), "the job's child in another process group is still running")
+        p = self.job("wait", "local", str(tid), "--poll", "0.3")
+        self.assertEqual(p.returncode, 137, p.stdout + p.stderr)
+        self.assertTrue(p.stdout.startswith("job: KILLED local#%d" % tid), p.stdout)
+
+    def test_removing_a_queued_job_ends_its_wait_killed(self):
+        self.job("group", "local", "kq1", "1")
+        a = self.submit("sleep 30", task="T-kq1a", extra=("--group", "kq1"))
+        self.wait_status(a, "Running")
+        sub = self.job("submit", "local", "T-kq1b", "--group", "kq1", "--", "true")
+        b = int(sub.stdout)
+        token = sub.stderr.split("--token ", 1)[1].split()[0]
+        w = subprocess.Popen([sys.executable, JOB, "wait", "local", "%d:%s" % (b, token), "--poll", "0.3"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.d.env())
+        time.sleep(1)
+        k = self.job("kill", "local", str(b))
+        self.assertIn("removed from the queue", k.stdout)
+        out, err = w.communicate(timeout=30)
+        self.assertEqual(w.returncode, 137, out + err)
+        self.assertTrue(out.startswith("job: KILLED local#%d" % b), out)
+        self.assertIn("removed from the queue by job kill before it ran", out)
+        self.job("kill", "local", str(a))
+
+    def test_kill_by_task_refuses_other_sessions_jobs(self):
+        mine = self.job("submit", "local", "T-ktask", "--group", "kt", "--", "sleep 30", JOB_SESSION="s-me")
+        theirs = self.job("submit", "local", "T-ktask", "--group", "kt", "--", "sleep 30", JOB_SESSION="s-other")
+        a, b = int(mine.stdout), int(theirs.stdout)
+        self.wait_status(a, "Running")
+        self.wait_status(b, "Running")
+        k = self.job("kill", "local", "--task", "T-ktask", JOB_SESSION="s-me")
+        self.assertEqual(k.returncode, 205, k.stdout + k.stderr)
+        self.assertIn("other sessions", k.stdout)
+        self.assertIn("Running", self.d.status(a))
+        k = self.job("kill", "local", "--task", "T-ktask", "--all-sessions", JOB_SESSION="s-me")
+        self.assertEqual(k.returncode, 0, k.stdout + k.stderr)
+        self.assertIn("local#%d killed" % a, k.stdout)
+        self.assertIn("local#%d killed" % b, k.stdout)
+        none = self.job("kill", "local", "--task", "T-ktask", JOB_SESSION="s-me")
+        self.assertIn("no unfinished job of task T-ktask", none.stdout)
+
+    def test_kill_by_task_of_my_own_jobs(self):
+        ids = [int(self.job("submit", "local", "T-kown", "--group", "kt", "--", "sleep 30", JOB_SESSION="s-own").stdout)
+               for _ in range(2)]
+        k = self.job("kill", "local", "--task", "T-kown", JOB_SESSION="s-own")
+        self.assertEqual(k.returncode, 0, k.stdout + k.stderr)
+        for i in ids:
+            self.assertIn("local#%d" % i, k.stdout)
+
+    def test_kill_help_says_queued_and_held(self):
+        h = " ".join(self.job("kill", "--help").stdout.split())
+        self.assertIn("remove a queued or held one", h)
+        self.assertIn("remove a queued or held one", " ".join(self.job("--help").stdout.split()))
+
+
 if __name__ == "__main__":
     unittest.main()

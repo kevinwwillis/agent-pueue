@@ -269,6 +269,69 @@ def _proc_tree(token):
     return sum(x[1] for x in live), len(members), sum(1 for x in live if x[2])
 
 
+def _job_procs(token, proc="/proc"):
+    """{pid: start time} of the job's processes: those with its token in their environment, and their descendants.
+    Zombies are left out (they are already dead)."""
+    if not token:
+        return {}
+    needle = ("JOB_TOKEN=" + token).encode()
+    stats, members = {}, set()
+    for name in os.listdir(proc):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(os.path.join(proc, name, "stat"), "rb") as f:
+                raw = f.read().decode("ascii", "replace")
+            rest = raw[raw.rindex(")") + 2:].split()
+            stats[pid] = (int(rest[1]), rest[19], rest[0])
+            with open(os.path.join(proc, name, "environ"), "rb") as f:
+                if needle in f.read().split(b"\0"):
+                    members.add(pid)
+        except (OSError, ValueError, IndexError):
+            continue
+    children = {}
+    for pid, (ppid, _, _) in stats.items():
+        children.setdefault(ppid, []).append(pid)
+    stack = list(members)
+    while stack:
+        for c in children.get(stack.pop(), []):
+            if c not in members:
+                members.add(c)
+                stack.append(c)
+    me = {os.getpid(), os.getppid()}
+    return {p: stats[p][1] for p in members if p in stats and stats[p][2] != "Z" and p not in me}
+
+
+def _same_process(pid, start, proc="/proc"):
+    try:
+        with open(os.path.join(proc, str(pid), "stat"), "rb") as f:
+            raw = f.read().decode("ascii", "replace")
+        rest = raw[raw.rindex(")") + 2:].split()
+        return rest[19] == start and rest[0] != "Z"
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def _end_leftovers(token, before, wait_s=3.0):
+    """SIGKILL every process of the job still alive after pueue's kill: those seen before it (pueue kills only the
+    job's own process group, so a child in another group, like `timeout`'s, or one that called setsid, lives on) and
+    any found by the token now. Returns the pids still alive after wait_s."""
+    end = time.monotonic() + wait_s
+    while True:
+        alive = {p: st for p, st in before.items() if _same_process(p, st)}
+        alive.update(_job_procs(token))
+        if not alive or time.monotonic() >= end:
+            return sorted(alive)
+        for pid, st in alive.items():
+            if _same_process(pid, st):
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+        time.sleep(0.1)
+
+
 def _summarize_task(t):
     status = t.get("status") or {}
     kind = next(iter(status), "Unknown") if isinstance(status, dict) else str(status)
@@ -768,6 +831,9 @@ def host_probe(req):
     want_token = req.get("token")
     if t is None or (want_token and (t.get("envs") or {}).get("JOB_TOKEN") != want_token):
         out = {"found": t is not None, "token_mismatch": t is not None}
+        removed = os.path.join(STATE_DIR, "results", "%s.removed" % want_token) if want_token else None
+        if removed and t is None and os.path.exists(removed):
+            out["removed"] = {"by": "job kill", "at": os.path.getmtime(removed)}
         rec = os.path.join(STATE_DIR, "results", "%s.exit" % want_token) if want_token else None
         if rec and os.path.exists(rec):
             try:
@@ -1014,6 +1080,12 @@ def host_group(req):
     return {"name": name, "parallel": n, "created": created}
 
 
+def _mark(path):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("%f\n" % time.time())
+
+
 def host_kill(req):
     tid = int(req["id"])
     t = _pueue_status().get("tasks", {}).get(str(tid))
@@ -1023,14 +1095,22 @@ def host_kill(req):
     if tok and (t.get("envs") or {}).get("JOB_TOKEN") != tok:
         raise JobError("task %d now belongs to a different job; not killed" % tid)
     status = next(iter(t.get("status") or {"?": 0}))
-    if status == "Running":
-        token = (t.get("envs") or {}).get("JOB_TOKEN")
+    token = (t.get("envs") or {}).get("JOB_TOKEN")
+    results = os.path.join(STATE_DIR, "results")
+    if status in ("Running", "Paused"):
         scoped = bool(token) and os.path.exists(os.path.join(STATE_DIR, "scripts", token + ".shim"))
+        before = _job_procs(token)
+        if token and req.get("stopped_by") not in LOOP_STOPS:
+            _mark(os.path.join(results, token + ".jobkill"))  # its verdict says job kill ended it
         if scoped:  # its shim dies with it, so keep its use so far
             _snapshot_kill(token, req.get("stopped_by") if req.get("stopped_by") in LOOP_STOPS else "job kill")
         try:
             _pueue(["kill", str(tid)])
         except JobError:
+            try:
+                os.remove(os.path.join(results, token + ".jobkill"))
+            except (OSError, TypeError):
+                pass
             if scoped:
                 try:
                     os.remove(os.path.join(STATE_DIR, "results", token + ".killed"))
@@ -1039,9 +1119,21 @@ def host_kill(req):
             raise
         if scoped:
             _stop_scope(token)  # processes the job detached (setsid, nohup) end with it
-        return {"id": tid, "action": "killed"}
+        left = _end_leftovers(token, before) if token else []
+        return {"id": tid, "action": "killed", "processes": len(before), "left": left}
     if status in ("Queued", "Stashed", "Locked"):
-        _pueue(["remove", str(tid)])
+        mark = os.path.join(results, token + ".removed") if token else None
+        if mark:
+            _mark(mark)  # a wait on it ends KILLED, removed by job kill, not GONE
+        try:
+            _pueue(["remove", str(tid)])
+        except JobError:
+            if mark:
+                try:
+                    os.remove(mark)
+                except OSError:
+                    pass
+            raise
         return {"id": tid, "action": "removed from the queue"}
     raise JobError("task %d is %s; nothing to kill" % (tid, status))
 
@@ -4075,6 +4167,11 @@ class Waiter:
             why = ("task id %s on %s now belongs to a different job" % (self.tid, self.host)
                    if s.get("token_mismatch") else
                    "task %s no longer exists in pueue on %s" % (self.tid, self.host))
+            if s.get("removed") and not s.get("token_mismatch"):
+                at = dt.datetime.fromtimestamp(s["removed"]["at"]).astimezone().isoformat()
+                stub = {"id": self.tid, "status": "Done", "end": at, "result": "Killed"}
+                return self._outcome("KILLED", EXIT["KILLED"], stub, tail=False,
+                                     note="removed from the queue by job kill before it ran")
             rec = s.get("record")
             if rec is not None:  # the job's own exit record survived pueue's cleanup
                 stub = {"id": self.tid, "status": "Done", "end": rec["end"],
@@ -4583,10 +4680,46 @@ def cmd_group(args):
     return 0
 
 
+def _kill_text(host, tid, r):
+    text = "%s#%s %s" % (host, tid, r["action"])
+    if r["action"] == "killed" and "left" in r:
+        text += ": %d process(es) of the job were running" % r.get("processes", 0)
+        text += ("; none is left" if not r["left"] else
+                 "; %d still alive after SIGKILL: pids %s" % (len(r["left"]), " ".join(map(str, r["left"]))))
+    return text
+
+
 def cmd_kill(args):
-    r = call(args.host, "kill", {"id": int(args.id), "token": args.token})
-    print("%s#%s %s" % (args.host, args.id, r["action"]))
-    return 0
+    if args.task is None:
+        if args.id is None:
+            raise JobError("job kill needs a job id, or --task NAME")
+        r = call(args.host, "kill", {"id": int(args.id), "token": args.token})
+        print(_kill_text(args.host, args.id, r))
+        return 0 if not r.get("left") else EXIT["WRAPPER_ERROR"]
+    if args.id is not None or args.token:
+        raise JobError("give a job id or --task NAME, not both")
+    tasks = [s for s in call(args.host, "ls", {}, timeout=60)["tasks"]
+             if s.get("label") == args.task and s["status"] != "Done"]
+    if not tasks:
+        print("%s: no unfinished job of task %s" % (args.host, args.task))
+        return 0
+    me = _session()
+    others = [s for s in tasks if s.get("session") != me]
+    if others and not args.all_sessions:
+        raise JobError("task %s on %s has %d unfinished job(s) of other sessions (%s); nothing was killed. Add "
+                       "--all-sessions to kill them too" % (args.task, args.host, len(others), ", ".join(
+                           "#%s of %s" % (s["id"], s.get("session") or "unknown") for s in others)))
+    code = 0
+    for s in tasks:
+        try:
+            r = call(args.host, "kill", {"id": int(s["id"]), "token": s.get("token")})
+            print(_kill_text(args.host, s["id"], r))
+            if r.get("left"):
+                code = EXIT["WRAPPER_ERROR"]
+        except JobError as e:
+            print("%s#%s not killed: %s" % (args.host, s["id"], e))
+            code = EXIT["WRAPPER_ERROR"]
+    return code
 
 
 HELP_RULES = """rules (docs/usage.md has the rest):
@@ -4737,10 +4870,14 @@ def build_parser():
     q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
     q.add_argument("--group", required=True, help="the paused group")
 
-    q = sub.add_parser("kill", help="kill a running job")
+    kill_help = "kill a running job (and every process it started) or remove a queued or held one"
+    q = sub.add_parser("kill", help=kill_help, description=kill_help)
     q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
-    q.add_argument("id", type=int)
+    q.add_argument("id", type=int, nargs="?", default=None)
     q.add_argument("--token", default=None, help="refuse if the id now belongs to another job")
+    q.add_argument("--task", default=None, metavar="NAME", help="every unfinished job of this task id on the host")
+    q.add_argument("--all-sessions", action="store_true",
+                   help="with --task: also other sessions' jobs (refused without it)")
     return p
 
 

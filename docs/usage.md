@@ -134,7 +134,7 @@ pipe's exit code replaces the job's, so a failed job reads as exit 0, and
 |---|---|---|---|
 | `SUCCESS` | 0 | The command exited 0. | no |
 | `FAILED` | the job's own code | The command exited nonzero. A job killed by a signal from outside (the OOM killer, `kill -9`) ends here with code 128 + signal, usually 137. | no |
-| `KILLED` | 137 | Killed with `job kill` or `pueue kill`, or the pueue daemon was restarted while it ran. | no |
+| `KILLED` | 137 | Killed with `job kill` or `pueue kill`, or removed from the queue with `job kill` before it ran (the note says so). | no |
 | `FAILED_TO_SPAWN` | 127 | pueue could not start the command. | no |
 | `ERRORED`, `DEPENDENCY_FAILED` | 203 | pueue-side error, or a dependency failed. | no |
 | `STALLED` | 200 | See "Stall detection". | **yes** |
@@ -227,7 +227,8 @@ job run gpu1 TASK-12 --check "$SCRATCH/nan-check.sh" -- 'python train.py'
 | `job log <host> <id> [--token T] [--lines N] [--grep RE] [--full]` | The job's output: its last N lines (default 50), the last N lines matching the regular expression RE, or the whole log (up to its last 32 MB). Use it instead of `pueue log` or reading the log file over ssh; it finds the log the way `job` does, whatever the host's PATH. |
 | `job show <host> <id> [--token T]` | Everything about one job: task, state (with the verdict once it ended), group and whether it is paused, session, token, working directory, times, size and RAM limit on admission hosts, the log's path, and the full command. |
 | `job resume <host> --group G` | Start a paused group again (`pueue start --group G`). A pueue daemon restart leaves the groups that had running jobs paused; a wait on a job queued there ends with an `ALERT` naming this command. |
-| `job kill <host> <id> [--token T]` | Kill a running job (pueue kill), or take a queued one out of the queue (pueue remove). With `--token`, refuses if the id now belongs to another job. |
+| `job kill <host> <id> [--token T]` | Kill a running job, or remove a queued or held one from the queue. A running job's whole process tree ends: pueue's kill, then SIGKILL to every process of the job still alive (found by its token and as descendants, so children in their own process group, like `timeout`'s, or that called `setsid`, end too). It prints how many processes were running and whether any is left (exit 205 if one is). A wait on a job removed before it ran ends `KILLED` with `removed from the queue by job kill before it ran`. With `--token`, refuses if the id now belongs to another job. |
+| `job kill <host> --task NAME [--all-sessions]` | The same for every unfinished job of task id NAME on the host. Refused, killing nothing, when any of them belongs to another session, unless `--all-sessions`. |
 
 ## Queues of jobs
 
