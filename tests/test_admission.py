@@ -1016,6 +1016,16 @@ class LoopTests(Base):
         with open(os.path.join(self.settings["state_dir"], "alerts", r["data"]["token"] + ".jsonl")) as f:
             alerts = [json.loads(x) for x in f]
         self.assertEqual([a["kind"] for a in alerts], ["group_paused"])
+        self.assertIn("job resume", alerts[0]["message"])
+        self.assertNotIn("pueue start", alerts[0]["message"])
+        self.assertEqual(alerts[0]["resume"], {"group": "padm"})
+        w = self.j.Waiter("local", r["data"]["id"], token=r["data"]["token"])
+        w.alert_cursor = 0
+        self.j.call = lambda h, op, req, **kw: {"found": True, "status": "Stashed", "id": r["data"]["id"],
+                                                 "alert_count": 1, "alerts": alerts, "token": r["data"]["token"]}
+        out = w.step()
+        self.assertEqual(out["verdict"], "ALERT")
+        self.assertIn("job resume local --group padm", out["note"])
         self.d.pueue("start", "--group", "padm")
 
     def test_older_job_short_of_room_blocks_younger_after_the_fairness_wait(self):

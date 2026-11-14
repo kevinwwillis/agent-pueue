@@ -804,5 +804,59 @@ class HelpAndLastLineTests(Base):
         self.assertIn("--tail", r)
 
 
+class LogShowResumeTests(Base):
+    """job log, job show and job resume (TASK-007.07)."""
+
+    def test_log_lines_grep_full(self):
+        tid = self.submit("for i in $(seq 1 300); do echo line $i; done; printf 'bar 1%%\\rbar 100%%\\n'",
+                          task="T-log")
+        self.wait_status(tid, "Done")
+        p = self.job("log", "local", str(tid), "--lines", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.splitlines(), ["line 300", "bar 100%"])
+        g = self.job("log", "local", str(tid), "--grep", "^line 2[0-9]$", "--lines", "3")
+        self.assertEqual(g.stdout.splitlines(), ["line 27", "line 28", "line 29"])
+        self.assertIn("3 of 10 lines matching", g.stderr)
+        f = self.job("log", "local", str(tid), "--full")
+        self.assertEqual(f.stdout.count("line "), 300)
+        self.assertTrue(f.stdout.startswith("line 1\n"))
+        bad = self.job("log", "local", str(tid), "--grep", "(")
+        self.assertEqual(bad.returncode, 205)
+        other = self.job("log", "local", str(tid), "--token", "0" * 32)
+        self.assertEqual(other.returncode, 205)
+        self.assertIn("different job", other.stdout)
+
+    def test_show(self):
+        sub = self.job("submit", "local", "T-show", "--", "echo 'two words'\nexit 3")
+        tid = int(sub.stdout)
+        token = sub.stderr.split("--token ", 1)[1].split()[0]
+        self.wait_status(tid, "Done")
+        p = self.job("show", "local", str(tid))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        for text in ("task:              T-show", "Done: FAILED exit 3", "token:             " + token,
+                     "log:               local:", "  echo 'two words'", "  exit 3", "group:             session-"):
+            self.assertIn(text, p.stdout)
+
+    def test_resume_a_paused_group(self):
+        self.job("group", "local", "pz", "1")
+        self.d.pueue("pause", "--group", "pz")
+        tid = self.submit("true", task="T-pz", extra=("--group", "pz"))
+        r = self.job("resume", "local", "--group", "pz")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("was Paused, now Running; 1 job(s) waiting", r.stdout)
+        self.wait_status(tid, "Done")
+        self.assertEqual(self.job("resume", "local", "--group", "nope").returncode, 205)
+
+    def test_an_older_host_says_it_predates_the_op(self):
+        job = self.load_job()
+
+        def old(host, op, req, **kw):
+            raise job.JobError("gpu1: no reply from job on the host (exit 2): usage: job ... invalid choice: 'log'")
+        job.call = old
+        with self.assertRaises(job.JobError) as e:
+            job._newer_op("gpu1", "log", {})
+        self.assertIn("predates job log", str(e.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -224,6 +224,9 @@ job run gpu1 TASK-12 --check "$SCRATCH/nan-check.sh" -- 'python train.py'
 | `job ls [host ...] [--all] [--recent H]` | Every job on this machine and every host in the hosts file: host, id, task id, status, run time, group, session, command. Finished jobs older than `--recent` hours (default 24) are hidden unless `--all`. Exits 202 if a host could not be reached (the reachable ones are still listed). |
 | `job group <host> <name> <n>` | Create a pueue group (if missing) and let it run `n` jobs at a time. Then `job submit/run ... --group <name>`. |
 | `job room [host ...] [--json]` | Each admission host's room: CPU, RAM, memory pressure, disks, each GPU's free memory and outside use, the jobs running and the jobs held with their reasons. |
+| `job log <host> <id> [--token T] [--lines N] [--grep RE] [--full]` | The job's output: its last N lines (default 50), the last N lines matching the regular expression RE, or the whole log (up to its last 32 MB). Use it instead of `pueue log` or reading the log file over ssh; it finds the log the way `job` does, whatever the host's PATH. |
+| `job show <host> <id> [--token T]` | Everything about one job: task, state (with the verdict once it ended), group and whether it is paused, session, token, working directory, times, size and RAM limit on admission hosts, the log's path, and the full command. |
+| `job resume <host> --group G` | Start a paused group again (`pueue start --group G`). A pueue daemon restart leaves the groups that had running jobs paused; a wait on a job queued there ends with an `ALERT` naming this command. |
 | `job kill <host> <id> [--token T]` | Kill a running job (pueue kill), or take a queued one out of the queue (pueue remove). With `--token`, refuses if the id now belongs to another job. |
 
 ## Queues of jobs
@@ -303,7 +306,8 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   command ends are stopped.
 - GPUs are given by UUID in `CUDA_VISIBLE_DEVICES` (also in `JOB_GPU_UUIDS`); a job without `--gpus` sees none.
   `--env CUDA_VISIBLE_DEVICES=...` is refused. Code should use devices 0..N-1.
-- `ALERT` (exit 201) can also come from the loop: the job's group is paused, it uses more GPU memory than its
+- `ALERT` (exit 201) can also come from the loop: the job's group is paused (the note gives the exact `job resume`
+  command), it uses more GPU memory than its
   size or a GPU it was not given, its RAM trend reaches its limit, it is oversized, a stop at its time limit failed, or the
   host's loop has stopped while the job is held. The job keeps its place.
 - A pilot stopped at its time limit ends `PILOT_TIME_LIMIT` (exit 207, not 137) with a note saying so ("as

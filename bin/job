@@ -845,13 +845,13 @@ def _probe_admission(s, req):
         s["admission_stale"] = age is None or age > _heartbeat_limit(settings)
 
 
-def _tail(path, n):
-    """The last n lines among the log's final TAIL_BYTES, each cut to TAIL_LINE_MAX characters."""
+def _tail(path, n, max_bytes=TAIL_BYTES):
+    """The last n lines among the log's final max_bytes, each cut to TAIL_LINE_MAX characters."""
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            f.seek(max(0, size - TAIL_BYTES))
+            f.seek(max(0, size - max_bytes))
             buf = f.read()
     except OSError:
         return []
@@ -864,7 +864,7 @@ def _tail(path, n):
         lines.append(line)
     if lines and lines[-1] == "":
         lines.pop()
-    if size > TAIL_BYTES and lines:
+    if size > max_bytes and lines:
         lines.pop(0)  # the first line is probably partial
     return lines[-n:]
 
@@ -897,6 +897,109 @@ def _probe_progress(s):
     if q and q.get("progress"):
         s["progress"] = q["progress"][-1][1:3]
         s["projected_end"] = q.get("projected_end")
+
+
+LOG_FULL_MAX = 32 * 1024 * 1024  # job log --full sends at most this many final bytes
+
+
+def _task_of(st, req):
+    """The pueue task a request names by id (and token, when given); JobError when there is none."""
+    tid = int(req["id"])
+    t = st.get("tasks", {}).get(str(tid))
+    if t is None:
+        raise JobError("no task %d on %s" % (tid, socket.gethostname()))
+    tok = req.get("token")
+    if tok and (t.get("envs") or {}).get("JOB_TOKEN") != tok:
+        raise JobError("task %d on %s now belongs to a different job" % (tid, socket.gethostname()))
+    return tid, t
+
+
+def _lines_of(raw):
+    """A log's text as display lines: a progress bar's line keeps its last redraw, long lines are cut."""
+    line = raw.decode("utf-8", "replace").rstrip("\n").rstrip("\r")
+    line = line.rsplit("\r", 1)[-1] if "\r" in line else line
+    return line[:TAIL_LINE_MAX] + " ...[line cut]" if len(line) > TAIL_LINE_MAX else line
+
+
+def host_log(req):
+    """A job's output: its last lines, the last lines matching a pattern, or all of it."""
+    import collections
+    tid, t = _task_of(_pueue_status(), req)
+    path = _log_path(tid)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        raise JobError("task %d on %s has no log file (%s)" % (tid, socket.gethostname(), path))
+    n = req.get("lines") if isinstance(req.get("lines"), int) and req["lines"] > 0 else 50
+    out = {"id": tid, "log_path": path, "size": size, "status": _task_status(t)}
+    if req.get("full"):
+        with open(path, "rb") as f:
+            f.seek(max(0, size - LOG_FULL_MAX))
+            out["text"] = f.read(LOG_FULL_MAX).decode("utf-8", "replace")
+        out["cut"] = size > LOG_FULL_MAX
+        return out
+    if req.get("grep") is not None:
+        try:
+            rx = re.compile(str(req["grep"]))
+        except re.error as e:
+            raise JobError("--grep %r is not a valid regular expression: %s" % (req["grep"], e))
+        keep, count = collections.deque(maxlen=n), 0
+        with open(path, "rb") as f:
+            for raw in f:
+                line = _lines_of(raw)
+                if rx.search(line):
+                    count += 1
+                    keep.append(line)
+        out.update(lines=list(keep), matches=count)
+        return out
+    out["lines"] = _tail(path, n, max_bytes=max(TAIL_BYTES, min(n * 2 * TAIL_LINE_MAX, LOG_FULL_MAX)))
+    return out
+
+
+def host_show(req):
+    """Everything known about one job: command, task, group, size, state, times, token, log."""
+    st = _pueue_status()
+    tid, t = _task_of(st, req)
+    s = _summarize_task(t)
+    s["runner"] = t.get("command")
+    s["log_path"] = _log_path(tid)
+    g = st.get("groups", {}).get(s["group"]) or {}
+    s["group_status"], s["group_parallel"] = g.get("status"), g.get("parallel_tasks")
+    tok = s.get("token")
+    if tok:
+        try:
+            with open(os.path.join(STATE_DIR, "scripts", tok + ".cmd"), encoding="utf-8", errors="replace") as f:
+                s["full_command"] = f.read(65536)
+        except OSError:
+            pass
+    if s["status"] == "Done":
+        s["scope"] = _scope_result(tok)
+    try:
+        settings = _admission_settings()
+    except JobError:
+        settings = None
+    if settings is not None and tok:
+        _probe_admission(s, {})
+        q = Admission(settings).read_queue(tok)
+        if q:
+            s["admission"] = {k: q.get(k) for k in ("state", "size", "size_source", "like_from", "pilot", "constraints",
+                                                    "memory_max", "ram_counted", "gpus", "reason", "submitted",
+                                                    "released", "projected_end")}
+    return s
+
+
+def host_resume(req):
+    """Start a paused group again (pueue start --group)."""
+    group = req.get("group")
+    st = _pueue_status()
+    g = st.get("groups", {}).get(group) if isinstance(group, str) else None
+    if g is None:
+        raise JobError("no pueue group %r on %s" % (group, socket.gethostname()))
+    _pueue(["start", "--group", group])
+    after = (_pueue_status().get("groups", {}).get(group) or {}).get("status")
+    waiting = sum(1 for t in st.get("tasks", {}).values()
+                  if t.get("group") == group and _task_status(t) in ("Queued", "Paused"))
+    return {"group": group, "was": g.get("status"), "status": after, "waiting": waiting}
 
 
 def host_group(req):
@@ -2751,8 +2854,8 @@ class Loop:
             g = groups.get(q["group"]) or {}
             if g.get("status") == "Paused":
                 q["reason"] = "its group %s is paused" % q["group"]
-                self.adm.alert(q, "group_paused", "held: its pueue group %s is paused; resume it with "
-                               "'pueue start --group %s'" % (q["group"], q["group"]))
+                self.adm.alert(q, "group_paused", "held: its pueue group %s is paused; resume it with job resume"
+                               % q["group"], {"resume": {"group": q["group"]}})
                 self.adm.save(q)
                 continue
             if running.get(q["group"], 0) >= (g.get("parallel_tasks") or 1):
@@ -3319,7 +3422,8 @@ def host_history(req):
 
 HOST_OPS = {"submit": host_submit, "probe": host_probe, "ls": host_ls,
             "group": host_group, "kill": host_kill, "room": host_room, "admission": host_admission,
-            "hold": host_hold, "history": host_history, "resize": host_resize}
+            "hold": host_hold, "history": host_history, "resize": host_resize, "log": host_log, "show": host_show,
+            "resume": host_resume}
 
 
 def host_main(op):
@@ -3967,6 +4071,9 @@ class Waiter:
                 for a in s["alerts"]:
                     m = a.get("message") or a.get("kind") or "?"
                     rs = a.get("resize") if isinstance(a.get("resize"), dict) else {}
+                    rg = a.get("resume") if isinstance(a.get("resume"), dict) else {}
+                    if rg.get("group"):
+                        m += " (exact command: job resume %s --group %s)" % (self.host, shlex.quote(str(rg["group"])))
                     if rs.get("ram"):
                         m += " (exact command: job resize %s %s%s --ram %s)" % (
                             self.host, self.tid, (" --token %s" % self.token) if self.token else "", rs["ram"])
@@ -4323,6 +4430,78 @@ def cmd_ls(args):
     return EXIT["UNREACHABLE"] if unreachable else 0
 
 
+def _newer_op(host, op, req):
+    """call() for an op added in job 0.8; a host running an older job says so instead of a usage error."""
+    try:
+        return call(host, op, req)
+    except JobError as e:
+        if "invalid choice" in str(e) or "usage:" in str(e):
+            raise JobError("%s's job predates job %s; update it with install.sh" % (host, op))
+        raise
+
+
+def cmd_log(args):
+    r = _newer_op(args.host, "log", {"id": args.id, "token": args.token, "lines": args.lines, "grep": args.grep,
+                                     "full": bool(args.full)})
+    if args.full:
+        if r.get("cut"):
+            sys.stderr.write("job: the log is %s; only its last %s follow (all of it: %s:%s)\n" % (
+                _gbs(r["size"]), _gbs(LOG_FULL_MAX), args.host, r["log_path"]))
+        sys.stdout.write(r.get("text") or "")
+    else:
+        for line in r.get("lines") or []:
+            print(line)
+        what = ("%d of %d lines matching %r" % (len(r["lines"]), r["matches"], args.grep) if args.grep is not None
+                else "last %d lines" % len(r.get("lines") or []))
+        sys.stderr.write("job: %s#%s (%s) %s; log %s:%s\n" % (args.host, args.id, r.get("status"), what, args.host,
+                                                               r["log_path"]))
+    return 0
+
+
+def cmd_show(args):
+    s = _newer_op(args.host, "show", {"id": args.id, "token": args.token})
+    state = s.get("status")
+    if state == "Done":
+        v, c, note = scope_verdict(*verdict_of(s), s.get("scope"))
+        state = "Done: %s exit %d%s" % (v, c, " (%s)" % note if note else "")
+    adm = s.get("admission") or {}
+    if s.get("held"):
+        state += ", held: %s" % (s.get("held_reason") or "not looked at by the admission loop yet")
+    rows = [("job", "%s#%s" % (args.host, s.get("id"))), ("task", s.get("label")), ("state", state),
+            ("group", "%s (%s, %s at a time)" % (s.get("group"), s.get("group_status"), s.get("group_parallel"))),
+            ("session", s.get("session")), ("token", s.get("token")),
+            ("submitted from", s.get("submitted_from")), ("working directory", s.get("path")),
+            ("queued", _fmt_et(_parse_time(s.get("enqueued_at"))) if s.get("enqueued_at") else None),
+            ("started", _fmt_et(_parse_time(s.get("start"))) if s.get("start") else None),
+            ("ended", _fmt_et(_parse_time(s.get("end"))) if s.get("end") else None),
+            ("run time", _fmt_dur(_runtime(s)) if s.get("start") else None)]
+    z = adm.get("size")
+    if isinstance(z, dict):
+        rows.append(("size", "%g CPU, %s RAM%s (%s%s)" % (
+            z.get("cpus") or 0, _gbs(z.get("ram") or 0),
+            ", %d GPU %s" % (z["gpus"], _gbs(z.get("gpu_mem") or 0)) if z.get("gpus") else "",
+            "pilot" if adm.get("pilot") else adm.get("size_source") or "?",
+            " %s" % adm["like_from"] if adm.get("like_from") else "")))
+        if adm.get("memory_max"):
+            rows.append(("RAM limit", _gbs(adm["memory_max"])))
+    rows += [("log", "%s:%s" % (args.host, s.get("log_path"))), ("pueue runs", s.get("runner"))]
+    for k, v in rows:
+        if v is not None:
+            print("%-18s %s" % (k + ":", v))
+    cmd = s.get("full_command") or s.get("command") or ""
+    print("command:")
+    for line in cmd.rstrip("\n").splitlines() or [""]:
+        print("  " + line)
+    return 0
+
+
+def cmd_resume(args):
+    r = _newer_op(args.host, "resume", {"group": args.group})
+    print("%s: group %s was %s, now %s; %d job(s) waiting in it" % (
+        args.host, r["group"], r.get("was"), r.get("status"), r.get("waiting") or 0))
+    return 0
+
+
 def cmd_group(args):
     r = call(args.host, "group", {"name": args.name, "parallel": args.parallel})
     print("%s: group %s %s, runs %d at a time" % (args.host, r["name"],
@@ -4345,6 +4524,7 @@ HELP_RULES = """rules (docs/usage.md has the rest):
     session's jobs. For jobs side by side: job group HOST NAME N, then --group NAME.
   - on admission hosts every job needs a size: best --pilot first, then --like TOKEN (or --like last).
   - job kill HOST ID also removes a queued or held job.
+  - job log HOST ID, job show HOST ID and job resume HOST --group G instead of raw pueue (not on ssh's PATH).
 """
 
 RUN_RULES = """never pipe it (| tail, | head, | grep): the pipe's exit code replaces the job's and the verdict can be
@@ -4465,6 +4645,23 @@ def build_parser():
     q.add_argument("name")
     q.add_argument("parallel", type=int)
 
+    q = sub.add_parser("log", help="a job's output (default: its last 50 lines)")
+    q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
+    q.add_argument("id", type=int)
+    q.add_argument("--token", default=None, help="refuse if the id now belongs to another job")
+    q.add_argument("--lines", type=int, default=50, metavar="N", help="how many lines (default 50)")
+    q.add_argument("--grep", default=None, metavar="RE", help="only lines matching this regular expression (last N)")
+    q.add_argument("--full", action="store_true", help="the whole log")
+
+    q = sub.add_parser("show", help="everything about one job: command, task, group, size, state, times, token, log")
+    q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
+    q.add_argument("id", type=int)
+    q.add_argument("--token", default=None, help="refuse if the id now belongs to another job")
+
+    q = sub.add_parser("resume", help="start a paused group again")
+    q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
+    q.add_argument("--group", required=True, help="the paused group")
+
     q = sub.add_parser("kill", help="kill a running job")
     q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
     q.add_argument("id", type=int)
@@ -4506,7 +4703,8 @@ def main(argv=None):
         return EXIT["WRAPPER_ERROR"]
     handlers = {"run": cmd_run, "submit": lambda a: cmd_run(a, queue_only=True), "wait": cmd_wait,
                 "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill, "room": cmd_room, "admission": cmd_admission, "history": cmd_history,
-                "hold": cmd_hold, "release": cmd_release, "resize": cmd_resize}
+                "hold": cmd_hold, "release": cmd_release, "resize": cmd_resize, "log": cmd_log, "show": cmd_show,
+                "resume": cmd_resume}
     try:
         return handlers[args.cmd](args)
     except NoRoom as e:  # a hold the host has no room for: the service refuses its load (other errors: its own guard)
