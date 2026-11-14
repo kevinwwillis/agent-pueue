@@ -1558,6 +1558,33 @@ class DeliveryTests(Base):
         self.assertEqual([x[:2] for x in seen], [("far", "delivered")])
         self.assertLessEqual(seen[0][2], 5)  # best effort: a hung host holds the agent's wake-up at most this long
 
+    def test_the_delivered_marks_go_to_all_hosts_at_once_within_one_deadline(self):
+        job = self.load_job_here()
+        hosts = ["far%d" % i for i in range(3)]
+        for h in hosts:
+            job.HOSTS[h] = h + ".invalid"
+        job.DELIVERED_TIMEOUT_S = 1
+        seen = []
+
+        def hung(host, op, req, timeout=120):
+            seen.append(host)
+            time.sleep(3)  # a host that hangs past the deadline
+        job.call = hung
+        ws = []
+        for i, h in enumerate(hosts):
+            class W:
+                pass
+            w = W()
+            w.host, w.tid, w.token = h, i + 1, "%x" % (i + 10) * 32
+            ws.append(w)
+        o = {"verdict": "SUCCESS", "code": 0, "s": {"id": 1, "status": "Done", "result": "Success"}, "note": None}
+        import io
+        t0 = time.monotonic()
+        job._finish(ws, [(w, o) for w in ws], [], None, io.StringIO())
+        took = time.monotonic() - t0
+        self.assertEqual(sorted(seen), hosts)  # every host was asked
+        self.assertLess(took, 2.5, "the marks were sent one after another, or past the deadline")
+
     def test_wait_mine_reports_every_undelivered_end_the_host_keeps(self):
         import contextlib
         import io

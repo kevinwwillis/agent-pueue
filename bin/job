@@ -5471,12 +5471,27 @@ def _finish(waiters, done, pending, urgent, out, notes=()):
                 delivered.setdefault(w.host, []).append(w.token)
         elif o["verdict"] == "UNTRACKED":
             _mark_in(UNTRACKED_DIR, w.token, SCRIPT_KEEP_DAYS * 86400)  # the next wait follows its processes
-    for h, toks in delivered.items():  # the host keeps them in pueue's list until then (session-group cleanup)
+    _mark_delivered(delivered)
+    return code
+
+
+def _mark_delivered(delivered):
+    """Tell each host which of its jobs' outcomes were reported (the host keeps them in pueue's list until then, for
+    session-group cleanup), all hosts at once, waiting DELIVERED_TIMEOUT_S at most in all. Best effort: a host whose
+    job predates the op, or that is unreachable or slow, keeps the jobs longer, and nothing is lost."""
+    import threading
+
+    def one(h, toks):
         try:
             call(h, "delivered", {"tokens": toks}, timeout=DELIVERED_TIMEOUT_S)
-        except Exception:
-            pass  # a host whose job predates the op, or unreachable: it keeps the jobs longer, nothing is lost
-    return code
+        except Exception:  # noqa: BLE001
+            pass
+    threads = [threading.Thread(target=one, args=(h, toks), daemon=True) for h, toks in delivered.items()]
+    end = time.monotonic() + DELIVERED_TIMEOUT_S
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
 
 
 def _report_text(waiters, done, pending, urgent, out, notes=()):

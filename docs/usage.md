@@ -217,8 +217,9 @@ verdicts and early end as `job wait` on several ids. It also reports, with its
 verdict, each of the session's finished jobs its host still lists that no
 wait has reported, whatever its age (a wait records each job it reports, in
 `~/.local/state/agent-pueue/reported/`, and marks it delivered on its host,
-which keeps it listed until then; a host older than that mark is asked about
-the last 24 h only): the jobs that ended
+which keeps it listed until then; the marks go to all hosts at once, and the
+wait waits for them 5 s at most in all; a host older than that mark is asked
+about the last 24 h only): the jobs that ended
 while no one waited, and each job pueue lost track of whose command still runs
 (see above). A job counts as reported only once the whole report was written
 out; a job left running (`STALLED`, `ALERT`, `UNREACHABLE`, `UNTRACKED`) is not
