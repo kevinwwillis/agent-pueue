@@ -821,7 +821,8 @@ class ResizeRules(unittest.TestCase):
 
 
 class FakeHost:
-    """A fake /proc (stat, meminfo, pressure, diskstats) and GPU list that a test can change between cycles."""
+    """A fake /proc (stat, meminfo, pressure, vmstat, diskstats) and GPU list that a test can change between
+    cycles."""
 
     def __init__(self, root, threads=8):
         self.root, self.threads = root, threads
@@ -832,14 +833,17 @@ class FakeHost:
         os.makedirs(self.cgroups, exist_ok=True)
         self.ticks = 0
         self.fake_psi = {}  # {cgroup dir: [full10, full60, total]}: a stalling cgroup's stall time grows each tick
-        self.set(avail=50 * GB, busy=0.0, cards=[])
+        self.set(avail=50 * GB, busy=0.0, cards=[], allocstall=0)
 
-    def set(self, avail=None, busy=None, psi=None, cards=None, procs=None):
+    def set(self, avail=None, busy=None, psi=None, cards=None, procs=None, allocstall=None):
         if avail is not None:
             with open(os.path.join(self.proc, "meminfo"), "w") as f:
                 f.write("MemTotal: %d kB\nMemAvailable: %d kB\n" % (64 * GB // 1024, avail // 1024))
         if busy is not None:
             self.busy = busy
+        if allocstall is not None:  # global direct reclaim so far: unchanged, the host is not in global reclaim
+            with open(os.path.join(self.proc, "vmstat"), "w") as f:
+                f.write("nr_free_pages 1000\nallocstall_normal 0\nallocstall_movable %d\n" % allocstall)
         with open(os.path.join(self.proc, "pressure", "memory"), "w") as f:
             f.write("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
                     "full avg10=%.2f avg60=0.00 avg300=0.00 total=0\n" % (psi or 0.0))
@@ -2943,6 +2947,14 @@ class PressureMeasure(unittest.TestCase):
         self.set(self.scope[len(self.cg):], 0.0)
         self.job(full=30.0, events=7, current=95 * MiB, limit=100 * MiB)
         self.m = self.j.Measure(proc=self.proc, cgroup_root=self.cg, uid=1000)
+        self.allocstall(1000)
+        self.assertTrue(self.m.global_reclaim())  # the first reading can't tell: the safe side
+        self.assertFalse(self.m.global_reclaim())  # from here on, no global reclaim until the counters grow
+
+    def allocstall(self, n):
+        """/proc/vmstat with its allocstall_* counters summing to n (global direct reclaim so far)."""
+        self.write(os.path.join(self.proc, "vmstat"), "nr_free_pages 1000\nallocstall_dma 0\nallocstall_dma32 0\n"
+                   "allocstall_normal %d\nallocstall_movable %d\npgscan_kswapd 5\n" % (n // 2, n - n // 2))
 
     @staticmethod
     def psi_text(full10, full60=None, total=0):
@@ -3029,26 +3041,66 @@ class PressureMeasure(unittest.TestCase):
         self.assertFalse(got["jobs"][self.TOK]["at_limit"])
         self.assertEqual((got["psi"], got["where"]), (3.0, "/user.slice/user-1001.slice"))
 
-    def test_another_cgroup_stalled_at_its_own_limit_holds_no_job(self):
+    def test_a_member_stalled_at_its_own_limit_still_counts(self):
+        # Only jobs are ever left out. A cgroup outside the jobs at its own limit may be hiding a real shortage (its
+        # count is hierarchical, so one container at its limit would hide all of system.slice), so it counts.
         self.job(full=0.0, events=7, current=10 * MiB, limit=100 * MiB)  # the job does not stall
-        # a top-level slice with an aggregate MemoryMax (read as one cgroup), thrashing against it
         self.set("/students.slice", 50.0)
         self.events("/students.slice", 3, current=int(9.9 * GB), limit=10 * GB)
-        got = self.measure()  # first sight: it has reached its limit and is within 5% of it
-        self.assertEqual(got["psi"], 3.0)
-        self.events("/students.slice", 9)  # it reached it again since the last sample
-        self.assertEqual(self.measure()["psi"], 3.0)
+        self.measure()
+        self.events("/students.slice", 9)  # it reached its limit again since the last sample
+        got = self.measure()
+        self.assertEqual((got["psi"], got["source"], got["cgroups"]), (22.4, "system", 50.0))
         self.set("/students.slice", 0.0)
-        # a service slice whose workers have their own limits: the slice's count is hierarchical
+
+    def test_a_real_shortage_is_not_hidden_by_one_container_at_its_limit(self):
+        # review 6 B1: a host-wide shortage (40%) while one container under system.slice touches its MemoryMax
+        self.write(os.path.join(self.proc, "pressure", "memory"), self.psi_text(40.0))
+        self.job(full=0.0, events=0, current=10 * MiB, limit=100 * MiB)
+        self.set("/user.slice/user-1001.slice", 0.0)
+        self.set(self.USER + "/app.slice/pueued.service", 0.0)
         self.set("/system.slice", 40.0)
-        self.events("/system.slice/worker@1.service", 0, current=GB, limit=GB)
+        self.events("/system.slice/docker-x.scope", 0, current=10 ** 9, limit=10 ** 9)
         self.events("/system.slice", 5)
         self.measure()
-        self.events("/system.slice", 8)
-        self.assertEqual(self.measure()["psi"], 3.0)
-        # stalled without reaching any limit since: real pressure
+        self.events("/system.slice", 6)
+        got = self.measure()
+        self.assertEqual((got["psi"], got["where"]), (40.0, "/system.slice"))
+
+    def test_in_global_reclaim_nothing_is_left_out(self):
+        # review 6 B3: a job at its own limit while the whole host reclaims (allocstall grows): the system-wide figure
+        self.write(os.path.join(self.proc, "pressure", "memory"), self.psi_text(40.0))
+        for r in ("/system.slice", "/user.slice/user-1001.slice", self.USER + "/app.slice/pueued.service"):
+            self.set(r, 0.0)
+        self.job(full=40.0, events=100, current=99 * MiB, limit=100 * MiB)
         self.measure()
-        self.assertEqual(self.measure()["psi"], 22.4)  # the lower of 40 (system.slice) and the system-wide 22.4
+        self.job(full=40.0, events=130, current=99 * MiB, limit=100 * MiB)
+        got = self.measure()
+        self.assertTrue(got["jobs"][self.TOK]["at_limit"])
+        self.assertEqual((got["psi"], got["global"]), (0.0, False))  # no global reclaim: its own limit, left out
+        self.job(full=40.0, events=160, current=99 * MiB, limit=100 * MiB)
+        self.allocstall(1500)
+        got = self.measure()
+        self.assertTrue(got["jobs"][self.TOK]["at_limit"])
+        self.assertEqual((got["psi"], got["source"], got["global"], got["cgroups"]), (40.0, "system", True, None))
+        room = self.j.compute_room(settings(self.j, self.tmp), [dict(
+            sample(100), psi=got["psi"], psi_source=got["source"], psi_system=40.0, psi_global=True)], [], [], 100)
+        ok, why = self.j.fits(settings(self.j, self.tmp, memory_pressure_max_pct=5), room, held())
+        self.assertFalse(ok)
+        self.assertIn("the host is in global reclaim", why)
+
+    def test_global_reclaim_is_assumed_when_it_cannot_be_told(self):
+        os.unlink(os.path.join(self.proc, "vmstat"))
+        self.assertTrue(self.m.global_reclaim())
+        self.write(os.path.join(self.proc, "vmstat"), "nr_free_pages 1000\n")  # no allocstall counters
+        self.assertTrue(self.m.global_reclaim())
+        self.allocstall(7)
+        self.assertTrue(self.m.global_reclaim())  # first reading after a gap
+        self.assertFalse(self.m.global_reclaim())
+        got = self.measure()  # the job is at its own limit: left out outside global reclaim
+        self.assertEqual(got["psi"], 3.0)
+        os.unlink(os.path.join(self.proc, "vmstat"))
+        self.assertEqual((self.measure()["psi"], self.measure()["source"]), (22.4, "system"))
 
     def test_the_figure_is_never_above_the_system_wide_one(self):
         self.set("/system.slice", 40.0)
@@ -3060,8 +3112,8 @@ class PressureMeasure(unittest.TestCase):
             psi_cg_where="/system.slice")], [], [], 100)
         ok, why = self.j.fits(settings(self.j, self.tmp, memory_pressure_max_pct=5), room, held())
         self.assertFalse(ok)
-        self.assertIn("system-wide, lower than the highest of the cgroups not stalled against their own RAM limits, "
-                      "40.0% in /system.slice", why)
+        self.assertIn("system-wide, lower than the highest of the cgroups leaving out jobs stalled against their own "
+                      "RAM limits, 40.0% in /system.slice", why)
 
     def test_a_cgroup_removed_between_open_and_read_is_gone_not_unreadable(self):
         import errno
@@ -3092,11 +3144,13 @@ class PressureMeasure(unittest.TestCase):
         os.chmod(self.cg + "/user.slice/user-1001.slice/memory.pressure", 0)
         got = self.measure()
         self.assertEqual((got["psi"], got["source"], got["unreadable"]), (22.4, "system", 1))
-        room = self.j.compute_room(settings(self.j, self.tmp), [dict(sample(100), psi=got["psi"], psi_source=got["source"],
-                                                                     psi_unreadable=1, psi_system=22.4)], [], [], 100)
+        self.assertEqual(got["unreadable_paths"], ["/user.slice/user-1001.slice"])
+        room = self.j.compute_room(settings(self.j, self.tmp), [dict(
+            sample(100), psi=got["psi"], psi_source=got["source"], psi_unreadable=1, psi_system=22.4,
+            psi_unreadable_paths=got["unreadable_paths"])], [], [], 100)
         ok, why = self.j.fits(settings(self.j, self.tmp, memory_pressure_max_pct=5), room, held())
         self.assertFalse(ok)
-        self.assertIn("system-wide: 1 cgroup(s) could not be read", why)
+        self.assertIn("system-wide: 1 cgroup(s) could not be read: /user.slice/user-1001.slice", why)
 
     def test_no_pressure_files_means_the_system_wide_figure(self):
         m = self.j.Measure(proc=self.proc, cgroup_root=os.path.join(self.tmp, "empty"), uid=1000)
@@ -3265,10 +3319,13 @@ class ReviewFiveRules(unittest.TestCase):
     def test_the_undersized_alert_waits_for_a_host_with_ram_to_spare(self):
         u = {"ram": GB, "cache": 0, "files": 0, "limit": 2 * GB,
              "psi": {"full10": 30.0, "full60": 30.0, "at_limit": True}}
-        for last, fires in (({"psi_outside": 2.0, "avail": 50 * GB}, False),   # something outside the jobs stalls
-                            ({"psi_outside": None, "avail": 50 * GB}, False),  # not known
-                            ({"psi_outside": 0.0, "avail": GB // 2}, False),   # MemAvailable under the headroom
-                            ({"psi_outside": 0.0, "avail": 50 * GB}, True)):
+        quiet = {"psi_global": False}
+        for last, fires in ((dict(quiet, psi_outside=2.0, avail=50 * GB), False),   # something outside the jobs stalls
+                            (dict(quiet, psi_outside=None, avail=50 * GB), False),  # not known
+                            (dict(quiet, psi_outside=0.0, avail=GB // 2), False),   # MemAvailable under the headroom
+                            ({"psi_global": True, "psi_outside": 0.0, "avail": 50 * GB}, False),  # global reclaim
+                            ({"psi_outside": 0.0, "avail": 50 * GB}, False),        # not known to be out of it
+                            (dict(quiet, psi_outside=0.0, avail=50 * GB), True)):
             loop = self.oversize_loop()
             loop.samples = [dict(sample(9999), **last)]
             q = self.oversized_job()

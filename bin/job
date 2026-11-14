@@ -1547,7 +1547,8 @@ class Measure:
                  psi_root=None):
         self.proc, self.sys, self.cg = proc, sys_root, cgroup_root
         self.psi_root = psi_root or cgroup_root  # the tree whose memory.pressure files are read (tests give a fake)
-        self.last_stall = {}  # {cgroup path: (memory.events max, pressure full total)} at the last sample
+        self.last_stall = {}  # {job cgroup path: (memory.events max, pressure full total)} at the last sample
+        self.last_allocstall = None  # the sum of /proc/vmstat allocstall_* at the last sample
         self.gpu_file = gpu_file if gpu_file is not None else os.environ.get("JOB_TEST_GPUS")
         self.uid = os.getuid() if uid is None else uid
         self.nvml = None
@@ -1625,15 +1626,32 @@ class Measure:
             d = os.path.dirname(d)
         return min(lims) if lims else None
 
-    def own_limit_stall(self, cg, top, seen):
-        """The stall of one cgroup (an absolute path) and whether it is stalled against its own limit, by the same
-        test for a job scope and for any other cgroup (docs/admission.md, "Memory pressure"). Since its last sample:
-        at its own limit when both its "full" stall time (memory.pressure total=) and its memory.events "max" count
-        grew; stalled at all only when the stall time grew. On first sight (a new cgroup, or a restarted loop): at its
-        limit when it has reached it before and memory.current is within 5% of its effective limit, and stalled as
-        its full avg10 says. seen collects this sample's counters. Returns {full10, full60, at_limit, figure}: the
-        figure it adds to the host's (0 when at its own limit, or when its stall time did not grow); raises OSError
-        when its pressure cannot be read."""
+    def global_reclaim(self):
+        """Whether the host is in global reclaim: the sum of /proc/vmstat's allocstall_* counters (allocstall before
+        4.8) grew since the last call. The kernel counts these only for direct reclaim that is not aimed at one
+        cgroup (mm/vmscan.c do_try_to_free_pages: `if (!cgroup_reclaim(sc))`), so a cgroup reclaiming against its
+        own memory.max never adds to them. True when it can't be told (the first call, no such counters, or an
+        unreadable file): the safe side, which excludes nothing."""
+        try:
+            vals = [int(ln.split()[1]) for ln in self._read(self.proc, "vmstat").splitlines()
+                    if ln.startswith("allocstall")]
+        except (OSError, ValueError, IndexError):
+            vals = []
+        n = sum(vals)
+        if not vals:
+            self.last_allocstall = None
+            return True
+        last, self.last_allocstall = self.last_allocstall, n
+        return last is None or n > last
+
+    def job_stall(self, cg, top, seen):
+        """The stall of one job's cgroup (an absolute path) and whether it is stalled against its own limit
+        (docs/admission.md, "Memory pressure"). Since its last sample: at its own limit when both its "full" stall
+        time (memory.pressure total=) and its memory.events "max" count grew; stalled at all only when the stall time
+        grew. On first sight (a new job, or a restarted loop): at its limit when it has reached it before and
+        memory.current is within 5% of its effective limit, and stalled as its full avg10 says. seen collects this
+        sample's counters. Returns {full10, full60, at_limit, stalled}; raises OSError when its pressure cannot be
+        read."""
         p = self.cgroup_pressure(cg)
         full10, full60 = float(p["full"]["avg10"]), float(p["full"]["avg60"])
         try:
@@ -1650,28 +1668,31 @@ class Measure:
             stalled = full10 > 0
             cur, lim = _read_cg_int(cg, "memory.current"), self.effective_limit(cg, top)
             at_limit = bool(ev) and bool(cur) and bool(lim) and cur >= 0.95 * lim
-        return {"full10": full10, "full60": full60, "at_limit": at_limit,
-                "figure": full10 if stalled and not at_limit else 0.0}
+        return {"full10": full10, "full60": full60, "at_limit": at_limit, "stalled": stalled}
 
     def pressure(self, scopes):
-        """Memory pressure outside the cgroups stalled against their own limits, and each job's own stall
-        (docs/admission.md, "Memory pressure").
+        """Memory pressure for the admission check, and each job's own stall (docs/admission.md, "Memory pressure").
 
         scopes: {token: absolute path} of every agent-pueue job scope of this user. The cgroup tree under psi_root
         is split into the job scopes and the member cgroups that hold none of them (walking down only through
         user.slice and the ancestors of job scopes: each other user's slice, system.slice and the other top-level
-        cgroups, each read as one, and this user's other units). Every one of them, job scope or not, is left out
-        when it is stalled against its own limit (own_limit_stall): that is it being undersized, not host pressure.
-        The cgroup figure is the highest of the rest; the host's figure is the lower of it and the system-wide full
-        avg10, so it is never more sensitive than the system-wide figure alone. Where any member's pressure cannot be
-        read, or none can, the system-wide figure is used alone (it counts a job's own stall, the safe side).
+        cgroups, each read as one, and this user's other units). A member counts at its full avg10, whatever its
+        own limits. A job counts at its full avg10 while its stall time grows, except when it is stalled against its
+        own limit and the host is not in global reclaim (global_reclaim): that is it being undersized, not host
+        pressure. In global reclaim, the system-wide full avg10 is the figure, excluding nothing. Otherwise the
+        cgroup figure is the highest of the members' and the jobs' figures, and the host's figure is the lower of it
+        and the system-wide full avg10, so it is never more sensitive than the system-wide figure alone. Where any
+        member's pressure cannot be read, or none can, the system-wide figure is used alone (it counts a job's own
+        stall, the safe side), and the unreadable cgroups are named.
 
         Returns {psi, system, source ("cgroups" when the cgroup figure is the lower, else "system"), where,
         cgroups (the cgroup figure, None when not used), cg_where, outside (the highest figure among the members,
-        None when not used), unreadable, jobs: {token: {full10, full60, at_limit}}}."""
+        None when not all were read), unreadable (a count), unreadable_paths (up to 5 of them), global (whether the
+        host is in global reclaim), jobs: {token: {full10, full60, at_limit}}}."""
         system = self.memory_pressure()
+        glob = self.global_reclaim()
         out = {"psi": system, "system": system, "source": "system", "where": None, "cgroups": None, "cg_where": None,
-               "outside": None, "unreadable": 0, "jobs": {}}
+               "outside": None, "unreadable": 0, "unreadable_paths": [], "global": glob, "jobs": {}}
         root = self.psi_root.rstrip("/")
         cgr = self.cg.rstrip("/")
         rel = {}
@@ -1683,14 +1704,14 @@ class Measure:
             parts = r.strip("/").split("/")
             for i in range(1, len(parts)):
                 above.add("/" + "/".join(parts[:i]))
-        seen, members, unreadable, todo = {}, [], 0, [""]
+        seen, members, bad, todo = {}, [], [], [""]
         while todo:
             d = todo.pop()
             try:
                 names = sorted(e.name for e in os.scandir(root + d) if e.is_dir(follow_symlinks=False))
             except OSError as e:
                 if not _gone(e):
-                    unreadable += 1
+                    bad.append(d or "/")
                 continue
             for n in names:
                 c = d + "/" + n
@@ -1700,30 +1721,33 @@ class Measure:
                     todo.append(c)
                     continue
                 try:
-                    members.append((self.own_limit_stall(root + c, root, seen)["figure"], c))
+                    members.append((float(self.cgroup_pressure(root + c)["full"]["avg10"]), c))
                 except OSError as e:
                     if not _gone(e):  # gone since it was listed, or a kernel without pressure files
-                        unreadable += 1
+                        bad.append(c)
                 except (KeyError, ValueError):
-                    unreadable += 1
+                    bad.append(c)
         outside = max(members) if members else (0.0, None)
         best = outside
         for c, tok in rel.items():
             job = scopes[tok] + "/job"
             base = job if os.path.isdir(job) else scopes[tok]
             try:
-                j = self.own_limit_stall(base, cgr, seen)
+                j = self.job_stall(base, cgr, seen)
             except (OSError, KeyError, ValueError):
                 continue  # ended, or not readable: its stall is unknown, and the cgroups outside still count
             out["jobs"][tok] = {"full10": j["full10"], "full60": j["full60"], "at_limit": j["at_limit"]}
-            if j["figure"] > best[0]:
-                best = (j["figure"], c)
+            fig = j["full10"] if j["stalled"] and (glob or not j["at_limit"]) else 0.0
+            if fig > best[0]:
+                best = (fig, c)
         self.last_stall = seen
-        out["unreadable"] = unreadable
-        if members and not unreadable:
-            out.update(cgroups=best[0], cg_where=best[1], outside=outside[0])
-            if best[0] <= system:
-                out.update(psi=best[0], source="cgroups", where=best[1])
+        out["unreadable"], out["unreadable_paths"] = len(bad), bad[:5]
+        if members and not bad:
+            out["outside"] = outside[0]
+            if not glob:
+                out.update(cgroups=best[0], cg_where=best[1])
+                if best[0] <= system:
+                    out.update(psi=best[0], source="cgroups", where=best[1])
         return out
 
     def disk_of(self, path):
@@ -2023,7 +2047,8 @@ def compute_room(settings, samples, inflight, holds, now):
     out = {"t": last["t"], "psi": last["psi"], "pressure_ok": last["psi"] <= settings["memory_pressure_max_pct"],
            "psi_source": last.get("psi_source") or "system", "psi_where": last.get("psi_where"),
            "psi_system": last.get("psi_system", last["psi"]), "psi_unreadable": last.get("psi_unreadable") or 0,
-           "psi_cgroups": last.get("psi_cgroups"), "psi_cg_where": last.get("psi_cg_where")}
+           "psi_cgroups": last.get("psi_cgroups"), "psi_cg_where": last.get("psi_cg_where"),
+           "psi_global": last.get("psi_global"), "psi_unreadable_paths": last.get("psi_unreadable_paths") or []}
     use = {tok: j for tok, j in last["jobs"].items()}
 
     # RAM: what would be available with no admitted job, at its lowest over the window
@@ -2095,14 +2120,19 @@ def _psi_where(room):
     """Where a room's memory pressure figure comes from, for messages."""
     if room.get("psi_source") == "cgroups":
         if not room.get("psi_where"):
-            return " (no cgroup is stalled other than against its own RAM limit)"
-        return " (in %s, the highest of the cgroups not stalled against their own RAM limits)" % room["psi_where"]
+            return " (nothing is stalled other than jobs against their own RAM limits)"
+        return " (in %s, the highest of the cgroups, leaving out jobs stalled against their own RAM limits)" % (
+            room["psi_where"])
     if room.get("psi_cgroups") is not None:
-        return " (system-wide, lower than the highest of the cgroups not stalled against their own RAM limits, " \
-               "%.1f%% in %s)" % (room["psi_cgroups"], room.get("psi_cg_where") or "?")
+        return " (system-wide, lower than the highest of the cgroups leaving out jobs stalled against their own " \
+               "RAM limits, %.1f%% in %s)" % (room["psi_cgroups"], room.get("psi_cg_where") or "?")
     if room.get("psi_unreadable"):
-        return " (system-wide: %d cgroup(s) could not be read, so jobs' own stalls are counted too)" % (
-            room["psi_unreadable"])
+        paths = room.get("psi_unreadable_paths") or []
+        return " (system-wide: %d cgroup(s) could not be read%s, so jobs' own stalls are counted too)" % (
+            room["psi_unreadable"], ": " + ", ".join(paths) + (", ..." if room["psi_unreadable"] > len(paths) else "")
+            if paths else "")
+    if room.get("psi_global"):
+        return " (system-wide: the host is in global reclaim, so no job's stall is left out)"
     return " (system-wide)"
 
 
@@ -3299,7 +3329,8 @@ class Loop:
         s = {"t": now, "busy": busy, "iowait": iowait or 0.0, "avail": mem.get("MemAvailable", 0),
              "psi": pr["psi"], "psi_system": pr["system"], "psi_source": pr["source"], "psi_where": pr["where"],
              "psi_unreadable": pr["unreadable"], "psi_cgroups": pr["cgroups"], "psi_cg_where": pr["cg_where"],
-             "psi_outside": pr["outside"], "disks": self.m.disks(now, set(self.disk_names.values())),
+             "psi_outside": pr["outside"], "psi_global": pr["global"], "psi_unreadable_paths": pr["unreadable_paths"],
+             "disks": self.m.disks(now, set(self.disk_names.values())),
              "gpus": {c["uuid"]: dict({k: c[k] for k in ("index", "name", "total", "used", "util")},
                                      others=others.get(c["uuid"], 0)) for c in cards},
              "jobs": {tok: {"ram": j["ram"], "cpu": j["cpu"], "gpu": j.get("gpu", {})} for tok, j in jobs.items()},
@@ -3617,11 +3648,11 @@ class Loop:
             return
         last = self.samples[-1] if self.samples else {}
         outside = last.get("psi_outside")
-        if (outside is None or outside >= OUTSIDE_QUIET_PCT
+        if (last.get("psi_global") is not False or outside is None or outside >= OUTSIDE_QUIET_PCT
                 or (last.get("avail") or 0) <= self.s["ram_headroom_gb"] * GB):
-            # the host may be short of RAM (something outside the jobs stalls, its pressure could not all be read,
-            # or MemAvailable is under the headroom): global reclaim may be what stalls it, so the once-per-job
-            # ALERT is not spent on a doubtful case
+            # the host may be short of RAM (in global reclaim, or not known to be out of it; something outside the
+            # jobs stalls, or its pressure could not all be read; or MemAvailable is under the headroom): global
+            # reclaim may be what stalls it, so the once-per-job ALERT is not spent on a doubtful case
             q["undersized"] = None
             return
         limit = u.get("limit") or q.get("memory_max") or 0

@@ -333,11 +333,11 @@ measured use grows. Deployments that want limits on container work set them in t
 cache excluded). Per-process GPU values map to a job through `/proc/<pid>/cgroup`. The disk rate comes from
 `/proc/<pid>/io` summed over the scope's processes (a soft value: short-lived children are missed).
 
-**Per host:** busy threads from `/proc/stat` deltas; `MemAvailable`; memory pressure leaving out the cgroups
+**Per host:** busy threads from `/proc/stat` deltas; `MemAvailable`; memory pressure leaving out the jobs
 stalled against their own limits (below); per-disk busy time from `/proc/diskstats` deltas for the devices in `disks`.
 
 **Memory pressure.** The pressure check protects the host's other users when RAM is really short. The system-wide
-figure (`/proc/pressure/memory`) also counts a cgroup stalled against its own `memory.max`: one job thrashing in its
+figure (`/proc/pressure/memory`) also counts a job stalled against its own `memory.max`: one job thrashing in its
 own limit can put it over the limit on a host with plenty of RAM available, and holding every other job does not help
 it. The cgroups read are:
 
@@ -347,30 +347,45 @@ it. The cgroups read are:
   slice, every unit beside the job scopes (pueued, the loop, sessions);
 - the job scopes (every `agent-pueue-*` scope of this user, admitted or not), each read at its `job/` cgroup.
 
-Each of them, job or member, is tested the same way. It is stalled against its own limit when, over the sample
-interval, both its `full` stall time (`memory.pressure` `total=`) and its `memory.events` `max` count grew; that count
-is hierarchical, so a slice counts as at its limit when a cgroup under it (a worker with its own limit) reached its
-own. On first sight (a new cgroup, a restarted loop): when it has reached a limit before and its `memory.current` is
-within 5% of its effective limit (the lowest `memory.max` of it and its ancestors). Such a cgroup is left out: that
-is it being undersized, not host pressure. Of the rest, a cgroup whose stall time did not grow over the interval
-adds nothing (its `avg10` is only decaying from a stall that ended, as after a thrashing burst), and one whose stall
-time grew adds its `full avg10`. The cgroup figure is the highest of these, and the figure the check uses is the
-lower of it and the system-wide `full avg10`, so it is never more sensitive than the system-wide figure alone: a job
-thrashing alone raises the system-wide figure while the cgroup figure stays low, and in a real shortage both are high.
+A member counts at its `full avg10`, whatever its own limits: a cgroup outside the jobs at its own limit can hide a
+real shortage (its `memory.events` count is hierarchical, so one container at its limit would hide all of
+`system.slice`), and students' notebooks are killed when total use passes a fixed line, so a real shortage must
+always hold jobs.
 
-Real host-wide shortage stalls whatever allocates, without reaching its own limit, so it still holds jobs; a job's
-own thrashing does not. A member whose pressure file cannot be read (other than one that has just gone, `ENOENT`, or
-`ENODEV` when it went between the open and the read), or no member at all, means the system-wide figure is used
-alone, which counts every job's own stall (the safe side); `job room` and the held reason say which source holds,
-and in which cgroup the cgroup figure is highest. The ram room check is unchanged.
+A job is stalled against its own limit when, over the sample interval, both its `full` stall time
+(`memory.pressure` `total=`) and its `memory.events` `max` count grew; on first sight (a new job, a restarted loop),
+when it has reached its limit before and its `memory.current` is within 5% of its effective limit (the lowest
+`memory.max` of it and its ancestors). A job whose stall time did not grow adds nothing (its `avg10` is only
+decaying from a stall that ended, as after a thrashing burst); one whose stall time grew adds its `full avg10`,
+except that a job stalled against its own limit is left out while the host is not in global reclaim: that is it
+being undersized, not host pressure.
+
+The host is in global reclaim when the sum of the `allocstall_*` counters in `/proc/vmstat` grew over the sample
+interval. The kernel counts these only for direct reclaim that is not aimed at one cgroup (`mm/vmscan.c`,
+`do_try_to_free_pages`: `if (!cgroup_reclaim(sc))`), so a cgroup reclaiming against its own `memory.max` never adds
+to them. Where it can't be told (the loop's first sample, a kernel without the counters, an unreadable file), the
+host counts as in global reclaim (the safe side). In global reclaim the figure the check uses is the system-wide
+`full avg10`, with nothing left out. Otherwise the cgroup figure is the highest of the members' and the jobs'
+figures, and the figure the check uses is the lower of it and the system-wide `full avg10`, so it is never more
+sensitive than the system-wide figure alone: a job thrashing alone raises the system-wide figure while the cgroup
+figure stays low, and in a real shortage both are high.
+
+A member whose pressure file cannot be read (other than one that has just gone, `ENOENT`, or `ENODEV` when it went
+between the open and the read), or no member at all, means the system-wide figure is used alone, which counts every
+job's own stall (the safe side); `job room` and the held reason say which source holds, name the cgroups that could
+not be read, and say in which cgroup the cgroup figure is highest. The ram room check is unchanged.
+
+Not supported: a job thrashing against an ancestor's limit (a `MemoryMax` on the user's slice or on the pueue
+service). Its own `memory.events` `max` count does not grow then, so its stall counts as host pressure and holds
+other jobs; the admission loop assumes the only memory limits above the job scopes are the host's RAM.
 
 A job stalled against its own limit for over `undersize_stall_pct` of the last minute (its `job/` cgroup's
 `full avg60`, while it is at its limit) is undersized: its owner gets one ALERT saying so (its stall, limit, use
-and file cache), and `job room` shows it under the job while it lasts. The ALERT is made only when nothing outside
-the jobs stalls (every member's figure under 1%, all of them read) and `MemAvailable` is above `ram_headroom_gb`:
-otherwise global reclaim may be what stalls it, and the once-per-job ALERT is not spent on a doubtful case. A running
-job's limit is never raised; the owner kills it and submits it again with a larger size, or measures it with
-`--pilot`.
+and file cache), and `job room` shows it under the job while it lasts. The ALERT is made only when the host is not
+in global reclaim (by the same signal), nothing outside the jobs stalls (every member's figure under 1%, all of them
+read), and `MemAvailable` is above `ram_headroom_gb`: otherwise global reclaim may be what stalls it, and the
+once-per-job ALERT is not spent on a doubtful case. A running job's limit is never raised; the owner kills it and
+submits it again with a larger size, or measures it with `--pilot`.
 
 ### Room
 
