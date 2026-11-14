@@ -1503,13 +1503,15 @@ def _gone(e):
 def _droppable_cache(stat):
     """The file cache a lower RAM limit makes the kernel drop, from a memory.stat dict: inactive_file, and the part of
     active_file that is not memory-mapped (hot mapped file pages, such as a program's or library's code and data it
-    reads through mmap, are its working set: dropping them makes it fault them straight back)."""
+    reads through mmap, are its working set: dropping them makes it fault them straight back), less the pages that
+    are dirty or under writeback (file_dirty, file_writeback), which must be written out before they can go."""
     def n(k):
         try:
             return int(stat.get(k, 0))
         except (TypeError, ValueError):
             return 0
-    return n("inactive_file") + max(0, n("active_file") - n("file_mapped"))
+    return max(0, n("inactive_file") + max(0, n("active_file") - n("file_mapped"))
+               - n("file_dirty") - n("file_writeback"))
 
 
 def _refaults(stat):
@@ -2905,32 +2907,43 @@ def host_submit_admitted(req, settings, command):
 
 
 PEAK_SEEN_FRACTION = 1.02  # memory.peak within this factor of the highest sampled memory.current was seen by sampling
+PEAK_AT_LIMIT_FRACTION = 0.9  # memory.peak at or over this share of the job's memory.max: it reached its limit
 
 
-def _resize_floor(settings, peak, use, kernel_peak=0, cache=0, sampled_current=0):
+def _cache_off_peak(kernel_peak, sampled_current, limit):
+    """Whether the file cache may be taken off a job's memory.peak for its resize floor: the peak is under
+    PEAK_AT_LIMIT_FRACTION of its memory.max (limit; a peak at its limit says only that it filled it, and what with
+    is unknown), and it was seen by sampling (within PEAK_SEEN_FRACTION of the highest memory.current the loop
+    sampled). False when its limit is not known."""
+    return bool(kernel_peak and limit and kernel_peak < PEAK_AT_LIMIT_FRACTION * limit
+                and kernel_peak <= PEAK_SEEN_FRACTION * (sampled_current or 0))
+
+
+def _resize_floor(settings, peak, use, kernel_peak=0, cache=0, sampled_current=0, limit=None):
     """The lowest RAM limit a running job may be given: what it can't give back if its limit is lowered, the largest
     of its sampled RAM peak times resize_margin (the loop samples once a cycle, so that is a lower bound), its use
     now less the file cache a lower limit drops (use: memory.current less _droppable_cache), and the kernel's own
     peak of its cgroup (memory.peak, which catches spikes between samples).
 
-    memory.peak counts file cache too: a job that streams data fills its limit with cache, so memory.peak alone would
-    say it needs its whole limit. The cache is taken off it only when the peak was seen by sampling: memory.peak is
-    within PEAK_SEEN_FRACTION of the highest memory.current the loop sampled (sampled_current), so the sampled peak
-    (the first term) measured what was not cache at that peak. Otherwise the peak came between samples, of unknown
-    make-up (an anonymous spike, with the cache squeezed out then and refilled since, looks the same), and the whole
-    memory.peak is the floor. A limit under a real spike ends the job; one too high only keeps room idle."""
+    memory.peak counts file cache too. The cache is taken off it only when _cache_off_peak: the peak is under 0.9 of
+    the job's memory.max (limit) and was seen by sampling (within PEAK_SEEN_FRACTION of the highest memory.current
+    the loop sampled, sampled_current; never a reading taken at resize time), so the sampled peak (the first term)
+    measured what was not cache at that peak. Otherwise the whole memory.peak is the floor: a peak between samples
+    is of unknown make-up (an anonymous spike, with the cache squeezed out then and refilled since, looks the same),
+    and a job that sits at its limit cannot be shrunk. A limit under a real spike ends the job; one too high only
+    keeps room idle."""
     kernel_peak = kernel_peak or 0
-    if kernel_peak and kernel_peak <= PEAK_SEEN_FRACTION * (sampled_current or 0):
+    if _cache_off_peak(kernel_peak, sampled_current, limit):
         kernel_peak = max(0, kernel_peak - (cache or 0))
     return max(use, peak * settings["resize_margin"], kernel_peak)
 
 
-def _resize_suggestion(settings, peak, use, kernel_peak=0, cache=0, projected=0, sampled_current=0):
+def _resize_suggestion(settings, peak, use, kernel_peak=0, cache=0, projected=0, sampled_current=0, limit=None):
     """The size to suggest for an oversized job, in bytes: what --like would give from its peak (peak times
     margins.ram; the RAM its progress trend projects at its end, if higher, stands in for the peak), at least the
     smallest size whose limit covers the resize floor, rounded up to 0.1 GB, and raised further if the size as
     written (--ram 4.1G) would parse to a limit a byte under the floor."""
-    floor = _resize_floor(settings, peak, use, kernel_peak, cache, sampled_current)
+    floor = _resize_floor(settings, peak, use, kernel_peak, cache, sampled_current, limit)
     want = max(max(peak, projected or 0) * settings["margins"]["ram"], floor / settings["ram_hard_factor"],
                SCOPE_MIN_MEMORY)
     n = int(math.ceil(want / 1e8 - 1e-9)) * 10 ** 8
@@ -2942,8 +2955,14 @@ def _resize_suggestion(settings, peak, use, kernel_peak=0, cache=0, projected=0,
 def _shrink_blocked(full60, refault_grew):
     """Why a job must not be shrunk (nor told it is oversized) now, or None: it is short of memory in its own cgroup
     (its memory.pressure full avg60 over SHRINK_STALL_PCT), or file pages it dropped are being read back
-    (workingset_refault_file grew since the loop's last sample), so the file cache it holds is working set."""
-    if full60 is not None and full60 > SHRINK_STALL_PCT:
+    (workingset_refault_file grew since the loop's last sample), so the file cache it holds is working set. Either
+    one None (could not be read) blocks it too: a shrink is refused when its safety can't be checked."""
+    if full60 is None:
+        return "its own memory pressure (memory.pressure of its cgroup) could not be read, so a shrink can't be checked"
+    if refault_grew is None:
+        return ("its file refault count (memory.stat workingset_refault_file) could not be read or compared, so a "
+                "shrink can't be checked")
+    if full60 > SHRINK_STALL_PCT:
         return ("it spent %.1f%% of the last minute stalled reclaiming memory in its own cgroup (memory.pressure full "
                 "avg60, over %g%%): it is short of memory now, and a lower limit would make that worse" % (
                     full60, SHRINK_STALL_PCT))
@@ -3163,29 +3182,30 @@ def _resize_running(settings, con, q, old, new):
     if not known:
         raise JobError("its RAM limit is not known (no recorded limit, and its cgroup's memory.max reads none); "
                        "not resized")
-    current = min(known)
+    limit_now = min(known)  # the limit it runs under now
     peak_cpu = r[2] or 0.0
     if new["cpus"] < old["cpus"] and new["cpus"] < peak_cpu - 1e-9:
         raise JobError("--cpus %g is under its measured CPU use, %.2f threads at its peak; the smallest accepted is "
                        "--cpus %g" % (new["cpus"], peak_cpu, math.ceil(peak_cpu * 100 - 1e-9) / 100))
     if new["ram"] == old["ram"]:  # only its CPU threads change: it keeps the RAM limit it runs under
-        return {"memory_max": current, "ram_counted": current, "was_memory_max": q.get("memory_max")}, None
+        return {"memory_max": limit_now, "ram_counted": limit_now, "was_memory_max": q.get("memory_max")}, None
     limit = ram_limit(settings, new["ram"])
-    if limit > current:
+    if limit > limit_now:
         raise JobError("--ram %s gives a RAM limit of %s, above the limit it runs under now, %s (ram_hard_factor has "
                        "changed since it was released); a running job's limit is never raised, so give a --ram whose "
-                       "limit is at most %s" % (_gbs(new["ram"]), _gbs(limit), _gbs(current), _gbs(current)))
-    ram_now, cache, current, refault = m.cgroup_mem(job_cg[len(m.cg):])
+                       "limit is at most %s" % (_gbs(new["ram"]), _gbs(limit), _gbs(limit_now), _gbs(limit_now)))
+    ram_now, cache, usage, refault = m.cgroup_mem(job_cg[len(m.cg):])
     if ram_now is None:
         raise JobError("its cgroup's memory could not be read; not resized")
-    use = max(0, current - cache)  # what it can't give back now: memory.current less the cache a lower limit drops
+    use = max(0, usage - cache)  # what it can't give back now: memory.current less the cache a lower limit drops
     kernel_peak = _read_cg_int(job_cg, "memory.peak") or 0
-    sampled_current = max(r[3] or 0, current)
+    sampled_current = r[3] or 0  # the loop's samples only: a reading taken now would make any peak look seen
     peak = max(r[0] or 0, ram_now)
-    floor = _resize_floor(settings, peak, use, kernel_peak, cache, sampled_current)
+    floor = _resize_floor(settings, peak, use, kernel_peak, cache, sampled_current, limit_now)
     if limit < floor:
-        smallest = _resize_suggestion(settings, peak, use, kernel_peak, cache, sampled_current=sampled_current)
-        seen = kernel_peak and kernel_peak <= PEAK_SEEN_FRACTION * sampled_current
+        smallest = _resize_suggestion(settings, peak, use, kernel_peak, cache, sampled_current=sampled_current,
+                                      limit=limit_now)
+        seen = _cache_off_peak(kernel_peak, sampled_current, limit_now)
         raise JobError("--ram %s gives a RAM limit of %s, under %s: the largest of its measured peak so far, %s, times "
                        "resize_margin %g, its use now less the file cache a lower limit drops, %s, and the kernel's "
                        "peak of its cgroup, %s%s; the smallest size accepted is about --ram %s" % (
@@ -3193,7 +3213,8 @@ def _resize_running(settings, con, q, old, new):
                            _gbs(use), _gbs(kernel_peak),
                            " less the file cache it holds now, %s (memory.peak counts file cache, and this peak was "
                            "seen by the loop's sampling)" % _gbs(cache) if seen else
-                           " whole (memory.peak came between the loop's samples, so what it was made of is unknown)",
+                           " whole (memory.peak reached 90% of its limit, or came between the loop's samples, so "
+                           "what it was made of is unknown)",
                            _size_arg(smallest)))
     try:
         full60 = float(m.cgroup_pressure(job_cg)["full"]["avg60"])
@@ -3202,16 +3223,30 @@ def _resize_running(settings, con, q, old, new):
     if refault is not None and q.get("refault") is None:
         raise JobError("its file refaults have not been sampled by the admission loop yet; try again after its next "
                        "cycle (about %d s)" % settings["sample_interval_s"])
-    why = _shrink_blocked(full60, refault is not None and refault > q["refault"])
+    why = _shrink_blocked(full60, None if refault is None else refault > q["refault"])
     if why:
         raise JobError("not shrunk now: %s; nothing changed" % why)
     _set_memory_max(job_cg, limit)
+    token = q["token"]
 
     def undo():
+        """Put back the limit it ran under, but never above the limit recorded for it now (a resize that ran
+        meanwhile may have lowered it), and never over a memory.max someone else has set since."""
         try:
-            _set_memory_max(job_cg, have or current)
-        except JobError as e:
-            sys.stderr.write("job resize: could not put the RAM limit of %s back: %s\n" % (q["token"], e))
+            now_cg = _read_cg_int(job_cg, "memory.max")
+            if now_cg is not None and abs(now_cg - limit) >= 65536:
+                return  # changed since this resize set it: not this resize's to put back
+            rec = Admission(settings).read_queue(token)
+            recorded = (rec or {}).get("memory_max")
+            if not recorded:
+                sys.stderr.write("job resize: the RAM limit of %s was left at %s: its recorded limit could not be "
+                                 "read\n" % (token, _gbs(limit)))
+                return
+            back = min(limit_now, recorded)
+            if back > limit:
+                _set_memory_max(job_cg, back)
+        except Exception as e:  # noqa: BLE001  (it runs in a finally: it must never hide the refusal it undoes)
+            sys.stderr.write("job resize: could not put the RAM limit of %s back: %s\n" % (token, e))
     return {"memory_max": limit, "ram_counted": limit, "was_memory_max": q.get("memory_max")}, undo
 
 
@@ -3589,11 +3624,12 @@ class Loop:
     def track_memory(self, q, u):
         """Keep, in the job's queue file, its own stall (full avg60), its file refault count at this sample and
         whether that grew since the last one: what job resize and the oversize ALERT check before a shrink
-        (_shrink_blocked)."""
+        (_shrink_blocked). Not measured this cycle: neither is known, which blocks a shrink."""
         if not u:
+            q["refault_grew"] = q["stall60"] = None
             return
         ref, last = u.get("refault"), q.get("refault")
-        q["refault_grew"] = ref is not None and last is not None and ref > last
+        q["refault_grew"] = None if ref is None or last is None else ref > last  # None: not known
         q["refault"] = ref
         q["stall60"] = (u.get("psi") or {}).get("full60")
 
@@ -3619,12 +3655,12 @@ class Loop:
         path = self.scopes_now.get(q["token"])
         kernel_peak = (_read_cg_int(os.path.join(path, "job"), "memory.peak") or 0) if path else 0
         use, cache = (u or {}).get("need") or 0, (u or {}).get("cache") or 0
-        current = max(p.get("current") or 0, (u or {}).get("current") or 0)
-        suggest = _resize_suggestion(self.s, p["ram"], use, kernel_peak, cache, projected, current)
-        if suggest >= size:
-            return  # its floor (a spike memory.peak caught, not file cache) leaves nothing to give back
-        counted = self._counted(q, now)["ram_counted"]
         limits = [x for x in (q.get("memory_max"), (u or {}).get("limit")) if x]
+        suggest = _resize_suggestion(self.s, p["ram"], use, kernel_peak, cache, projected, p.get("current") or 0,
+                                     min(limits) if limits else None)
+        if suggest >= size:
+            return  # its floor (memory.peak at its limit or between samples, not file cache) leaves nothing to give
+        counted = self._counted(q, now)["ram_counted"]
         if limits and ram_limit(self.s, _parse_size(_size_arg(suggest))) > min(limits):
             return  # ram_hard_factor was raised since its release: no size both covers its floor and is under the
             # limit it runs under, so job resize would refuse any shrink

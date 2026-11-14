@@ -488,25 +488,30 @@ let its owner give that room back:
       limit drops, and the kernel's peak of its `job/` cgroup (`memory.peak`, which catches spikes between
       samples). The file cache a lower limit drops is `inactive_file` plus the part of `active_file` that is not
       memory-mapped (`file_mapped`): hot mapped pages, such as code and data a program reads through `mmap`, are
-      its working set, and dropping them only makes it fault them back. `memory.peak` counts file cache, and a job
-      that streams data fills its limit with cache, which the kernel drops at a lower limit; taken whole it would
-      say such a job needs its whole limit (a 64 GB job using 26.5 GB with `memory.peak` at its 80 GB limit could
-      never shrink). So that cache is taken off `memory.peak` when the peak was seen by sampling: `memory.peak` is
-      within 2% of the highest `memory.current` (cache included) the loop sampled for the job, so the sampled RAM
-      peak measured what was not cache at that peak. Otherwise the peak came between samples and its make-up is
-      unknown (an anonymous spike that squeezed the cache out, with the cache refilled since, looks the same), and
-      the whole `memory.peak` is the floor. Nothing about the cache at the peak is assumed. A limit
-      under a real spike ends the job; one too high only keeps room idle. A `--cpus`-only resize keeps the limit it runs under.
+      its working set, and dropping them only makes it fault them back; less the pages that are dirty or under
+      writeback (`file_dirty`, `file_writeback`), which must be written out before they can go. `memory.peak`
+      counts file cache, so that cache is taken off it only when both hold: `memory.peak` is under 0.9 of the
+      job's `memory.max`, and it was seen by sampling (within 2% of the highest `memory.current`, cache included,
+      that the loop sampled for the job; a reading taken by the resize itself does not count), so the sampled RAM
+      peak measured what was not cache at that peak. Otherwise the whole `memory.peak` is the floor: a peak
+      between samples is of unknown make-up (an anonymous spike that squeezed the cache out, with the cache
+      refilled since, looks the same), and a job whose peak reached its limit filled it with something unknown,
+      so a job that sits at its limit (a streaming job that fills it with cache, too) cannot be shrunk. Nothing
+      about the cache at the peak is assumed. A limit under a real spike ends the job; one too high only keeps
+      room idle. A `--cpus`-only resize keeps the limit it runs under.
     - It is also refused, saying which, while the job is short of memory in its own cgroup (its `memory.pressure`
       `full avg60` over 1%) or reads dropped file pages back in (its `memory.stat` `workingset_refault_file` grew
       since the loop's last sample, which the loop keeps in its queue file; before the loop has sampled it once,
-      the resize is refused with "try again"): a lower limit would make either worse. No oversize ALERT is made
-      in those cases either.
+      the resize is refused with "try again"): a lower limit would make either worse. It is refused too when
+      either can't be read (no pressure file, no refault counter): a shrink whose safety can't be checked is not
+      made. No oversize ALERT is made in any of those cases either.
     - `--cpus` may not go under its measured CPU peak.
     - Order: its scope's `job/memory.max` is lowered and read back first, before the queue lock (lowering it can
       force a long reclaim, and submits and the loop wait on that lock); then, under the lock, the job is checked
       again to be the same running job at the same size and limit (if not, its limit is put back and the resize
-      is refused with "try again"), then the record, then the resize file
+      is refused with "try again"; put back never above the limit recorded for it then, which a resize that ran
+      meanwhile may have lowered, and not at all when its `memory.max` was changed by someone else since), then
+      the record, then the resize file
       the loop counts by; a step that fails puts back the ones before it, so a reported failure leaves nothing
       changed. The loop counts a running job at the larger of its recorded limit and its cgroup's `memory.max`,
       so between the steps it is never counted below its real limit. A restart of the job reads the new limit

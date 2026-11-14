@@ -2778,7 +2778,7 @@ class LoopTests(Base):
         reason, _ = self.j._submit_reason(self.settings, adm, held(group="sched"), None)
         self.assertIn("is not running", reason)
 
-    def test_a_streaming_jobs_file_cache_does_not_stop_its_alert_or_its_shrink(self):
+    def test_a_job_whose_peak_reached_its_limit_gets_no_alert_and_is_not_shrunk(self):
         if subprocess.run(["stat", "-f", "-c", "%T", "/var/tmp"], capture_output=True, text=True).stdout.strip() in (
                 "tmpfs", "ramfs"):
             self.skipTest("/var/tmp is in memory here, so its pages are not file cache")
@@ -2798,13 +2798,60 @@ class LoopTests(Base):
         now[0] += 3600
         self.host.tick()
         loop.cycle()
-        o = self.queue_file(tok).get("oversize")
-        self.assertTrue(o, "the oversize ALERT was dropped for a job whose memory.peak is file cache")
-        self.assertIn("oversize", self.queue_file(tok)["alerted"])
-        p = self.job("resize", "local", str(tid), "--ram", o["suggest"], **self.env())
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)  # the suggestion is accepted
-        self.assertEqual(self.memory_max(loop, tok), self.j.ram_limit(self.settings, self.j._parse_size(o["suggest"])))
-        self.assertEqual(self.status(tid), "Running")  # the kernel dropped cache to the new limit; the job runs on
+        # memory.peak at its limit: what filled it is unknown (cache, or an anonymous spike that squeezed the cache
+        # out), so the floor is the whole memory.peak and nothing can be given back
+        self.assertIsNone(self.queue_file(tok).get("oversize"))
+        self.assertNotIn("oversize", self.queue_file(tok).get("alerted") or [])
+        was = self.memory_max(loop, tok)
+        p = self.job("resize", "local", str(tid), "--ram", "300Mi", **self.env())
+        self.assertEqual(p.returncode, 205, p.stdout + p.stderr)
+        self.assertIn("reached 90% of its limit", p.stdout)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        self.assertEqual(self.status(tid), "Running")
+
+    def test_a_failed_shrink_never_puts_back_a_limit_above_the_recorded_one(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        cg = os.path.join(loop.m.scopes()[tok], "job")
+        os.environ.update(self.env())
+        self.addCleanup(os.environ.pop, "JOB_ADMISSION_CONFIG", None)
+        adm = self.j.Admission(self.settings)
+        mine = self.j.ram_limit(self.settings, 300 * MiB)
+        recorded = self.j._whole_pages(mine + (was - mine) // 2)
+        lower = self.j.ram_limit(self.settings, 250 * MiB)
+        for case in ("recorded lower", "memory.max set since"):
+            out = {}
+
+            def run():
+                try:
+                    out["r"] = self.j.host_resize({"id": tid, "ram": 300 * MiB})
+                except self.j.JobError as e:
+                    out["e"] = str(e)
+            fd = adm.lock("queue.lock")
+            th = threading.Thread(target=run)
+            th.start()
+            try:
+                for _ in range(200):
+                    if self.memory_max(loop, tok) == mine:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(self.memory_max(loop, tok), mine)
+                q = adm.read_queue(tok)
+                if case == "recorded lower":  # a resize recorded a limit between this one's and the old one
+                    q["memory_max"] = recorded
+                else:  # a resize set a lower memory.max (and recorded it) while this one waited for the lock
+                    q["memory_max"] = lower
+                    self.j._set_memory_max(cg, lower)
+                adm.save(q)
+            finally:
+                os.close(fd)
+            th.join(60)
+            self.assertIn("changed while it was being resized", out.get("e", ""), out)
+            self.assertEqual(self.memory_max(loop, tok), recorded if case == "recorded lower" else lower, case)
+            q = adm.read_queue(tok)  # back to where it was for the next case
+            q["memory_max"] = was
+            adm.save(q)
+            self.j._set_memory_max(cg, was)
 
     def test_a_resize_in_the_middle_of_a_cycle_stays_in_the_record(self):
         loop, tid, tok, now = self.running_job()
@@ -3172,17 +3219,38 @@ class ReviewThreeRules(unittest.TestCase):
         self.addCleanup(remove_own_dir, self.tmp)
         self.s = settings(self.j, self.tmp, ram_hard_factor=1.5)
 
-    def test_the_floor_takes_file_cache_out_of_the_kernels_peak(self):
-        # the live case: sized 64 GB (limit 80 GB), sampled peak 26.5 GB, memory.peak at its 80 GB limit, of which
-        # 53 GB is file cache it still holds
-        # (the loop sampled memory.current at that peak: the cache filled the limit, which sampling sees)
-        floor = self.j._resize_floor(self.s, 26.5 * GB, 26 * GB, 80 * GB, 53 * GB, sampled_current=80 * GB)
+    def test_the_floor_takes_file_cache_off_a_sampled_peak_under_its_limit(self):
+        # limit 80 GB; memory.peak 60 GB, seen by sampling (memory.current was sampled at 60 GB), 40 GB of it file
+        # cache it still holds: the cache comes off, and the sampled RAM peak times resize_margin is the floor
+        floor = self.j._resize_floor(self.s, 26.5 * GB, 20 * GB, 60 * GB, 40 * GB, sampled_current=60 * GB,
+                                     limit=80 * GB)
         self.assertAlmostEqual(floor, 26.5 * GB * 1.25)
-        n = self.j._resize_suggestion(self.s, 26.5 * GB, 26 * GB, 80 * GB, 53 * GB, sampled_current=80 * GB)
+        n = self.j._resize_suggestion(self.s, 26.5 * GB, 20 * GB, 60 * GB, 40 * GB, sampled_current=60 * GB,
+                                      limit=80 * GB)
         self.assertEqual(self.j._size_arg(n), "33.2G")
         self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._parse_size("33.2G")), floor)
         # anonymous growth between samples (little cache now) keeps its floor at the kernel's peak
-        self.assertGreaterEqual(self.j._resize_floor(self.s, 26.5 * GB, 26 * GB, 80 * GB, 1 * GB), 79 * GB)
+        self.assertGreaterEqual(self.j._resize_floor(self.s, 26.5 * GB, 26 * GB, 60 * GB, 1 * GB, limit=80 * GB),
+                                59 * GB)
+
+    def test_a_job_whose_peak_reached_its_limit_cannot_be_shrunk(self):
+        # sized 64 GB (limit 80 GB), sampled peak 26.5 GB, memory.peak at its 80 GB limit, 53 GB of it file cache now:
+        # what filled the limit at its peak is unknown, so the floor is the whole memory.peak
+        for limit in (80 * GB, 85 * GB, None):  # at it, at 94% of it, or not known
+            self.assertEqual(self.j._resize_floor(self.s, 26.5 * GB, 26 * GB, 80 * GB, 53 * GB,
+                                                  sampled_current=80 * GB, limit=limit), 80 * GB, limit)
+
+    def test_review_6_a_hidden_spike_under_a_cache_filled_limit_is_not_given_away(self):
+        # limit 100 GB, always cache-filled; anon sampled at 5 GB; an unsampled 40 GB anonymous spike squeezed the
+        # cache out and it refilled since: memory.peak and every sampled memory.current are 100 GB
+        floor = self.j._resize_floor(self.s, 5 * GB, 5 * GB, 100 * GB, 95 * GB, sampled_current=100 * GB,
+                                     limit=100 * GB)
+        self.assertGreaterEqual(floor, 40 * GB)
+
+    def test_dirty_and_writeback_pages_are_not_droppable(self):
+        self.assertEqual(self.j._droppable_cache({"inactive_file": 10, "active_file": 6, "file_mapped": 2,
+                                                  "file_dirty": 3, "file_writeback": 1}), 10)
+        self.assertEqual(self.j._droppable_cache({"inactive_file": 1, "file_dirty": 5}), 0)
 
     def oversize_loop(self):
         class M:  # enough of Measure for a Loop that is never cycled
@@ -3212,7 +3280,8 @@ class ReviewThreeRules(unittest.TestCase):
 
     def oversized_job(self, **kw):
         q = {"token": "f" * 32, "task": "T-o", "size": {"cpus": 1, "ram": 10 * GB, "gpus": 0, "gpu_mem": 0},
-             "started": 1000.0, "released": 1000.0, "memory_max": self.j.ram_limit(self.s, 10 * GB), "gpus": []}
+             "started": 1000.0, "released": 1000.0, "memory_max": self.j.ram_limit(self.s, 10 * GB), "gpus": [],
+             "stall60": 0.0, "refault_grew": False}
         q.update(kw)
         return q
 
@@ -3281,12 +3350,13 @@ class ReviewFiveRules(unittest.TestCase):
     def test_a_spike_between_samples_keeps_the_whole_kernel_peak_as_the_floor(self):
         # memory.peak 80 GB, but the highest memory.current the loop sampled was 30 GB: the peak came between
         # samples, of unknown make-up (an anonymous spike that squeezed the cache out, the cache refilled since)
-        self.assertEqual(self.j._resize_floor(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=30 * GB),
-                         80 * GB)
-        # within 2% of the sampled peak: seen by sampling, so its cache comes off
-        self.assertEqual(self.j._resize_floor(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=79 * GB),
-                         27 * GB)
-        n = self.j._resize_suggestion(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=30 * GB)
+        self.assertEqual(self.j._resize_floor(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=30 * GB,
+                                              limit=100 * GB), 80 * GB)
+        # within 2% of the sampled peak, and under 90% of its limit: seen by sampling, so its cache comes off
+        self.assertEqual(self.j._resize_floor(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=79 * GB,
+                                              limit=100 * GB), 27 * GB)
+        n = self.j._resize_suggestion(self.s, 10 * GB, 10 * GB, 80 * GB, 53 * GB, sampled_current=30 * GB,
+                                      limit=100 * GB)
         self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._parse_size(self.j._size_arg(n))), 80 * GB)
 
     def test_no_oversize_alert_while_it_stalls_or_its_file_cache_is_read_back(self):
@@ -3310,11 +3380,27 @@ class ReviewFiveRules(unittest.TestCase):
         loop = self.oversize_loop()
         q = {}
         loop.track_memory(q, {"refault": 10, "psi": {"full60": 0.2}})
-        self.assertEqual((q["refault"], q["refault_grew"], q["stall60"]), (10, False, 0.2))
+        self.assertEqual((q["refault"], q["refault_grew"], q["stall60"]), (10, None, 0.2))  # first: not known yet
         loop.track_memory(q, {"refault": 14, "psi": None})
-        self.assertEqual((q["refault"], q["refault_grew"]), (14, True))
-        loop.track_memory(q, {"refault": 14})
-        self.assertFalse(q["refault_grew"])
+        self.assertEqual((q["refault"], q["refault_grew"], q["stall60"]), (14, True, None))
+        loop.track_memory(q, {"refault": 14, "psi": {"full60": 0.0}})
+        self.assertIs(q["refault_grew"], False)
+        loop.track_memory(q, {"refault": None, "psi": {"full60": 0.0}})  # a kernel without the counter
+        self.assertIsNone(q["refault_grew"])
+        loop.track_memory(q, None)  # not measured this cycle
+        self.assertEqual((q["refault_grew"], q["stall60"]), (None, None))
+
+    def test_a_shrink_and_the_oversize_alert_fail_closed_when_its_stall_cannot_be_read(self):
+        self.assertIn("could not be read", self.j._shrink_blocked(None, False))
+        self.assertIn("could not be read", self.j._shrink_blocked(0.0, None))
+        p, u = {"ram": 1 * GB, "n": 10, "current": 2 * GB}, {"ram": GB, "need": GB, "cache": 0, "limit": None,
+                                                             "current": 2 * GB}
+        for unknown in ({"stall60": None}, {"refault_grew": None}):
+            loop = self.oversize_loop()
+            q = self.oversized_job(**unknown)
+            loop.check_oversize(q, 10000.0, "Running", p, u)
+            self.assertIsNone(q["oversize"], unknown)
+            self.assertEqual(loop.alerts, [])
 
     def test_the_undersized_alert_waits_for_a_host_with_ram_to_spare(self):
         u = {"ram": GB, "cache": 0, "files": 0, "limit": 2 * GB,
