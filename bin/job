@@ -35,7 +35,7 @@ import time
 import traceback
 import uuid
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 PROTOCOL = 3
 # Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
 # option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
@@ -4502,8 +4502,10 @@ def host_main(op):
         req = json.loads(sys.stdin.read() or "{}")
         if req.get("pueue_config"):  # tests: point the host side at a throwaway pueued
             os.environ["JOB_PUEUE_CONFIG"] = req["pueue_config"]
-            global STATE_DIR
+            global STATE_DIR, ADMISSION_CONFIG
             STATE_DIR = os.path.join(os.path.dirname(req["pueue_config"]), "state")
+            # nor at the host's admission settings: a throwaway daemon is not admitted by the host's loop
+            ADMISSION_CONFIG = os.path.join(os.path.dirname(req["pueue_config"]), "admission.json")
         if req.get("protocol") not in ACCEPTED_PROTOCOLS:
             raise JobError("protocol mismatch: client %s, host %s (job %s on %s); install the same "
                            "version on both (install.sh)" % (req.get("protocol"),
