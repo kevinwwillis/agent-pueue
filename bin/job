@@ -18,6 +18,7 @@ import argparse
 import base64
 import ctypes
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -1146,6 +1147,7 @@ def host_ls(req):
         if s["status"] == "Done" and s.get("token"):
             s["scope"] = _scope_result(s["token"])
             s["killed_by"] = _killed_by(s, st)
+            s["delivered"] = os.path.exists(os.path.join(STATE_DIR, "results", s["token"] + ".delivered"))
         elif s["status"] == "Stashed" and s.get("token"):
             _probe_admission(s, {})
         elif s["status"] == "Running" and s.get("token"):
@@ -1492,6 +1494,39 @@ def _admission_settings(path=None, nthreads=None):
     return s
 
 
+def _gone(e):
+    """Whether an OSError from a cgroup file means the cgroup is gone: ENOENT, or ENODEV when it was removed between
+    the open and the read."""
+    return isinstance(e, FileNotFoundError) or getattr(e, "errno", None) == errno.ENODEV
+
+
+def _droppable_cache(stat):
+    """The file cache a lower RAM limit makes the kernel drop, from a memory.stat dict: inactive_file, and the part of
+    active_file that is not memory-mapped (hot mapped file pages, such as a program's or library's code and data it
+    reads through mmap, are its working set: dropping them makes it fault them straight back)."""
+    def n(k):
+        try:
+            return int(stat.get(k, 0))
+        except (TypeError, ValueError):
+            return 0
+    return n("inactive_file") + max(0, n("active_file") - n("file_mapped"))
+
+
+def _refaults(stat):
+    """A memory.stat dict's count of file pages read back in after the kernel dropped them (workingset_refault_file;
+    workingset_refault on kernels before 5.9), or None."""
+    for k in ("workingset_refault_file", "workingset_refault"):
+        try:
+            return int(stat[k])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+OUTSIDE_QUIET_PCT = 1.0  # outside the jobs, a cgroup stalled this little (full avg10) is quiet: noise, not a shortage
+SHRINK_STALL_PCT = 1.0   # a job stalled more than this (its own full avg60) is not shrunk, nor told it is oversized
+
+
 def _parse_pressure(text):
     """A pressure file ("some avg10=0.00 avg60=0.00 avg300=0.00 total=0" and a "full" line) as
     {"some": {"avg10": "0.00", ...}, "full": {...}}."""
@@ -1512,7 +1547,7 @@ class Measure:
                  psi_root=None):
         self.proc, self.sys, self.cg = proc, sys_root, cgroup_root
         self.psi_root = psi_root or cgroup_root  # the tree whose memory.pressure files are read (tests give a fake)
-        self.last_events = {}
+        self.last_stall = {}  # {cgroup path: (memory.events max, pressure full total)} at the last sample
         self.gpu_file = gpu_file if gpu_file is not None else os.environ.get("JOB_TEST_GPUS")
         self.uid = os.getuid() if uid is None else uid
         self.nvml = None
@@ -1566,11 +1601,11 @@ class Measure:
         OSError when it cannot be read (FileNotFoundError when the cgroup or its pressure file is gone)."""
         return _parse_pressure(self._read(path, "memory.pressure"))
 
-    def limit_events(self, job_cg):
-        """The count of memory.events "max" of a job cgroup: how often its use reached its own memory.max and the
-        kernel reclaimed inside it. None when it cannot be read."""
+    def limit_events(self, cg):
+        """The count of memory.events "max" of a cgroup: how often its use (or, as the count is hierarchical, a
+        descendant's) reached its own memory.max and the kernel reclaimed inside it. None when it cannot be read."""
         try:
-            for line in self._read(job_cg, "memory.events").splitlines():
+            for line in self._read(cg, "memory.events").splitlines():
                 k, _, v = line.partition(" ")
                 if k == "max":
                     return int(v)
@@ -1578,41 +1613,84 @@ class Measure:
             pass
         return None
 
+    def effective_limit(self, cg, top):
+        """The lowest memory.max of a cgroup and its ancestors below top (absolute paths): the limit its use reclaims
+        against. None when none is set."""
+        top = top.rstrip("/")
+        lims, d = [], cg.rstrip("/")
+        while d.startswith(top + "/"):
+            v = _read_cg_int(d, "memory.max")
+            if v:
+                lims.append(v)
+            d = os.path.dirname(d)
+        return min(lims) if lims else None
+
+    def own_limit_stall(self, cg, top, seen):
+        """The stall of one cgroup (an absolute path) and whether it is stalled against its own limit, by the same
+        test for a job scope and for any other cgroup (docs/admission.md, "Memory pressure"). Since its last sample:
+        at its own limit when both its "full" stall time (memory.pressure total=) and its memory.events "max" count
+        grew; stalled at all only when the stall time grew. On first sight (a new cgroup, or a restarted loop): at its
+        limit when it has reached it before and memory.current is within 5% of its effective limit, and stalled as
+        its full avg10 says. seen collects this sample's counters. Returns {full10, full60, at_limit, figure}: the
+        figure it adds to the host's (0 when at its own limit, or when its stall time did not grow); raises OSError
+        when its pressure cannot be read."""
+        p = self.cgroup_pressure(cg)
+        full10, full60 = float(p["full"]["avg10"]), float(p["full"]["avg60"])
+        try:
+            total = int(p["full"]["total"])
+        except (KeyError, ValueError):
+            total = None
+        ev = self.limit_events(cg)
+        seen[cg] = (ev, total)
+        prev = self.last_stall.get(cg)
+        if prev is not None and total is not None and prev[1] is not None:
+            stalled = total > prev[1]
+            at_limit = stalled and ev is not None and prev[0] is not None and ev > prev[0]
+        else:
+            stalled = full10 > 0
+            cur, lim = _read_cg_int(cg, "memory.current"), self.effective_limit(cg, top)
+            at_limit = bool(ev) and bool(cur) and bool(lim) and cur >= 0.95 * lim
+        return {"full10": full10, "full60": full60, "at_limit": at_limit,
+                "figure": full10 if stalled and not at_limit else 0.0}
+
     def pressure(self, scopes):
-        """Memory pressure outside the job scopes, and each job's own stall (docs/admission.md, "Memory pressure").
+        """Memory pressure outside the cgroups stalled against their own limits, and each job's own stall
+        (docs/admission.md, "Memory pressure").
 
         scopes: {token: absolute path} of every agent-pueue job scope of this user. The cgroup tree under psi_root
-        is split into the job scopes and the cgroups that hold none of them (walking down only through user.slice and
-        the ancestors of job scopes: each other user's slice, system.slice and the other top-level cgroups, this
-        user's other units). The host's figure
-        is the highest full avg10 among those, and among the job scopes that are stalled but not at their own limit
-        (global reclaim reaches them too). A job at its own memory.max stalls inside its own scope; that is the job
-        being undersized, not host pressure. Where any of those cgroups' pressure cannot be read, or none can, the
-        system-wide figure is used instead (it counts a job's own stall, the safe side).
+        is split into the job scopes and the member cgroups that hold none of them (walking down only through
+        user.slice and the ancestors of job scopes: each other user's slice, system.slice and the other top-level
+        cgroups, each read as one, and this user's other units). Every one of them, job scope or not, is left out
+        when it is stalled against its own limit (own_limit_stall): that is it being undersized, not host pressure.
+        The cgroup figure is the highest of the rest; the host's figure is the lower of it and the system-wide full
+        avg10, so it is never more sensitive than the system-wide figure alone. Where any member's pressure cannot be
+        read, or none can, the system-wide figure is used alone (it counts a job's own stall, the safe side).
 
-        Returns {psi, system, source ("cgroups" or "system"), where, unreadable, jobs: {token: {full10, full60,
-        at_limit}}}."""
+        Returns {psi, system, source ("cgroups" when the cgroup figure is the lower, else "system"), where,
+        cgroups (the cgroup figure, None when not used), cg_where, outside (the highest figure among the members,
+        None when not used), unreadable, jobs: {token: {full10, full60, at_limit}}}."""
         system = self.memory_pressure()
-        out = {"psi": system, "system": system, "source": "system", "where": None, "unreadable": 0, "jobs": {}}
+        out = {"psi": system, "system": system, "source": "system", "where": None, "cgroups": None, "cg_where": None,
+               "outside": None, "unreadable": 0, "jobs": {}}
         root = self.psi_root.rstrip("/")
+        cgr = self.cg.rstrip("/")
         rel = {}
         for tok, path in scopes.items():
-            if path.startswith(self.cg.rstrip("/") + "/"):
-                rel[path[len(self.cg.rstrip("/")):]] = tok
+            if path.startswith(cgr + "/"):
+                rel[path[len(cgr):]] = tok
         above = {"/user.slice"}  # each user's slice on its own: "full" of all users together hides one who stalls
         for r in rel:
             parts = r.strip("/").split("/")
             for i in range(1, len(parts)):
                 above.add("/" + "/".join(parts[:i]))
-        members, unreadable, todo = [], 0, [""]
+        seen, members, unreadable, todo = {}, [], 0, [""]
         while todo:
             d = todo.pop()
             try:
                 names = sorted(e.name for e in os.scandir(root + d) if e.is_dir(follow_symlinks=False))
-            except FileNotFoundError:
-                continue
-            except OSError:
-                unreadable += 1
+            except OSError as e:
+                if not _gone(e):
+                    unreadable += 1
                 continue
             for n in names:
                 c = d + "/" + n
@@ -1622,36 +1700,30 @@ class Measure:
                     todo.append(c)
                     continue
                 try:
-                    members.append((float(self.cgroup_pressure(root + c)["full"]["avg10"]), c))
-                except FileNotFoundError:
-                    continue  # gone since it was listed, or a kernel without pressure files
-                except (OSError, KeyError, ValueError):
+                    members.append((self.own_limit_stall(root + c, root, seen)["figure"], c))
+                except OSError as e:
+                    if not _gone(e):  # gone since it was listed, or a kernel without pressure files
+                        unreadable += 1
+                except (KeyError, ValueError):
                     unreadable += 1
-        events_last, self.last_events = self.last_events, {}
-        best = max(members) if members else (0.0, None)
+        outside = max(members) if members else (0.0, None)
+        best = outside
         for c, tok in rel.items():
             job = scopes[tok] + "/job"
             base = job if os.path.isdir(job) else scopes[tok]
             try:
-                p = self.cgroup_pressure(base)
-                full10, full60 = float(p["full"]["avg10"]), float(p["full"]["avg60"])
+                j = self.own_limit_stall(base, cgr, seen)
             except (OSError, KeyError, ValueError):
                 continue  # ended, or not readable: its stall is unknown, and the cgroups outside still count
-            ev = self.limit_events(base)
-            if ev is not None:
-                self.last_events[tok] = ev
-            prev = events_last.get(tok)
-            if prev is not None:
-                at_limit = ev is not None and ev > prev  # it reached its limit again since the last sample
-            else:  # first sight (a new job, or a restarted loop): it has reached its limit and is at it now
-                cur, mx = _read_cg_int(base, "memory.current"), _read_cg_int(base, "memory.max")
-                at_limit = bool(ev) and bool(cur) and bool(mx) and cur >= 0.95 * mx
-            out["jobs"][tok] = {"full10": full10, "full60": full60, "at_limit": at_limit}
-            if not at_limit and full10 > best[0]:
-                best = (full10, c)
+            out["jobs"][tok] = {"full10": j["full10"], "full60": j["full60"], "at_limit": j["at_limit"]}
+            if j["figure"] > best[0]:
+                best = (j["figure"], c)
+        self.last_stall = seen
         out["unreadable"] = unreadable
         if members and not unreadable:
-            out.update(psi=best[0], source="cgroups", where=best[1])
+            out.update(cgroups=best[0], cg_where=best[1], outside=outside[0])
+            if best[0] <= system:
+                out.update(psi=best[0], source="cgroups", where=best[1])
         return out
 
     def disk_of(self, path):
@@ -1733,8 +1805,11 @@ class Measure:
         return out
 
     def job_use(self, now, scopes):
-        """{token: {ram, cache, limit, cpu, disk_mb_s, pids, populated}} for each scope: RAM size basis (bytes, file
-        cache excluded), its file cache now, its memory.max (None for none), CPU threads and disk MB/s (read plus written) since the last call, and the job's pids."""
+        """{token: {ram, cache, files, need, current, refault, limit, cpu, disk_mb_s, pids, populated}} for each
+        scope: RAM size basis (bytes, all file cache excluded), the file cache a lower limit drops (_droppable_cache),
+        all its file cache, what it can't give back (memory.current less that droppable cache), memory.current, its
+        file refault count (None when not reported), its memory.max (None for none), CPU threads and disk MB/s (read
+        plus written) since the last call, and the job's pids."""
         out, seen = {}, {}
         io_seen = {}
         for tok, scope in scopes.items():
@@ -1748,8 +1823,9 @@ class Measure:
                 pids = [int(x) for x in self._read(base, "cgroup.procs").split()]
             except (OSError, ValueError):
                 continue
-            cache = int(stat.get("active_file", 0)) + int(stat.get("inactive_file", 0))
-            ram = max(0, cur - cache)
+            files = int(stat.get("active_file", 0)) + int(stat.get("inactive_file", 0))
+            ram = max(0, cur - files)
+            cache = min(files, _droppable_cache(stat))
             last = self.last_jobs.get(tok)
             cpu = (usec - last[1]) / 1e6 / (now - last[0]) if last and now > last[0] else None
             seen[tok] = (now, usec)
@@ -1761,22 +1837,25 @@ class Measure:
                 io_seen[pid] = b
                 moved += max(0, b - self.last_io.get(pid, 0))  # a new pid started since the last call
             disk = moved / 1e6 / (now - last[0]) if last and now > last[0] else None
-            out[tok] = {"ram": ram, "cache": cache, "limit": _read_cg_int(base, "memory.max"), "cpu": cpu,
+            out[tok] = {"ram": ram, "cache": cache, "files": files, "need": max(0, cur - cache), "current": cur,
+                        "refault": _refaults(stat), "limit": _read_cg_int(base, "memory.max"), "cpu": cpu,
                         "disk_mb_s": disk, "pids": pids, "populated": bool(pids)}
         self.last_jobs = seen
         self.last_io = io_seen
         return out
 
     def cgroup_mem(self, path):
-        """(RAM on a job's basis, file cache) of a cgroup (a path under the cgroup root): memory.current less file
-        cache, and that cache; (None, 0) when it cannot be read."""
+        """(RAM on a job's basis, droppable file cache, memory.current, file refaults) of a cgroup (a path under the
+        cgroup root): memory.current less all file cache, the file cache a lower limit drops (_droppable_cache),
+        memory.current and the stat's file refault count (None when not reported); (None, 0, None, None) when it
+        cannot be read."""
         try:
             cur = int(self._read(self.cg + path, "memory.current"))
             stat = dict((ln.split() + ["0"])[:2] for ln in self._read(self.cg + path, "memory.stat").splitlines() if ln)
         except (OSError, ValueError):
-            return None, 0
-        cache = int(stat.get("active_file", 0)) + int(stat.get("inactive_file", 0))
-        return max(0, cur - cache), cache
+            return None, 0, None, None
+        files = int(stat.get("active_file", 0)) + int(stat.get("inactive_file", 0))
+        return max(0, cur - files), min(files, _droppable_cache(stat)), cur, _refaults(stat)
 
     def cgroup_ram(self, path):
         """RAM of a cgroup (a path under the cgroup root) on a job's basis: memory.current less file cache; None
@@ -1943,7 +2022,8 @@ def compute_room(settings, samples, inflight, holds, now):
     last = samples[-1]
     out = {"t": last["t"], "psi": last["psi"], "pressure_ok": last["psi"] <= settings["memory_pressure_max_pct"],
            "psi_source": last.get("psi_source") or "system", "psi_where": last.get("psi_where"),
-           "psi_system": last.get("psi_system", last["psi"]), "psi_unreadable": last.get("psi_unreadable") or 0}
+           "psi_system": last.get("psi_system", last["psi"]), "psi_unreadable": last.get("psi_unreadable") or 0,
+           "psi_cgroups": last.get("psi_cgroups"), "psi_cg_where": last.get("psi_cg_where")}
     use = {tok: j for tok, j in last["jobs"].items()}
 
     # RAM: what would be available with no admitted job, at its lowest over the window
@@ -2014,7 +2094,12 @@ def compute_room(settings, samples, inflight, holds, now):
 def _psi_where(room):
     """Where a room's memory pressure figure comes from, for messages."""
     if room.get("psi_source") == "cgroups":
-        return " (in %s, the highest outside jobs stalled against their own RAM limits)" % (room.get("psi_where") or "?")
+        if not room.get("psi_where"):
+            return " (no cgroup is stalled other than against its own RAM limit)"
+        return " (in %s, the highest of the cgroups not stalled against their own RAM limits)" % room["psi_where"]
+    if room.get("psi_cgroups") is not None:
+        return " (system-wide, lower than the highest of the cgroups not stalled against their own RAM limits, " \
+               "%.1f%% in %s)" % (room["psi_cgroups"], room.get("psi_cg_where") or "?")
     if room.get("psi_unreadable"):
         return " (system-wide: %d cgroup(s) could not be read, so jobs' own stalls are counted too)" % (
             room["psi_unreadable"])
@@ -2161,7 +2246,7 @@ HEARTBEAT_MIN_S = 120
 IN_FLIGHT = ("Queued", "Running", "Paused", "Locked")
 RECORD_FIELDS = ("token", "task", "session", "host", "pueue_id", "grp", "submitted", "released", "started", "ended",
                  "exit", "how", "size", "size_source", "like_from", "pilot", "constraints", "gpus", "peak_cpu",
-                 "peak_ram", "memory_peak", "peak_gpu_mem", "peaks_final", "peak_samples",
+                 "peak_ram", "memory_peak", "peak_gpu_mem", "peaks_final", "peak_samples", "peak_current",
                  "peak_disk_mb_s", "progress", "projected_end", "ram_counted", "gpu_counted", "memory_max", "resized")
 HOLD_FIELDS = ("id", "name", "card", "size", "start", "ended", "how", "ram")
 PROGRESS_KEEP = 200     # progress points kept per job
@@ -2789,30 +2874,54 @@ def host_submit_admitted(req, settings, command):
         os.close(fd)
 
 
-def _resize_floor(settings, peak, use, kernel_peak=0, cache=0):
-    """The lowest RAM limit a running job may be given: what it can't give back if its limit is lowered. That is
-    its anonymous, shared and kernel memory (the RAM size basis, file cache excluded), not file cache, which the
-    kernel drops at a lower limit: the largest of its sampled peak times resize_margin (the loop samples once a
-    cycle, so that is a lower bound), its use now, and the kernel's own peak of its cgroup (memory.peak, which
-    catches spikes between samples) less its file cache now. memory.peak counts file cache too: a job that streams
-    data fills its limit with cache, so memory.peak alone would say it needs its whole limit. Taking off the cache it
-    holds now leaves at least the non-cache part of that peak, or more where its cache was smaller at the peak (the
-    safe side). A limit under a real spike ends the job; one too high only keeps room idle."""
-    return max(use, peak * settings["resize_margin"], (kernel_peak or 0) - (cache or 0))
+PEAK_SEEN_FRACTION = 1.02  # memory.peak within this factor of the highest sampled memory.current was seen by sampling
 
 
-def _resize_suggestion(settings, peak, use, kernel_peak=0, cache=0, projected=0):
+def _resize_floor(settings, peak, use, kernel_peak=0, cache=0, sampled_current=0):
+    """The lowest RAM limit a running job may be given: what it can't give back if its limit is lowered, the largest
+    of its sampled RAM peak times resize_margin (the loop samples once a cycle, so that is a lower bound), its use
+    now less the file cache a lower limit drops (use: memory.current less _droppable_cache), and the kernel's own
+    peak of its cgroup (memory.peak, which catches spikes between samples).
+
+    memory.peak counts file cache too: a job that streams data fills its limit with cache, so memory.peak alone would
+    say it needs its whole limit. The cache is taken off it only when the peak was seen by sampling: memory.peak is
+    within PEAK_SEEN_FRACTION of the highest memory.current the loop sampled (sampled_current), so the sampled peak
+    (the first term) measured what was not cache at that peak. Otherwise the peak came between samples, of unknown
+    make-up (an anonymous spike, with the cache squeezed out then and refilled since, looks the same), and the whole
+    memory.peak is the floor. A limit under a real spike ends the job; one too high only keeps room idle."""
+    kernel_peak = kernel_peak or 0
+    if kernel_peak and kernel_peak <= PEAK_SEEN_FRACTION * (sampled_current or 0):
+        kernel_peak = max(0, kernel_peak - (cache or 0))
+    return max(use, peak * settings["resize_margin"], kernel_peak)
+
+
+def _resize_suggestion(settings, peak, use, kernel_peak=0, cache=0, projected=0, sampled_current=0):
     """The size to suggest for an oversized job, in bytes: what --like would give from its peak (peak times
     margins.ram; the RAM its progress trend projects at its end, if higher, stands in for the peak), at least the
     smallest size whose limit covers the resize floor, rounded up to 0.1 GB, and raised further if the size as
     written (--ram 4.1G) would parse to a limit a byte under the floor."""
-    floor = _resize_floor(settings, peak, use, kernel_peak, cache)
+    floor = _resize_floor(settings, peak, use, kernel_peak, cache, sampled_current)
     want = max(max(peak, projected or 0) * settings["margins"]["ram"], floor / settings["ram_hard_factor"],
                SCOPE_MIN_MEMORY)
     n = int(math.ceil(want / 1e8 - 1e-9)) * 10 ** 8
     while ram_limit(settings, _parse_size(_size_arg(n))) < floor:
         n += 10 ** 8
     return n
+
+
+def _shrink_blocked(full60, refault_grew):
+    """Why a job must not be shrunk (nor told it is oversized) now, or None: it is short of memory in its own cgroup
+    (its memory.pressure full avg60 over SHRINK_STALL_PCT), or file pages it dropped are being read back
+    (workingset_refault_file grew since the loop's last sample), so the file cache it holds is working set."""
+    if full60 is not None and full60 > SHRINK_STALL_PCT:
+        return ("it spent %.1f%% of the last minute stalled reclaiming memory in its own cgroup (memory.pressure full "
+                "avg60, over %g%%): it is short of memory now, and a lower limit would make that worse" % (
+                    full60, SHRINK_STALL_PCT))
+    if refault_grew:
+        return ("file pages it dropped are being read back in (workingset_refault_file grew since the loop's last "
+                "sample): the file cache it holds is part of what it works on, and a lower limit would make it read "
+                "them again and again")
+    return None
 
 
 def _size_arg(n):
@@ -2855,6 +2964,29 @@ def _set_assigned_limit(adm, token, limit):
         pass
 
 
+def _resize_target(adm, tid, req):
+    """(pueue task, token, queue entry) of the admitted job a resize names, held or running; JobError otherwise."""
+    host = socket.gethostname()
+    t = _pueue_status().get("tasks", {}).get(str(tid))
+    if t is None:
+        raise JobError("no task %d on %s" % (tid, host))
+    token = _env_token(t)
+    if req.get("token") and token != req["token"]:
+        raise JobError("task %d now belongs to a different job; not resized" % tid)
+    q = adm.read_queue(token) if token else None
+    if q is None or q.get("state") not in ("held", "released"):
+        raise JobError("task %d is not an admitted job held or running on %s" % (tid, host))
+    if q.get("pilot"):
+        raise JobError("task %d is a pilot, which is measuring the job, so it is not resized; when it ends, size "
+                       "the next run with --like %s" % (tid, token))
+    return t, token, q
+
+
+def _ended_record(con, token):
+    r = con.execute("SELECT ended FROM jobs WHERE token = ?", (token,)).fetchone()
+    return bool(r and r[0] is not None)
+
+
 def host_resize(req):
     """`job resize`: change a held job's size (it keeps its place), or shrink a running one (docs/admission.md).
     A refusal or a reported failure means nothing changed."""
@@ -2870,77 +3002,87 @@ def host_resize(req):
         cpus = float(_num(cpus, "--cpus", lo=0.01))
     tid, host = int(req["id"]), socket.gethostname()
     adm = Admission(settings)
-    # the host's capacity (for a held job's could-it-ever-fit check) before the lock, as a submit does: a GPU query
-    # can take up to two 30 s timeouts, and submits and the loop wait on the lock
-    capacity = _capacity(_measure_from_env())
-    fd = adm.lock("queue.lock")  # the loop ends a job under this lock too, so a resize never outlives its job
-    try:
-        t = _pueue_status().get("tasks", {}).get(str(tid))
-        if t is None:
-            raise JobError("no task %d on %s" % (tid, host))
-        token = _env_token(t)
-        if req.get("token") and token != req["token"]:
-            raise JobError("task %d now belongs to a different job; not resized" % tid)
-        q = adm.read_queue(token) if token else None
-        if q is None or q.get("state") not in ("held", "released"):
-            raise JobError("task %d is not an admitted job held or running on %s" % (tid, host))
-        if q.get("pilot"):
-            raise JobError("task %d is a pilot, which is measuring the job, so it is not resized; when it ends, size "
-                           "the next run with --like %s" % (tid, token))
-        old = dict(q["size"])
-        new = dict(old, **{k: v for k, v in (("ram", ram), ("cpus", cpus)) if v is not None})
+    # What is slow is done before the queue lock, which submits and the loop wait on: for a held job, the host's
+    # capacity (its could-it-ever-fit check; a GPU query can take up to two 30 s timeouts), read only then; for a
+    # running one, lowering its cgroup's memory.max, which can force a long reclaim. Its count is lowered only under
+    # the lock, after the limit, and the job is checked again there to be the same job in the same state.
+    t, token, q = _resize_target(adm, tid, req)
+    old = dict(q["size"])
+    new = dict(old, **{k: v for k, v in (("ram", ram), ("cpus", cpus)) if v is not None})
+    capacity = change = undo = None
+    if q["state"] == "held":
+        capacity = _capacity(_measure_from_env())
+    elif _task_status(t) in IN_FLIGHT:
         con = adm.db()
         try:
-            r = con.execute("SELECT ended FROM jobs WHERE token = ?", (token,)).fetchone()
-            if r and r[0] is not None:
+            if _ended_record(con, token):
                 raise JobError("task %d has ended; nothing to resize" % tid)
-            undo = used = None
-            if q["state"] == "held":
-                change, used = _resize_held(settings, con, q, new, capacity)
-            elif _task_status(t) in IN_FLIGHT:
-                change, undo = _resize_running(settings, con, q, old, new)
-            elif _task_status(t) == "Stashed":  # released this cycle and not yet enqueued, or about to be held again
-                raise JobError("task %d is being released by the admission loop now; try again after its next cycle "
-                               "(about %d s)" % (tid, settings["sample_interval_s"]))
-            else:
-                raise JobError("task %d has ended; nothing to resize" % tid)
-            resized = (q.get("resized") or []) + [{"t": time.time(), "state": q["state"], "from": {
-                "cpus": old["cpus"], "ram": old["ram"]}, "to": {"cpus": new["cpus"], "ram": new["ram"]}}]
-            before = dict({k: q.get(k) for k in change if k in RECORD_FIELDS}, token=token, size=old,
-                          resized=q.get("resized") or None)
-            # The RAM limit was lowered first (above); then the record, then the resize file, which is what the loop
-            # counts by. A step that fails undoes the ones before it, so a reported failure leaves nothing changed.
-            # Between the steps the job is counted at no less than its real limit: the loop counts a running job at
-            # the larger of its recorded limit and its cgroup's memory.max.
-            try:
-                adm.record(con, dict({k: v for k, v in change.items() if k in RECORD_FIELDS}, token=token, size=new,
-                                     resized=resized))
-                con.commit()
-                try:
-                    adm.write_json(adm.resize_path(token), dict(change, size=new, resized=resized))
-                except OSError:
-                    adm.record(con, before)
-                    con.commit()
-                    raise
-            except (OSError, sqlite3.Error) as e:
-                try:
-                    con.rollback()
-                except sqlite3.Error:
-                    pass
-                if undo:
-                    undo()
-                raise JobError("task %d was not resized: %s" % (tid, e))
+            change, undo = _resize_running(settings, con, q, old, new)
         finally:
             con.close()
-        if change.get("memory_max"):
-            _set_assigned_limit(adm, token, change["memory_max"])  # a restart of the job runs under the new limit
+    elif _task_status(t) == "Stashed":  # released this cycle and not yet enqueued, or about to be held again
+        raise JobError("task %d is being released by the admission loop now; try again after its next cycle "
+                       "(about %d s)" % (tid, settings["sample_interval_s"]))
+    else:
+        raise JobError("task %d has ended; nothing to resize" % tid)
+    done = False
+    try:
+        fd = adm.lock("queue.lock")  # the loop ends a job under this lock too, so a resize never outlives its job
         try:
-            os.utime(adm.path("queue"))  # the loop wakes on a change here, so a held job is looked at again now
-        except OSError:
-            pass
-        return dict(change, id=tid, token=token, state=q["state"], was=old, size=new, host=host, checked_against=used)
+            t2, token2, q2 = _resize_target(adm, tid, req)
+            same = (token2 == token and q2.get("state") == q["state"] and q2.get("size") == q["size"]
+                    and q2.get("memory_max") == q.get("memory_max")
+                    and (q["state"] == "held" or _task_status(t2) in IN_FLIGHT))
+            if not same:
+                raise JobError("task %d changed while it was being resized (released, ended or resized by another "
+                               "call); nothing changed, try again" % tid)
+            con = adm.db()
+            try:
+                if _ended_record(con, token):
+                    raise JobError("task %d has ended; nothing to resize" % tid)
+                used = None
+                if q["state"] == "held":
+                    change, used = _resize_held(settings, con, q, new, capacity)
+                resized = (q.get("resized") or []) + [{"t": time.time(), "state": q["state"], "from": {
+                    "cpus": old["cpus"], "ram": old["ram"]}, "to": {"cpus": new["cpus"], "ram": new["ram"]}}]
+                before = dict({k: q.get(k) for k in change if k in RECORD_FIELDS}, token=token, size=old,
+                              resized=q.get("resized") or None)
+                # The RAM limit was lowered first (above); then the record, then the resize file, which is what the
+                # loop counts by. A step that fails undoes the ones before it, so a reported failure leaves nothing
+                # changed. Between the steps the job is counted at no less than its real limit: the loop counts a
+                # running job at the larger of its recorded limit and its cgroup's memory.max.
+                try:
+                    adm.record(con, dict({k: v for k, v in change.items() if k in RECORD_FIELDS}, token=token,
+                                         size=new, resized=resized))
+                    con.commit()
+                    try:
+                        adm.write_json(adm.resize_path(token), dict(change, size=new, resized=resized))
+                    except OSError:
+                        adm.record(con, before)
+                        con.commit()
+                        raise
+                except (OSError, sqlite3.Error) as e:
+                    try:
+                        con.rollback()
+                    except sqlite3.Error:
+                        pass
+                    raise JobError("task %d was not resized: %s" % (tid, e))
+                done = True
+            finally:
+                con.close()
+            if change.get("memory_max"):
+                _set_assigned_limit(adm, token, change["memory_max"])  # a restart of the job runs under the new limit
+            try:
+                os.utime(adm.path("queue"))  # the loop wakes on a change here, so a held job is looked at again now
+            except OSError:
+                pass
+            return dict(change, id=tid, token=token, state=q["state"], was=old, size=new, host=host,
+                        checked_against=used)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        if undo and not done:
+            undo()
 
 
 def _resize_held(settings, con, q, new, capacity):
@@ -2975,8 +3117,8 @@ def _resize_running(settings, con, q, old, new):
     if new["ram"] > old["ram"] or new["cpus"] > old["cpus"]:
         raise JobError("a running job can only shrink (it has %g CPU threads and %s RAM); to grow it, kill it and "
                        "submit it again with the larger size" % (old["cpus"], _gbs(old["ram"])))
-    r = con.execute("SELECT peak_ram, peak_samples, peak_cpu FROM jobs WHERE token = ?",
-                    (q["token"],)).fetchone() or (0, 0, 0)
+    r = con.execute("SELECT peak_ram, peak_samples, peak_cpu, peak_current FROM jobs WHERE token = ?",
+                    (q["token"],)).fetchone() or (0, 0, 0, 0)
     if (r[1] or 0) < LIKE_MIN_SAMPLES:
         raise JobError("it has been measured %d times so far, too few to know its peak; resize it after the loop has "
                        "measured it %d times" % (r[1] or 0, LIKE_MIN_SAMPLES))
@@ -3003,19 +3145,36 @@ def _resize_running(settings, con, q, old, new):
         raise JobError("--ram %s gives a RAM limit of %s, above the limit it runs under now, %s (ram_hard_factor has "
                        "changed since it was released); a running job's limit is never raised, so give a --ram whose "
                        "limit is at most %s" % (_gbs(new["ram"]), _gbs(limit), _gbs(current), _gbs(current)))
-    use, cache = m.cgroup_mem(job_cg[len(m.cg):])
-    use = use or 0
+    ram_now, cache, current, refault = m.cgroup_mem(job_cg[len(m.cg):])
+    if ram_now is None:
+        raise JobError("its cgroup's memory could not be read; not resized")
+    use = max(0, current - cache)  # what it can't give back now: memory.current less the cache a lower limit drops
     kernel_peak = _read_cg_int(job_cg, "memory.peak") or 0
-    peak = max(r[0] or 0, use)
-    floor = _resize_floor(settings, peak, use, kernel_peak, cache)
+    sampled_current = max(r[3] or 0, current)
+    peak = max(r[0] or 0, ram_now)
+    floor = _resize_floor(settings, peak, use, kernel_peak, cache, sampled_current)
     if limit < floor:
-        smallest = _resize_suggestion(settings, peak, use, kernel_peak, cache)
+        smallest = _resize_suggestion(settings, peak, use, kernel_peak, cache, sampled_current=sampled_current)
+        seen = kernel_peak and kernel_peak <= PEAK_SEEN_FRACTION * sampled_current
         raise JobError("--ram %s gives a RAM limit of %s, under %s: the largest of its measured peak so far, %s, times "
-                       "resize_margin %g, its use now, %s, and the kernel's peak of its cgroup, %s, less the file cache "
-                       "it holds now, %s (memory.peak counts file cache, which a lower limit drops); the smallest size "
-                       "accepted is about --ram %s" % (
+                       "resize_margin %g, its use now less the file cache a lower limit drops, %s, and the kernel's "
+                       "peak of its cgroup, %s%s; the smallest size accepted is about --ram %s" % (
                            _gbs(new["ram"]), _gbs(limit), _gbs(floor), _gbs(peak), settings["resize_margin"],
-                           _gbs(use), _gbs(kernel_peak), _gbs(cache), _size_arg(smallest)))
+                           _gbs(use), _gbs(kernel_peak),
+                           " less the file cache it holds now, %s (memory.peak counts file cache, and this peak was "
+                           "seen by the loop's sampling)" % _gbs(cache) if seen else
+                           " whole (memory.peak came between the loop's samples, so what it was made of is unknown)",
+                           _size_arg(smallest)))
+    try:
+        full60 = float(m.cgroup_pressure(job_cg)["full"]["avg60"])
+    except (OSError, KeyError, ValueError):
+        full60 = None
+    if refault is not None and q.get("refault") is None:
+        raise JobError("its file refaults have not been sampled by the admission loop yet; try again after its next "
+                       "cycle (about %d s)" % settings["sample_interval_s"])
+    why = _shrink_blocked(full60, refault is not None and refault > q["refault"])
+    if why:
+        raise JobError("not shrunk now: %s; nothing changed" % why)
     _set_memory_max(job_cg, limit)
 
     def undo():
@@ -3139,7 +3298,8 @@ class Loop:
             j["psi"] = pr["jobs"].get(tok)
         s = {"t": now, "busy": busy, "iowait": iowait or 0.0, "avail": mem.get("MemAvailable", 0),
              "psi": pr["psi"], "psi_system": pr["system"], "psi_source": pr["source"], "psi_where": pr["where"],
-             "psi_unreadable": pr["unreadable"], "disks": self.m.disks(now, set(self.disk_names.values())),
+             "psi_unreadable": pr["unreadable"], "psi_cgroups": pr["cgroups"], "psi_cg_where": pr["cg_where"],
+             "psi_outside": pr["outside"], "disks": self.m.disks(now, set(self.disk_names.values())),
              "gpus": {c["uuid"]: dict({k: c[k] for k in ("index", "name", "total", "used", "util")},
                                      others=others.get(c["uuid"], 0)) for c in cards},
              "jobs": {tok: {"ram": j["ram"], "cpu": j["cpu"], "gpu": j.get("gpu", {})} for tok, j in jobs.items()},
@@ -3328,6 +3488,7 @@ class Loop:
                 p["cpu"] = max(p["cpu"], u["cpu"] or 0.0)
                 p["disk"] = max(p["disk"], u.get("disk_mb_s") or 0.0)
                 p["ram"] = max(p["ram"], u["ram"])
+                p["current"] = max(p.get("current") or 0, u.get("current") or 0)
                 p["gpu"] = max([p["gpu"]] + list(u.get("gpu", {}).values()))
                 stray = sorted(uu for uu, b in u.get("gpu", {}).items() if b and uu not in q.get("gpus", []))
                 if stray:
@@ -3364,6 +3525,7 @@ class Loop:
             if running:
                 self.track_progress(q, now, u)
                 self.keep_resized_limit(q)
+                self.track_memory(q, u)
                 self.check_oversize(q, now, status, p, u)
                 self.check_undersize(q, now, status, u)
                 self.record_peaks(con, q, final=False)
@@ -3393,6 +3555,17 @@ class Loop:
                            "end, over its RAM limit of %s, where it would be stopped" % (
                                _gbs(pts[-1][3]), pts[-1][1], pts[-1][2], _gbs(ram), _gbs(limit)))
 
+    def track_memory(self, q, u):
+        """Keep, in the job's queue file, its own stall (full avg60), its file refault count at this sample and
+        whether that grew since the last one: what job resize and the oversize ALERT check before a shrink
+        (_shrink_blocked)."""
+        if not u:
+            return
+        ref, last = u.get("refault"), q.get("refault")
+        q["refault_grew"] = ref is not None and last is not None and ref > last
+        q["refault"] = ref
+        q["stall60"] = (u.get("psi") or {}).get("full60")
+
     def check_oversize(self, q, now, status, p, u):
         """Note a running job whose RAM peak stays well under its size, and ALERT its owner once: it is counted at
         its hard limit, so room other jobs wait for is idle (docs/admission.md, "Resizing a job"). The peak, the
@@ -3410,10 +3583,13 @@ class Loop:
         need = max(p["ram"], projected)
         if need >= self.s["oversize_fraction"] * size:
             return
+        if _shrink_blocked(q.get("stall60"), q.get("refault_grew")):
+            return  # short of memory in its own cgroup, or its file cache is working set: not a size to give back
         path = self.scopes_now.get(q["token"])
         kernel_peak = (_read_cg_int(os.path.join(path, "job"), "memory.peak") or 0) if path else 0
-        use, cache = (u or {}).get("ram") or 0, (u or {}).get("cache") or 0
-        suggest = _resize_suggestion(self.s, p["ram"], use, kernel_peak, cache, projected)
+        use, cache = (u or {}).get("need") or 0, (u or {}).get("cache") or 0
+        current = max(p.get("current") or 0, (u or {}).get("current") or 0)
+        suggest = _resize_suggestion(self.s, p["ram"], use, kernel_peak, cache, projected, current)
         if suggest >= size:
             return  # its floor (a spike memory.peak caught, not file cache) leaves nothing to give back
         counted = self._counted(q, now)["ram_counted"]
@@ -3439,14 +3615,24 @@ class Loop:
         if status != "Running" or not psi or not psi.get("at_limit") or psi["full60"] < self.s["undersize_stall_pct"]:
             q["undersized"] = None
             return
+        last = self.samples[-1] if self.samples else {}
+        outside = last.get("psi_outside")
+        if (outside is None or outside >= OUTSIDE_QUIET_PCT
+                or (last.get("avail") or 0) <= self.s["ram_headroom_gb"] * GB):
+            # the host may be short of RAM (something outside the jobs stalls, its pressure could not all be read,
+            # or MemAvailable is under the headroom): global reclaim may be what stalls it, so the once-per-job
+            # ALERT is not spent on a doubtful case
+            q["undersized"] = None
+            return
         limit = u.get("limit") or q.get("memory_max") or 0
+        files = u.get("files", u.get("cache")) or 0
         q["undersized"] = {"stall": psi["full60"], "limit": limit, "ram": u.get("ram") or 0,
-                           "cache": u.get("cache") or 0, "since": (q.get("undersized") or {}).get("since") or now}
+                           "cache": files, "since": (q.get("undersized") or {}).get("since") or now}
         self.adm.alert(q, "undersized", "undersized: over the last minute it spent %.0f%% of its time stalled reclaiming "
                        "memory against its own RAM limit of %s (it uses %s, file cache %s more), so it runs slowly. "
                        "This is not host memory pressure and holds no other job. A running job's limit is never "
                        "raised: to give it more, kill it and submit it again with a larger --ram, or measure it with "
-                       "--pilot" % (psi["full60"], _gbs(limit), _gbs(u.get("ram") or 0), _gbs(u.get("cache") or 0)),
+                       "--pilot" % (psi["full60"], _gbs(limit), _gbs(u.get("ram") or 0), _gbs(files)),
                        extra={"undersized": {"stall": psi["full60"], "limit": limit}})
 
     def keep_resized_limit(self, q):
@@ -3459,26 +3645,25 @@ class Loop:
                 have = f.read().strip()
             if have == "max" or int(have) > q["memory_max"] + 65536:
                 _set_memory_max(os.path.join(path, "job"), q["memory_max"])
-        except FileNotFoundError:
-            return  # its scope ended since the cycle listed it: normal
         except (OSError, ValueError, JobError) as e:
-            if not os.path.isdir(os.path.join(path, "job")):
+            if (isinstance(e, OSError) and _gone(e)) or not os.path.isdir(os.path.join(path, "job")):
                 return  # ended while its limit was being set
             sys.stderr.write("job _admit: could not keep the resized RAM limit of %s: %s\n" % (q["token"], e))
 
     def _stored_peaks(self, con, token):
         """The peaks recorded so far (by this loop or one before a restart), so a restart never lowers them."""
-        r = con.execute("SELECT peak_cpu, peak_ram, peak_gpu_mem, peak_samples FROM jobs WHERE token = ?",
-                        (token,)).fetchone()
-        d = con.execute("SELECT peak_disk_mb_s FROM jobs WHERE token = ?", (token,)).fetchone()
-        r = r or (None, None, None, None)
-        return {"cpu": r[0] or 0.0, "ram": r[1] or 0, "gpu": r[2] or 0, "n": r[3] or 0, "disk": (d or [0])[0] or 0.0}
+        r = con.execute("SELECT peak_cpu, peak_ram, peak_gpu_mem, peak_samples, peak_disk_mb_s, peak_current FROM jobs "
+                        "WHERE token = ?", (token,)).fetchone()
+        r = r or (None,) * 6
+        return {"cpu": r[0] or 0.0, "ram": r[1] or 0, "gpu": r[2] or 0, "n": r[3] or 0, "disk": r[4] or 0.0,
+                "current": r[5] or 0}
 
     def record_peaks(self, con, q, final):
         p = self.peaks.get(q["token"]) or self._stored_peaks(con, q["token"])
         row = {"token": q["token"], "released": q.get("released"), "started": q.get("started"),
                "gpus": q.get("gpus", []), "peak_cpu": p["cpu"], "peak_ram": p["ram"],
                "peak_gpu_mem": p["gpu"], "peak_samples": p["n"], "peak_disk_mb_s": p["disk"],
+               "peak_current": p.get("current") or 0,
                "peaks_final": int(final), "progress": q.get("progress"), "projected_end": q.get("projected_end")}
         self.adm.record(con, row)
         # also written at release; a write lost there (or by a loop before records kept them) is filled in here, but
@@ -5106,6 +5291,7 @@ def _severity(o):
 
 REPORTED_DIR = os.path.join(STATE_DIR, "reported")  # one empty file per job token whose end a wait here reported
 UNTRACKED_DIR = os.path.join(STATE_DIR, "untracked")  # one per job token a wait here reported UNTRACKED
+DELIVERED_TIMEOUT_S = 5  # the best-effort "delivered" mark after a report never holds the wait's exit longer
 BAD_TOKEN_RX = re.compile(r"(^|: )bad token")  # a host's refusal of a token: fatal, not retried
 
 
@@ -5137,8 +5323,9 @@ def _mark_in(d, token, max_age):
 
 
 def _mark_reported(token):
-    # a mark matters only while job wait --mine looks at the job's end, MINE_RECENT_S
-    _mark_in(REPORTED_DIR, token, MINE_RECENT_S)
+    # kept as long as a host keeps a job's records: a host whose "delivered" mark was not set (unreachable after the
+    # report) still lists the job, and job wait --mine must not report it again
+    _mark_in(REPORTED_DIR, token, SCRIPT_KEEP_DAYS * 86400)
 
 
 def _reported(token):
@@ -5219,7 +5406,7 @@ def _finish(waiters, done, pending, urgent, out, notes=()):
             _mark_in(UNTRACKED_DIR, w.token, SCRIPT_KEEP_DAYS * 86400)  # the next wait follows its processes
     for h, toks in delivered.items():  # the host keeps them in pueue's list until then (session-group cleanup)
         try:
-            call(h, "delivered", {"tokens": toks}, timeout=30)
+            call(h, "delivered", {"tokens": toks}, timeout=DELIVERED_TIMEOUT_S)
         except Exception:
             pass  # a host whose job predates the op, or unreachable: it keeps the jobs longer, nothing is lost
     return code
@@ -5412,12 +5599,26 @@ def _ls_all(hosts):
     return results
 
 
-MINE_RECENT_S = 24 * 3600  # job wait --mine reports a job of the session that ended this recently, if not yet reported
+MINE_RECENT_S = 24 * 3600  # on a host that does not say which jobs were delivered: job wait --mine reports a job of
+# the session that ended this recently, if not yet reported
+
+
+def _unreported_end(s):
+    """Whether job wait --mine reports this finished job of the session: no wait on this machine reported it, and its
+    host says no wait marked it delivered, whatever its age (the host keeps it listed until one does). A host that does
+    not say (it predates the "delivered" mark) is asked about the last MINE_RECENT_S only."""
+    if _reported(s["token"]):
+        return False
+    if "delivered" in s:
+        return not s["delivered"]
+    rec = s.get("exit_record") if isinstance(s.get("exit_record"), dict) else {}
+    end = _parse_time(rec.get("end") or s.get("end"))
+    return bool(end) and (dt.datetime.now(end.tzinfo) - end).total_seconds() < MINE_RECENT_S
 
 
 def cmd_wait_mine(args):
-    """Wait on every unfinished job this session submitted, on every host, and report each of its jobs that ended in
-    the last MINE_RECENT_S without a wait on this machine reporting it."""
+    """Wait on every unfinished job this session submitted, on every host, and report each of its finished jobs that
+    no wait has reported (_unreported_end)."""
     me = _session()
     if me == "unknown":
         raise JobError("this shell has no session id (JOB_SESSION, or Claude Code's session variables), so --mine "
@@ -5438,10 +5639,7 @@ def cmd_wait_mine(args):
             if s["status"] != "Done" or _lost_running(s):  # a job pueue lost track of runs until its processes end
                 waiters.append(_waiter(args, s["id"], s["token"], host=h))
                 continue
-            rec = s.get("exit_record") if isinstance(s.get("exit_record"), dict) else {}
-            end = _parse_time(rec.get("end") or s.get("end"))
-            if end and (dt.datetime.now(end.tzinfo) - end).total_seconds() < MINE_RECENT_S and not _reported(
-                    s["token"]):
+            if _unreported_end(s):
                 waiters.append(_waiter(args, s["id"], s["token"], host=h))
                 ended += 1
     if not waiters:

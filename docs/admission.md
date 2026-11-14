@@ -333,31 +333,44 @@ measured use grows. Deployments that want limits on container work set them in t
 cache excluded). Per-process GPU values map to a job through `/proc/<pid>/cgroup`. The disk rate comes from
 `/proc/<pid>/io` summed over the scope's processes (a soft value: short-lived children are missed).
 
-**Per host:** busy threads from `/proc/stat` deltas; `MemAvailable`; memory pressure outside the jobs' own limits
-(below); per-disk busy time from `/proc/diskstats` deltas for the devices in `disks`.
+**Per host:** busy threads from `/proc/stat` deltas; `MemAvailable`; memory pressure leaving out the cgroups
+stalled against their own limits (below); per-disk busy time from `/proc/diskstats` deltas for the devices in `disks`.
 
 **Memory pressure.** The pressure check protects the host's other users when RAM is really short. The system-wide
-figure (`/proc/pressure/memory`) also counts a job stalled against its own `memory.max`: one job thrashing in its own
-limit can put it over the limit on a host with plenty of RAM available, and holding every other job does not help
-it. So the figure the check uses is the highest `full avg10` (from each cgroup's `memory.pressure`) among:
+figure (`/proc/pressure/memory`) also counts a cgroup stalled against its own `memory.max`: one job thrashing in its
+own limit can put it over the limit on a host with plenty of RAM available, and holding every other job does not help
+it. The cgroups read are:
 
-- the cgroups that hold no job scope: each top-level cgroup (`system.slice`, `init.scope`, ...), each user's slice
-  under `user.slice` on its own (all users together would hide one who stalls), and, inside this user's slice,
-  every unit beside the job scopes (pueued, the loop, sessions);
-- the job scopes (every `agent-pueue-*` scope of this user, admitted or not) that are stalled but not at their own
-  limit: their `job/` cgroup's `memory.events` `max` count has not grown since the last sample (on first sight: it
-  has never reached its limit, or `memory.current` is under 95% of `memory.max`). A host short of RAM stalls them
-  in global reclaim, and that is host pressure.
+- the members, the cgroups that hold no job scope: each top-level cgroup (`system.slice`, `init.scope`, a
+  top-level slice such as one for students, ...), each read as one cgroup with everything under it, each user's
+  slice under `user.slice` on its own (all users together would hide one who stalls), and, inside this user's
+  slice, every unit beside the job scopes (pueued, the loop, sessions);
+- the job scopes (every `agent-pueue-*` scope of this user, admitted or not), each read at its `job/` cgroup.
 
-Real host-wide shortage stalls whatever allocates outside the jobs, so it still holds jobs; a job's own thrashing
-does not. Where any of those cgroups' pressure file cannot be read (other than one that has just gone), or none
-can, the system-wide figure is used, which counts every job's own stall (the safe side); `job room` and the held
-reason say which source holds, and in which cgroup the figure is highest. The ram room check is unchanged.
+Each of them, job or member, is tested the same way. It is stalled against its own limit when, over the sample
+interval, both its `full` stall time (`memory.pressure` `total=`) and its `memory.events` `max` count grew; that count
+is hierarchical, so a slice counts as at its limit when a cgroup under it (a worker with its own limit) reached its
+own. On first sight (a new cgroup, a restarted loop): when it has reached a limit before and its `memory.current` is
+within 5% of its effective limit (the lowest `memory.max` of it and its ancestors). Such a cgroup is left out: that
+is it being undersized, not host pressure. Of the rest, a cgroup whose stall time did not grow over the interval
+adds nothing (its `avg10` is only decaying from a stall that ended, as after a thrashing burst), and one whose stall
+time grew adds its `full avg10`. The cgroup figure is the highest of these, and the figure the check uses is the
+lower of it and the system-wide `full avg10`, so it is never more sensitive than the system-wide figure alone: a job
+thrashing alone raises the system-wide figure while the cgroup figure stays low, and in a real shortage both are high.
+
+Real host-wide shortage stalls whatever allocates, without reaching its own limit, so it still holds jobs; a job's
+own thrashing does not. A member whose pressure file cannot be read (other than one that has just gone, `ENOENT`, or
+`ENODEV` when it went between the open and the read), or no member at all, means the system-wide figure is used
+alone, which counts every job's own stall (the safe side); `job room` and the held reason say which source holds,
+and in which cgroup the cgroup figure is highest. The ram room check is unchanged.
 
 A job stalled against its own limit for over `undersize_stall_pct` of the last minute (its `job/` cgroup's
 `full avg60`, while it is at its limit) is undersized: its owner gets one ALERT saying so (its stall, limit, use
-and file cache), and `job room` shows it under the job while it lasts. A running job's limit is never raised; the
-owner kills it and submits it again with a larger size, or measures it with `--pilot`.
+and file cache), and `job room` shows it under the job while it lasts. The ALERT is made only when nothing outside
+the jobs stalls (every member's figure under 1%, all of them read) and `MemAvailable` is above `ram_headroom_gb`:
+otherwise global reclaim may be what stalls it, and the once-per-job ALERT is not spent on a doubtful case. A running
+job's limit is never raised; the owner kills it and submits it again with a larger size, or measures it with
+`--pilot`.
 
 ### Room
 
@@ -435,14 +448,14 @@ let its owner give that room back:
   up again if that size as written would parse to a limit under the floor). Its need is its sampled RAM peak, or,
   when its progress lines (`$JOB_PROGRESS`) show RAM still growing, the RAM that trend reaches at its `total` if
   higher: a job on course to need its size is not oversized, and the suggestion covers where it is going (the alert
-  says so). The alert, the suggestion and the resize floor use one measure, what the job can't give back (file
-  cache excluded, below), so the suggested size is one `job resize` accepts when the alert is made. No alert is made
+  says so). The alert, the suggestion and the resize floor use one measure, what the job can't give back (the resize
+  floor, below), so the suggested size is one `job resize` accepts when the alert is made. No alert is made
   when no size would be accepted: the floor leaves nothing to give back, or `ram_hard_factor` was raised after its
   release so that the smallest size covering its floor gives a limit over the one it runs under.
   A new client prints the exact `job resize` command; `job room` shows the same under the job while it holds.
 - **`job resize HOST ID [--token T] [--ram SIZE] [--cpus N]`** (at least one of `--ram` and `--cpus`), a host
-  operation (`resize`). The host's capacity (a GPU query) is read before the queue lock, as for a submit; the rest
-  runs under the lock:
+  operation (`resize`). For a held job the host's capacity (a GPU query) is read before the queue lock, as for a
+  submit, and only then: a running job's shrink needs no capacity. The rest runs under the lock:
   - A **held** job takes the new size and keeps its submit time, so its place in the queue does not change. It is
     refused a RAM size below the highest RAM peak recorded for an earlier finished run of the same task id on that
     host, from the same session's runs when it has any, else any session's (the reply names that run and its
@@ -456,17 +469,29 @@ let its owner give that room back:
       the host's settings now. It is refused when that is above the limit it runs under now (the lower of its
       recorded limit and its cgroup's `memory.max`; `ram_hard_factor` may have grown since its release), and when
       it is under the resize floor, what the job can't give back if its limit is lowered: the largest of its
-      sampled RAM peak times `resize_margin`, its RAM use now (both on the RAM size basis, file cache excluded),
-      and the kernel's peak of its `job/` cgroup (`memory.peak`, which catches spikes between samples) less the
-      file cache it holds now. `memory.peak` counts file cache, and a job that streams data fills its limit with
-      cache, which the kernel drops at a lower limit; taken whole it would say such a job needs its whole limit
-      (a 64 GB job using 26.5 GB with `memory.peak` at its 80 GB limit could never shrink). Less the cache it holds
-      now, it still covers a spike in the job's own memory: the cache now is at most what it held at the peak
-      unless the cache was squeezed by that spike, and then the subtraction leaves more, the safe side, except
-      in one case it can't see: cache squeezed at the peak by a spike between samples and refilled since. A limit
+      sampled RAM peak times `resize_margin` (on the RAM size basis), its use now less the file cache a lower
+      limit drops, and the kernel's peak of its `job/` cgroup (`memory.peak`, which catches spikes between
+      samples). The file cache a lower limit drops is `inactive_file` plus the part of `active_file` that is not
+      memory-mapped (`file_mapped`): hot mapped pages, such as code and data a program reads through `mmap`, are
+      its working set, and dropping them only makes it fault them back. `memory.peak` counts file cache, and a job
+      that streams data fills its limit with cache, which the kernel drops at a lower limit; taken whole it would
+      say such a job needs its whole limit (a 64 GB job using 26.5 GB with `memory.peak` at its 80 GB limit could
+      never shrink). So that cache is taken off `memory.peak` when the peak was seen by sampling: `memory.peak` is
+      within 2% of the highest `memory.current` (cache included) the loop sampled for the job, so the sampled RAM
+      peak measured what was not cache at that peak. Otherwise the peak came between samples and its make-up is
+      unknown (an anonymous spike that squeezed the cache out, with the cache refilled since, looks the same), and
+      the whole `memory.peak` is the floor. Nothing about the cache at the peak is assumed. A limit
       under a real spike ends the job; one too high only keeps room idle. A `--cpus`-only resize keeps the limit it runs under.
+    - It is also refused, saying which, while the job is short of memory in its own cgroup (its `memory.pressure`
+      `full avg60` over 1%) or reads dropped file pages back in (its `memory.stat` `workingset_refault_file` grew
+      since the loop's last sample, which the loop keeps in its queue file; before the loop has sampled it once,
+      the resize is refused with "try again"): a lower limit would make either worse. No oversize ALERT is made
+      in those cases either.
     - `--cpus` may not go under its measured CPU peak.
-    - Order: its scope's `job/memory.max` is lowered and read back first, then the record, then the resize file
+    - Order: its scope's `job/memory.max` is lowered and read back first, before the queue lock (lowering it can
+      force a long reclaim, and submits and the loop wait on that lock); then, under the lock, the job is checked
+      again to be the same running job at the same size and limit (if not, its limit is put back and the resize
+      is refused with "try again"), then the record, then the resize file
       the loop counts by; a step that fails puts back the ones before it, so a reported failure leaves nothing
       changed. The loop counts a running job at the larger of its recorded limit and its cgroup's `memory.max`,
       so between the steps it is never counted below its real limit. A restart of the job reads the new limit

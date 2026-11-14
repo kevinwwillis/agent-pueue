@@ -8,6 +8,7 @@ afterwards. No callback is configured.
 Run: python3 -m unittest discover -s tests -v
 """
 
+import datetime as dt
 import json
 import os
 import shutil
@@ -1538,10 +1539,43 @@ class DeliveryTests(Base):
         os.makedirs(job.REPORTED_DIR, exist_ok=True)
         old = os.path.join(job.REPORTED_DIR, "c" * 32)
         open(old, "w").close()
-        os.utime(old, (time.time() - job.MINE_RECENT_S - 60,) * 2)
+        os.utime(old, (time.time() - job.SCRIPT_KEEP_DAYS * 86400 - 60,) * 2)
         job._mark_reported("d" * 32)
         self.assertFalse(os.path.exists(old))
         self.assertTrue(job._reported("d" * 32))
+
+    def test_the_delivered_mark_never_holds_the_wait_long(self):
+        job = self.load_job_here()
+        job.HOSTS["far"] = "far.invalid"
+        seen = []
+        job.call = lambda host, op, req, timeout=120: seen.append((host, op, timeout))
+
+        class W:
+            host, tid, token = "far", 5, "a" * 32
+        o = {"verdict": "SUCCESS", "code": 0, "s": {"id": 5, "status": "Done", "result": "Success"}, "note": None}
+        import io
+        job._finish([W()], [(W(), o)], [], None, io.StringIO())
+        self.assertEqual([x[:2] for x in seen], [("far", "delivered")])
+        self.assertLessEqual(seen[0][2], 5)  # best effort: a hung host holds the agent's wake-up at most this long
+
+    def test_wait_mine_reports_every_undelivered_end_the_host_keeps(self):
+        import contextlib
+        import io
+        job = self.load_job_here(JOB_SESSION="s-kept")
+        days_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
+        tasks = [{"id": 1, "status": "Done", "result": "Success", "token": "1" * 32, "session": "s-kept",
+                  "end": days_ago, "delivered": False},   # kept by its host until a wait reports it
+                 {"id": 2, "status": "Done", "result": "Success", "token": "2" * 32, "session": "s-kept",
+                  "end": days_ago, "delivered": True},    # reported by a wait elsewhere
+                 {"id": 3, "status": "Done", "result": "Success", "token": "3" * 32, "session": "s-kept",
+                  "end": days_ago}]                       # a host that predates the mark: the last day only
+        job._ls_hosts = lambda hosts=None: ["local"]
+        job._ls_all = lambda hosts: {"local": {"tasks": tasks}}
+        got = []
+        job.wait_all = lambda host, waiters, poll=None, out=None, notes=(): got.extend(w.tid for w in waiters) or 0
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            job.cmd_wait_mine(job.parse_args(["wait", "--mine"])[1])
+        self.assertEqual(got, [1])
 
     def test_a_bad_token_is_refused_at_once(self):
         p = self.job("wait", "local", "5", "--token", "not-a-token", "--poll", "0.3")
