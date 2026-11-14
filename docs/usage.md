@@ -264,7 +264,19 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   `--needs-path`) is skipped; an unreachable host stops the placement, since the job may have been queued
   there. `--host NAME` (repeatable) limits the choice.
 - A held job's wait prints why every 10 minutes (`held: needs 22.5 GB RAM (its limit, 1.5 times its size), 9.4 GB
-  free`); being held is not a verdict. A job needs room for its hard RAM limit, not just its size. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
+  free; ...`); being held is not a verdict. A job needs room for its hard RAM limit, not just its size. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
+  Don't shrink a held job's size below what it needs to get it started: it then ends in exit 137 at its limit. Size
+  it from a measured run (`--pilot`, then `--like`).
+- `job resize HOST ID [--token T] --ram SIZE [--cpus N]` changes an admitted job's size. A held job may take any
+  size the host could run, keeps its place in the queue, and is refused a RAM size below the highest RAM peak of an
+  earlier finished run of the same task id there. A running job may only shrink: its RAM limit is lowered at once
+  and it is counted at the new limit from the loop's next cycle, so held jobs can use the room freed. The new limit
+  must cover its measured peak times the host's `resize_margin` (default 1.25) and its use now. A pilot is not
+  resized. `job history` shows the size a job ended with, and the size it was resized from.
+- A running job that has used under half of its RAM size for its first 30 minutes (`oversize_fraction`,
+  `oversize_after_min`) gets one `ALERT` saying what it peaked at, its size, what it is counted at, and the exact
+  `job resize` command that shrinks it to the size `--like` would give. `job room` shows the same while it holds.
+  The job keeps running; reattach with `job wait`.
 - The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
   for a pilot its free RAM at release), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
   `note: it went over its RAM limit of N GB; the whole job was stopped`. Processes it leaves running when its

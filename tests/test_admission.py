@@ -646,6 +646,71 @@ class RecordsFile(unittest.TestCase):
                 shutil.rmtree(d)
 
 
+class ResizeRules(unittest.TestCase):
+    """TASK-007.01: the oversize ALERT's suggestion, the resize floor and how a resize shows (no daemon)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.j = load()
+        cls.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        cls.s = settings(cls.j, cls.tmp, ram_hard_factor=1.25)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.tmp.startswith("/tmp/jobt."):
+            shutil.rmtree(cls.tmp)
+
+    def test_new_settings_have_defaults_and_are_checked(self):
+        self.assertEqual((self.s["oversize_after_min"], self.s["oversize_fraction"], self.s["resize_margin"]),
+                         (30, 0.5, 1.25))
+        for bad in ({"oversize_fraction": 0}, {"oversize_fraction": 1.5}, {"resize_margin": 0.9},
+                    {"oversize_after_min": 0.5}):
+            with self.assertRaises(self.j.JobError):
+                settings(self.j, self.tmp, **bad)
+
+    def test_the_suggestion_is_the_like_size_and_covers_the_floor(self):
+        # the audit's job: 64 GB asked, 26.5 GB used; --like would give 26.5 x 1.25 = 33.1 GB
+        got = self.j._resize_suggestion(self.s, 26.5 * GB, 20 * GB)
+        self.assertEqual(self.j._size_arg(got), "33.2G")
+        self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._parse_size("33.2G")),
+                                self.j._resize_floor(self.s, 26.5 * GB, 20 * GB))
+        # a job using more now than its peak times the margin is never offered a limit below its use
+        self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._resize_suggestion(self.s, 10 * GB, 40 * GB)), 40 * GB)
+
+    def test_the_held_reason_for_ram_warns_about_exit_137(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=5 * GB)], [], [], 100)
+        ok, why = self.j.fits(self.s, r, held(ram=8 * GB))
+        self.assertFalse(ok)
+        self.assertIn("ends in exit 137", why)
+        self.assertIn("--pilot, then --like", why)
+
+    def test_history_shows_the_size_it_ended_with_and_that_it_was_resized(self):
+        j = {"pilot": 0, "size": {"cpus": 4, "ram": 32 * GB, "gpus": 0, "gpu_mem": 0},
+             "resized": [{"t": 1.0, "state": "released", "from": {"cpus": 8, "ram": 64 * GB},
+                          "to": {"cpus": 4, "ram": 32 * GB}}]}
+        self.assertEqual(self.j._history_size(j), "4 CPU, 32.0 GB, resized from 8 CPU, 64.0 GB")
+
+    def test_an_oversize_alert_gives_the_exact_command(self):
+        w = self.j.Waiter("h1", 14, token="f" * 32)
+        w.alert_cursor = 0
+        alert = {"kind": "oversize", "message": "oversized: ...", "resize": {"ram": "33.2G"}}
+        self.j.call = lambda host, op, req, timeout=120: {"found": True, "status": "Running", "token": "f" * 32,
+                                                          "alert_count": 1, "alerts": [alert], "log_size": 0}
+        o = w.step()
+        self.assertEqual(o["verdict"], "ALERT")
+        self.assertIn("job resize h1 14 --token %s --ram 33.2G" % ("f" * 32), o["note"])
+
+    def test_resize_on_a_host_that_predates_it(self):
+        import argparse
+
+        def old_host(host, op, req, timeout=120):
+            raise self.j.JobError("h1: no reply from job on the host (exit 2): usage: job ... invalid choice")
+        self.j.call = old_host
+        with self.assertRaises(self.j.JobError) as e:
+            self.j.cmd_resize(argparse.Namespace(host="h1", id=3, token=None, ram=GB, cpus=None))
+        self.assertIn("predates job resize", str(e.exception))
+
+
 class FakeHost:
     """A fake /proc (stat, meminfo, pressure, diskstats) and GPU list that a test can change between cycles."""
 
@@ -1942,6 +2007,117 @@ class LoopTests(Base):
             if svc.poll() is None:
                 svc.kill()
             subprocess.run(["systemctl", "--user", "reset-failed", unit], env=env, capture_output=True)
+
+    # -- TASK-007.01: oversized jobs and job resize ------------------------------------------------------------
+
+    def queue_file(self, tok):
+        with open(os.path.join(self.state, "queue", tok + ".json")) as f:
+            return json.load(f)
+
+    def test_an_oversized_running_job_alerts_and_shrinks(self):
+        self.write_settings(oversize_after_min=1)
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized("python3 -c 'b = bytearray(60 * 1024 * 1024); import time; time.sleep(300)'",
+                              cpus=2, ram=400 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        try:
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+            self.assertTrue(self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= 60 * MiB
+                                        and loop.peaks[tok]["n"] >= 3, n=40))
+            w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(tid), "--token", tok, "--poll", "0.3"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                 env=self.d.env(**self.env()))
+            time.sleep(1.5)
+            now[0] += 61  # past oversize_after_min
+            self.host.tick()
+            loop.cycle()
+            out, err = w.communicate(timeout=60)
+            self.assertEqual(w.returncode, 201, out + err)
+            self.assertIn("oversized", out)
+            m = __import__("re").search(r"exact command: job resize local %d --token %s --ram (\S+)\)" % (tid, tok), out)
+            self.assertTrue(m, out)
+            suggest = m.group(1)
+            room = self.job("room", "local", **self.env()).stdout
+            self.assertIn("oversized: its RAM peaked at", room)
+            self.assertIn("job resize local %d --token %s --ram %s" % (tid, tok, suggest), room)
+            # refused: growing, and a limit under the measured peak times resize_margin
+            p = self.job("resize", "local", str(tid), "--ram", "500Mi", **self.env())
+            self.assertEqual(p.returncode, 205, p.stdout)
+            self.assertIn("can only shrink", p.stdout)
+            p = self.job("resize", "local", str(tid), "--ram", "40Mi", **self.env())
+            self.assertIn("the smallest size accepted", p.stdout)
+            p = self.job("resize", "local", str(tid), "--token", "0" * 32, "--ram", suggest, **self.env())
+            self.assertIn("belongs to a different job", p.stdout)
+            # the suggested size is accepted: the limit is lowered at once, the count from the next cycle
+            p = self.job("resize", "local", str(tid), "--token", tok, "--ram", suggest, "--cpus", "1", **self.env())
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            new = self.j._parse_size(suggest)
+            limit = self.j.ram_limit(self.settings, new)
+            with open(os.path.join(loop.m.scopes()[tok], "job", "memory.max")) as f:
+                self.assertEqual(int(f.read()), limit)
+            self.host.tick()
+            loop.cycle()
+            with open(os.path.join(self.state, "room.json")) as f:
+                j = [x for x in json.load(f)["jobs"] if x["token"] == tok][0]
+            self.assertEqual(j["ram_counted"], limit)
+            self.assertEqual(j["size"]["ram"], new)
+            self.assertEqual(j["size"]["cpus"], 1)
+            self.assertEqual(self.queue_file(tok)["memory_max"], limit)  # the loop keeps it in the queue file too
+        finally:
+            self.job("kill", "local", str(tid))
+        self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+        rec = self.record(tok)
+        self.assertEqual(rec["memory_max"], limit)
+        self.assertEqual(json.loads(rec["size"])["ram"], new)
+        h = self.job("history", "local", "--token", tok, **self.env()).stdout
+        self.assertIn("resized from 2 CPU, 0.4 GB", h)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "resize", tok + ".json")))
+
+    def test_a_held_job_is_resized_in_place(self):
+        self.host.set(avail=3 * GB)
+        loop = self.loop()
+        r = self.submit_sized("echo resized-held", cpus=1, ram=4 * GB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        submitted = self.queue_file(tok)["submitted"]
+        con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"))
+        con.execute("INSERT INTO jobs (token, task, pueue_id, ended, peak_ram, peak_samples) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("e" * 32, "T-adm", 99, time.time() - 600, 1.5 * GB, 50))
+        con.commit()
+        con.close()
+        try:
+            p = self.job("resize", "local", str(tid), "--ram", "1G", **self.env())
+            self.assertEqual(p.returncode, 205, p.stdout)
+            self.assertIn("below the RAM peak of 1.5 GB of an earlier run of T-adm here (#99, token %s" % ("e" * 32),
+                          p.stdout)
+            p = self.job("resize", "local", str(tid), "--ram", "100G", **self.env())
+            self.assertIn("even when it is empty", p.stdout)
+            p = self.job("resize", "local", str(tid), "--ram", "1.6G", **self.env())
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("keeps its place", p.stdout)
+            self.host.set(avail=4 * GB)  # 3 GB room: the old size (6 GB limit) would not fit, the new (2.4 GB) does
+            loop.samples = []
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
+            self.assertEqual(self.wait(tid, tok).returncode, 0)
+            self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+            rec = self.record(tok)
+            self.assertEqual(rec["submitted"], submitted)  # its place in the queue did not change
+            self.assertEqual(rec["memory_max"], self.j.ram_limit(self.settings, int(1.6 * GB)))
+            self.assertEqual(json.loads(rec["resized"])[0]["from"]["ram"], 4 * GB)
+        finally:
+            if self.status(tid) != "Done":
+                self.d.pueue("remove", str(tid))
+
+    def test_a_pilot_is_not_resized(self):
+        self.host.set(avail=3 * GB)
+        r = self.submit_sized("true", pilot=True)
+        self.assertTrue(r["ok"], r)
+        try:
+            p = self.job("resize", "local", str(r["data"]["id"]), "--ram", "1G", **self.env())
+            self.assertEqual(p.returncode, 205, p.stdout)
+            self.assertIn("is a pilot", p.stdout)
+        finally:
+            self.d.pueue("remove", str(r["data"]["id"]))
 
     def test_admission_status(self):
         p = self.job("admission", "local", "status", **self.env())

@@ -112,6 +112,9 @@ standard-library Python 3.8. An example for a 32-thread host with 256 GB RAM (il
   "sample_interval_s": 15,
   "pilot_sample_interval_s": 1,
   "fairness_wait_min": 30,
+  "oversize_after_min": 30,
+  "oversize_fraction": 0.5,
+  "resize_margin": 1.25,
   "small": {"cpus": 1, "ram_gb": 4},
   "pilot": {"max_minutes": 30, "gpu_min_gb": 2},
   "margins": {"cpu": 1.2, "ram": 1.25, "gpu_mem": 1.15},
@@ -356,6 +359,34 @@ RAM, CPU or disk. A held job does not block others when it is held for a reason 
 full or paused), or when it would be short even with every admitted job on the host ended, because outside use
 and holds alone leave too little.
 
+### Resizing a job
+
+Running jobs stay counted at their hard limit, so a job sized far above its use keeps room from others. Two tools
+let its owner give that room back:
+
+- **Oversize ALERT.** When an admitted job that is not a pilot (and does not run its work in containers) has run for
+  `oversize_after_min` and was measured at least 3 times, and its RAM peak so far is under `oversize_fraction` of
+  its size, its owner gets one ALERT: what it peaked at, its size, what it is counted at, and a size to shrink to
+  (what `--like` would give: the peak times `margins.ram`, at least the resize floor below, rounded up to 0.1 GB).
+  A new client prints the exact `job resize` command; `job room` shows the same under the job while it holds.
+- **`job resize HOST ID [--token T] --ram SIZE [--cpus N]`**, a host operation (`resize`) under the queue lock:
+  - A **held** job takes the new size and keeps its submit time, so its place in the queue does not change. It is
+    refused a RAM size below the highest RAM peak recorded for an earlier finished run of the same task id on that
+    host (the reply names that run), and a size that could never fit the host (the submit check).
+  - A **running** job (released, its task in flight) may only shrink. Its new hard limit must be at least its
+    measured peak times `resize_margin` and at least its RAM use now, and it must have been measured at least 3
+    times. Its scope's `job/memory.max` is lowered and read back first, then its count: a failure in between
+    counts it too high, never too low. Its assignment file gets the new limit too, for a scope still starting, and
+    each cycle the loop lowers a resized job's `memory.max` again if a starting scope set the old one. It is
+    counted at the new limit from the next cycle.
+  - A pilot is refused (it is measuring).
+  - `resize_margin` defaults to 1.25: the peak is sampled every `sample_interval_s`, so it is a lower bound, and
+    1.25 is the margin `--like` already puts on a measured peak.
+  - The change goes to `state_dir/resize/<token>.json`, not to the queue file, which the loop rewrites from the copy
+    it read at the start of its cycle; every reader of the queue applies it, and the loop applies it again under
+    the lock before it releases. The record gets the new size, limit and count, and `resized` (each change: when,
+    held or running, from and to).
+
 ### Records
 
 `state_dir/admission.sqlite` (standard-library `sqlite3`). A submit writes a job's first row before it adds
@@ -368,8 +399,9 @@ commits before it takes the lock.
   (CPU, RAM basis, `memory.peak`, GPU memory, peak disk rate) and how many samples they come from, and the
   earlier job a `--like` size came from, the progress series (time, done, total, RAM; last 200 lines), the
   projected end, and what the loop counted the job at when it released it (RAM, GPU memory per card) with its
-  hard RAM limit (cleared if the job is held again). For a pilot, the RAM and GPU memory in the size are
-  placeholders; what it was counted at, and limited to, is the free room at its release.
+  hard RAM limit (cleared if the job is held again), and each `job resize` of it (`resized`; `size` is the size it
+  ended with). For a pilot, the RAM and GPU memory in the size are placeholders; what it was counted at, and
+  limited to, is the free room at its release.
 - `samples`: per-resource values, kept 7 days; `recent`: the loop's last samples in full.
 - `holds`: id, name, card, size, start, end, and how it ended.
 
@@ -383,7 +415,8 @@ The loop appends to `state_dir/alerts/<token>.jsonl`. `host_probe` returns alert
 new wait starts its cursor at the current end, so reattaching doesn't replay old alerts. ALERT is for things the
 owner must act on: the job's group is paused; the loop's heartbeat is stale; a GPU job uses more GPU memory than
 its size and no cap holds it there (no new job goes on that card until it is back under); the job's RAM trend
-reaches its hard limit before its `total`.
+reaches its hard limit before its `total`; the job is oversized (see "Resizing a job"; the alert carries the size to
+shrink to, from which the client writes the exact command).
 
 ### Holds
 
@@ -441,8 +474,10 @@ Not built yet: rented machines appear as hosts when a deployment's tooling write
   clients report it as a version problem) and says to update `job` on the submitting machine. The check is in
   `host_submit` itself, so it also applies to `local`, which skips `host_main`.
 - Probes stay at protocol 3; an admission host adds held reasons and alerts to the reply.
-- New operations (`room`, `hold`, `admission`, `history`) on a host that predates them fail with a usage error (exit 2,
-  no JSON); `job room` shows that host as `its job predates admission`.
+- New operations (`room`, `hold`, `admission`, `history`, `resize`) on a host that predates them fail with a usage
+  error (exit 2, no JSON); `job room` shows that host as `its job predates admission`, and `job resize` says the
+  host's job predates it. The resize fields in records, snapshots and alerts are additions an older client ignores,
+  so `PROTOCOL` is unchanged.
 - Rollout: install the new `bin/job` on every machine first. No host has a settings file yet, so nothing changes.
   Then turn admission on one host at a time: add the settings file, start the loop, check it, then the next. No
   pueued restart is needed (a restart kills running jobs). Jobs already running in other groups keep running and
