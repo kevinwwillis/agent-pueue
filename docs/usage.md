@@ -279,7 +279,7 @@ job run gpu1 TASK-12 --check "$SCRATCH/nan-check.sh" -- 'python train.py'
 | `job wait <host> <id>[:<token>] <id>[:<token>] ...` | Wait on several jobs on one host at once. Ends as soon as one of them ends badly (anything but `SUCCESS` or `PILOT_TIME_LIMIT`: `FAILED`, `KILLED`, `STALLED`, `ALERT`, `UNREACHABLE`, `GONE`, ...); the first line names it, says how many of the jobs really ended (a `STALLED` or `ALERT` job still runs, so it is not counted) and which have not, and a line gives the exact command to keep waiting on the others (`job wait <host> 13:<token> 14:<token>`). Otherwise it ends when all have ended (first line `job: ALL ENDED ...`, exit 0 if all succeeded, else the exit code of the lowest-id job that did not). `ID:TOKEN` refuses an id that now belongs to another job, like `--token` does for a single id; `--token` with several ids is refused (exit 205). |
 | `job ls [host ...] [--all] [--recent H]` | Every job on this machine and every host in the hosts file: host, id, task id, status, run time, group, session, token, command. Finished jobs older than `--recent` hours (default 24) are hidden unless `--all`. Exits 202 if a host could not be reached (the reachable ones are still listed). |
 | `job group <host> <name> <n>` | Create a pueue group (if missing) and let it run `n` jobs at a time. Then `job submit/run ... --group <name>`. |
-| `job room [host ...] [--json]` | Each admission host's room: CPU, RAM, memory pressure, disks, each GPU's free memory and outside use, the jobs running and the jobs held with their reasons. |
+| `job room [host ...] [--json]` | Each admission host's room: CPU, RAM, memory pressure (outside the jobs' own RAM limits, and where it is highest), disks, each GPU's free memory and outside use, the jobs running and the jobs held with their reasons. |
 | `job log <host> <id> [--token T] [--lines N] [--grep RE] [--full]` | The job's output: its last N lines (default 50; N is at least 1), the last N lines matching the regular expression RE, or the whole log (up to its last 32 MB). Use it instead of `pueue log` or reading the log file over ssh; it finds the log the way `job` does, whatever the host's PATH. |
 | `job show <host> <id> [--token T]` | Everything about one job: task, state (with the verdict once it ended), group and whether it is paused, session, token, working directory, times, size and RAM limit on admission hosts, the log's path, and the full command. |
 | `job resume <host> --group G` | Start a paused group again (`pueue start --group G`). A pueue daemon restart leaves the groups that had running jobs paused; a wait on a job queued there ends with an `ALERT` naming this command. |
@@ -331,7 +331,9 @@ when it fits. The design is [admission.md](admission.md). On such a host:
     `sized like ...`, and run on the host that holds that record. Refused when that run was killed or
     crashed (its peaks are only a lower bound) or was measured fewer than 3 times.
   - `--like last`: sized from the newest run of the same task id on that host that exited 0, or, only when none
-    did, from the newest pilot of it that reached its time limit (it says so); it prints which run and its peaks.
+    did, from the newest pilot of it that reached its time limit (it says so); it prints which run (with its
+    session) and its peaks. Runs of the same session come first; another session's run of the same task id is
+    used only when the session has none.
   - `--ram SIZE` (required, at least 16 MiB) with `--cpus N` (more than 0), `--gpus N`, `--gpu-mem SIZE` (per
     GPU), `--gpu-share PCT`; or `--small`. Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
 - `job run auto <task-id> ...` lets `job` choose the host: one with room now, else the job waits (is held) on
@@ -351,18 +353,28 @@ when it fits. The design is [admission.md](admission.md). On such a host:
 - Release is oldest first. Once the oldest held job has waited `fairness_wait_min` (30 minutes), younger jobs that
   need the room it lacks wait behind it, except a small one: one counted at under a tenth
   (`fairness_small_fraction`) of what the oldest still lacks of each resource they share.
-- `job resize HOST ID [--token T] --ram SIZE [--cpus N]` changes an admitted job's size. A held job may take any
-  size the host could run, keeps its place in the queue, and is refused a RAM size below the highest RAM peak of an
-  earlier finished run of the same task id there. A running job may only shrink: its RAM limit is lowered at once
-  and it is counted at the new limit from the loop's next cycle, so held jobs can use the room freed. The new limit
-  must cover its measured peak times the host's `resize_margin` (default 1.25), the kernel's peak of its cgroup
-  (`memory.peak`, which counts file cache), and its use now; its RAM limit is never raised, so a `--cpus`-only
-  resize keeps the limit it runs under, and `--cpus` may not go under its measured CPU peak. A refused or failed
-  resize changes nothing. A pilot is not resized. `job history` shows the size a job ended with, and the size it was resized from.
+- `job resize HOST ID [--token T] [--ram SIZE] [--cpus N]` (at least one of the two) changes an admitted job's
+  size. A held job may take any size the host could run, keeps its place in the queue, and is refused a RAM size
+  below the highest RAM peak of an earlier finished run of the same task id there (of the same session's runs when
+  it has any; the reply names the run and its session). A running job may only shrink: its RAM limit is lowered at
+  once and it is counted at the new limit from the loop's next cycle, so held jobs can use the room freed. The new
+  limit must cover what the job cannot give back: its measured peak times the host's `resize_margin` (default
+  1.25), its use now, and the kernel's peak of its cgroup (`memory.peak`) less the file cache it holds now (file
+  cache is dropped at a lower limit, so a job that streams data through its limit can still shrink; growth in its
+  own memory cannot). Its RAM limit is never raised, so a `--cpus`-only resize keeps the limit it runs under, and
+  `--cpus` may not go under its measured CPU peak. A refused or failed resize changes nothing. A pilot is not
+  resized, and a job the loop is releasing at that moment is refused with "try again". `job history` shows the
+  size a job ended with, and the size it was resized from.
 - A running job that has used under half of its RAM size for its first 30 minutes (`oversize_fraction`,
   `oversize_after_min`) gets one `ALERT` saying what it peaked at, its size, what it is counted at, and the exact
-  `job resize` command that shrinks it to the size `--like` would give. `job room` shows the same while it holds.
-  The job keeps running; reattach with `job wait`.
+  `job resize` command that shrinks it to the size `--like` would give, on the same measure the resize checks, so
+  the size it gives is accepted when the alert is made. A job whose RAM trend (its `$JOB_PROGRESS` lines) is still
+  rising is judged and sized by where the trend ends, and gets no alert when that is over half its size. `job
+  room` shows the same while it holds. The job keeps running; reattach with `job wait`.
+- A running job that spends over `undersize_stall_pct` (10%) of its time stalled reclaiming memory against its
+  own RAM limit gets one `ALERT` that it is undersized: it runs slowly. A running job's limit is never raised; to
+  give it more, kill it and submit it again with a larger `--ram`. `job room` shows it while it lasts. Its stall is
+  not host memory pressure and holds no other job.
 - The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
   for a pilot its free RAM at release), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
   `note: it went over its RAM limit of N GB; the whole job was stopped`. Processes it leaves running when its
@@ -371,7 +383,7 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   `--env CUDA_VISIBLE_DEVICES=...` is refused. Code should use devices 0..N-1.
 - `ALERT` (exit 201) can also come from the loop: the job's group is paused (the note gives the exact `job resume`
   command), it uses more GPU memory than its
-  size or a GPU it was not given, its RAM trend reaches its limit, it is oversized, a stop at its time limit failed, or the
+  size or a GPU it was not given, its RAM trend reaches its limit, it is oversized or undersized, a stop at its time limit failed, or the
   host's loop has stopped while the job is held. The job keeps its place.
 - A pilot stopped at its time limit ends `PILOT_TIME_LIMIT` (exit 207, not 137) with a note saying so ("as
   planned"); size the next run `--like` its token, or `--like last`.
