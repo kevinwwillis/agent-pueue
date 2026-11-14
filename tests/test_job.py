@@ -829,7 +829,7 @@ class SessionGroupTests(Base):
 
     def test_an_idle_group_goes_with_its_finished_jobs_once_they_are_old(self):
         tid = int(self.job("submit", "local", "T-sg-o", "--", "true", JOB_SESSION="sess-gone").stdout)
-        self.wait_status(tid, "Done")
+        self.assertEqual(self.job("wait", "local", str(tid), "--poll", "0.3").returncode, 0)  # its outcome delivered
         mark = os.path.join(self.d.dir, "state", "agent-pueue", "session-groups", "session-sess-gone")
         os.utime(mark, (time.time() - 7200,) * 2)  # no submit used it for two hours
         job = self.load_job_here()
@@ -1225,7 +1225,7 @@ class DaemonDeathTests(Base):
         self.assertIn("pueue had lost track of it", k.stdout)
         self.assertEqual(job._job_procs(token), {})
         again = self.job("wait", "local", str(tid), "--poll", "0.3")
-        self.assertEqual(again.returncode, 208, again.stdout + again.stderr)
+        self.assertEqual(again.returncode, 137, again.stdout + again.stderr)  # job kill ended it
 
     def test_an_ordinary_kill_before_a_clean_restart_is_killed_not_killed_by_restart(self):
         a = self.submit("sleep 300", task="T-oom")
@@ -1383,6 +1383,198 @@ class ReviewTwoTests(Base):
         job._keep_check("../escape", "/bin/true")
         self.assertFalse(os.path.exists(os.path.join(job.STATE_DIR, "escape")))
         self.assertIsNone(job._summarize_task({"id": 1, "status": {"Done": {}}, "envs": {"JOB_TOKEN": "../x"}})["token"])
+
+
+class LostJobTests(Base):
+    """A job pueue lost track of when its daemon died outright (review 4 of the client changes). Each test has a
+    daemon of its own."""
+
+    @classmethod
+    def setUpClass(cls):
+        pass
+
+    @classmethod
+    def tearDownClass(cls):
+        pass
+
+    def setUp(self):
+        self.d = Daemon()
+        self.addCleanup(self.d.stop)
+
+    def lose(self, cmd, task="T-lost", session=None):
+        """Submit cmd, let it start, then kill the daemon outright (its job runs on) and start it again."""
+        sub = self.job("submit", "local", task, "--", cmd, **({"JOB_SESSION": session} if session else {}))
+        tid, token = int(sub.stdout), sub.stderr.split("--token ", 1)[1].split()[0]
+        self.wait_status(tid, "Running")
+        time.sleep(0.5)
+        self.d.restart(down_for=0.5, sig=signal.SIGKILL)
+        job = self.load_job_here()
+        self.addCleanup(lambda: [os.kill(p, 9) for p in job._job_procs(token)])
+        self.assertTrue(job._job_procs(token), "the job's processes did not outlive the daemon; cannot test")
+        return tid, token, job
+
+    def test_a_lost_job_that_ends_on_its_own_reports_its_real_outcome(self):
+        tid, token, job = self.lose("sleep 5; echo done; exit 4", session="s-lost1")
+        first = self.job("wait", "local", str(tid), "--token", token, "--poll", "0.3")
+        self.assertEqual(first.returncode, 209, first.stdout + first.stderr)
+        self.assertIn("job wait local %d --token %s" % (tid, token), first.stdout)  # it offers waiting
+        self.assertIn("job kill local %d --token %s" % (tid, token), first.stdout)  # and stopping
+        self.assertNotIn("Submit it again", first.stdout)
+        p = self.job("wait", "local", str(tid), "--token", token, "--poll", "0.3")  # follows its processes
+        self.assertEqual(p.returncode, 4, p.stdout + p.stderr)
+        self.assertTrue(p.stdout.startswith("job: FAILED local#%d" % tid), p.stdout)
+        self.assertIn("lost track", p.stdout)
+        self.assertNotIn("Submit it again", p.stdout)
+        self.assertEqual(p.stdout.splitlines()[-1], "job: FAILED local#%d exit 4" % tid)
+        mine = self.job("wait", "--mine", "--poll", "0.3", JOB_SESSION="s-lost1")
+        self.assertIn("job: NONE exit 0", mine.stdout)  # reported once
+
+    def test_a_lost_job_that_ended_before_anyone_looked_is_a_success(self):
+        tid, token, job = self.lose("sleep 2; echo ok")
+        for _ in range(100):
+            if not job._job_procs(token):
+                break
+            time.sleep(0.1)
+        p = self.job("wait", "local", str(tid), "--poll", "0.3")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(p.stdout.startswith("job: SUCCESS local#%d" % tid), p.stdout)
+        self.assertIn("lost track", p.stdout)
+        ls = self.job("ls", "local")
+        self.assertRegex(ls.stdout, r"\n\S+\s+%d\s+T-lost\s+SUCCESS" % tid)
+
+    def test_the_host_never_sends_daemon_for_a_job_whose_processes_live(self):
+        tid, token, job = self.lose("sleep 300")
+        s = job.host_probe({"id": tid, "token": token})
+        # a client that knows only "daemon" reports any other value as a plain KILLED
+        self.assertNotEqual(s["killed_by"], "daemon")
+        self.assertTrue(s["alive_pids"])
+
+    def test_wait_mine_keeps_an_untracked_job_until_its_processes_end(self):
+        tid, token, job = self.lose("sleep 300", session="s-lost2")
+        first = self.job("wait", "--mine", "--poll", "0.3", JOB_SESSION="s-lost2")
+        self.assertEqual(first.returncode, 209, first.stdout + first.stderr)
+        w = subprocess.Popen([sys.executable, JOB, "wait", "--mine", "--poll", "0.3"], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=self.d.env(JOB_SESSION="s-lost2"))
+        time.sleep(3)
+        self.assertIsNone(w.poll(), "the second --mine ended at once")
+        for p in job._job_procs(token):
+            os.kill(p, 9)  # killed from outside
+        out, err = w.communicate(timeout=60)
+        self.assertEqual(w.returncode, 137, out + err)
+        self.assertIn("without leaving an exit record", out)
+        self.assertNotIn("Submit it again", out)
+        none = self.job("wait", "--mine", JOB_SESSION="s-lost2")
+        self.assertIn("job: NONE exit 0", none.stdout)
+
+    def test_kill_by_task_includes_an_untracked_job(self):
+        tid, token, job = self.lose("sleep 300", task="T-lostk", session="s-lostk")
+        k = self.job("kill", "local", "--task", "T-lostk", JOB_SESSION="s-lostk")
+        self.assertEqual(k.returncode, 0, k.stdout + k.stderr)
+        self.assertIn("lost track", k.stdout)
+        self.assertEqual(job._job_procs(token), {})
+        p = self.job("wait", "local", str(tid), "--poll", "0.3")
+        self.assertEqual(p.returncode, 137, p.stdout + p.stderr)  # killed by job kill: not "Submit it again"
+
+    def test_kill_leaves_the_processes_of_a_job_that_succeeded(self):
+        sub = self.job("submit", "local", "T-detach", "--", "setsid sleep 300 >/dev/null 2>&1 < /dev/null & exit 0")
+        tid, token = int(sub.stdout), sub.stderr.split("--token ", 1)[1].split()[0]
+        self.wait_status(tid, "Done")
+        job = self.load_job_here()
+        self.addCleanup(lambda: [os.kill(p, 9) for p in job._job_procs(token)])
+        self.assertTrue(job._job_procs(token), "no detached process; cannot test")
+        k = self.job("kill", "local", str(tid), "--token", token)
+        self.assertIn("nothing to kill", k.stdout)
+        self.assertTrue(job._job_procs(token))
+
+    def test_a_restart_victim_reported_after_a_later_restart(self):
+        job = self.load_job_here()
+        iso = lambda t: __import__("datetime").datetime.fromtimestamp(t).astimezone().isoformat()
+        st = {"tasks": {"1": {"id": 1, "status": {"Done": {"start": iso(999_000), "end": iso(999_990),
+                                                            "result": "Killed"}}},
+                        "2": {"id": 2, "status": {"Done": {"start": iso(1_000_100), "end": iso(1_000_500),
+                                                            "result": "Success"}}}}}
+        task = {"result": "Killed", "start": iso(999_000), "end": iso(999_990), "token": None}
+        job._daemon_start = lambda proc="/proc": 1_000_000.0
+        job._record_daemon_start()  # a job command ran while the first new daemon ran
+        job._daemon_start = lambda proc="/proc": 2_000_000.0  # then the daemon restarted again
+        self.assertEqual(job._killed_by(dict(task), st), "daemon")
+
+
+class DeliveryTests(Base):
+    """What counts as reported, and what the session-group cleanup may remove (review 4)."""
+
+    def test_a_failed_write_marks_nothing(self):
+        job = self.load_job_here()
+        tok = "a" * 32
+
+        class W:
+            host, tid, token = "local", 5, tok
+
+        class Broken:
+            def write(self, text):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+        o = {"verdict": "FAILED", "code": 3, "s": {"id": 5, "status": "Done", "result": "Failed"}, "note": None}
+        code = job._finish([W()], [(W(), o)], [], None, Broken())
+        self.assertEqual(code, 3)
+        self.assertFalse(job._reported(tok))
+        import io
+        job._finish([W()], [(W(), o)], [], None, io.StringIO())
+        self.assertTrue(job._reported(tok))
+
+    def test_a_stall_whose_job_ended_meanwhile_is_not_reported(self):
+        job = self.load_job_here()
+        tok = "b" * 32
+        job.call = lambda host, op, req, timeout=120: {"found": True, "id": 5, "status": "Done", "result": "Success",
+                                                       "token": tok, "tail": []}
+        w = job.Waiter("local", 5, token=tok)
+        o = w._outcome("STALLED", 200, {"found": True, "id": 5, "status": "Running", "token": tok})
+        self.assertFalse(job._really_ended(o))
+
+    def test_old_reported_marks_are_pruned(self):
+        job = self.load_job_here()
+        os.makedirs(job.REPORTED_DIR, exist_ok=True)
+        old = os.path.join(job.REPORTED_DIR, "c" * 32)
+        open(old, "w").close()
+        os.utime(old, (time.time() - job.MINE_RECENT_S - 60,) * 2)
+        job._mark_reported("d" * 32)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(job._reported("d" * 32))
+
+    def test_a_bad_token_is_refused_at_once(self):
+        p = self.job("wait", "local", "5", "--token", "not-a-token", "--poll", "0.3")
+        self.assertEqual(p.returncode, 205, p.stdout + p.stderr)
+        self.assertLess(p.elapsed, 10)
+        self.assertIn("token", p.stdout)
+        job = self.load_job_here()
+        o = job.Waiter("local", 5, token="../x", unreachable_min=15).step()
+        self.assertIsNotNone(o, "a host's bad-token error was retried")
+        self.assertEqual(o["code"], 205)
+
+    def test_session_group_cleanup_keeps_undelivered_and_live_jobs(self):
+        groups = lambda: json.loads(self.d.pueue("status", "--json").stdout)["groups"]
+        tid = int(self.job("submit", "local", "T-undel", "--", "true", JOB_SESSION="sess-undel").stdout)
+        self.wait_status(tid, "Done")
+        mark = os.path.join(self.d.dir, "state", "agent-pueue", "session-groups", "session-sess-undel")
+        os.utime(mark, (time.time() - 7200,) * 2)
+        job = self.load_job_here()
+        job.SESSION_GROUP_KEEP_S = 0
+        job._session_group(job._pueue_status(), "sess-other")
+        self.assertIn("session-sess-undel", groups())  # its outcome was never delivered
+        self.assertIn(str(tid), json.loads(self.d.pueue("status", "--json").stdout)["tasks"])
+        w = self.job("wait", "local", str(tid), "--poll", "0.3")
+        self.assertEqual(w.returncode, 0, w.stdout)
+        real = job._job_procs
+        job._job_procs = lambda token, proc="/proc": {4242: "1"}  # as if a process of it still lived
+        os.utime(mark, (time.time() - 7200,) * 2)
+        job._session_group(job._pueue_status(), "sess-other")
+        self.assertIn("session-sess-undel", groups())
+        job._job_procs = real
+        os.utime(mark, (time.time() - 7200,) * 2)
+        job._session_group(job._pueue_status(), "sess-other")
+        self.assertNotIn("session-sess-undel", groups())
 
 
 class ParserTests(unittest.TestCase):

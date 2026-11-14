@@ -136,7 +136,7 @@ pipe's exit code replaces the job's, so a failed job reads as exit 0, and
 | `FAILED` | the job's own code | The command exited nonzero. A job killed by a signal from outside (the OOM killer, `kill -9`) ends here with code 128 + signal, usually 137. | no |
 | `KILLED` | 137 | Killed with `job kill` or `pueue kill`, or removed from the queue with `job kill` before it ran (the note says so). | no |
 | `KILLED_BY_RESTART` | 208 | It was still running when the pueue daemon stopped (the machine rebooted, or the service was restarted or died); see below. Submit it again. | no |
-| `UNTRACKED` | 209 | The pueue daemon died without stopping it (killed outright, out of memory, a crash), so pueue lists it as killed, but its processes still run; the note lists their pids. Do not submit it again yet: stop them with the `job kill <host> <id> --token T` the note prints, then submit it again (a wait on it then ends `KILLED_BY_RESTART`). | **yes** |
+| `UNTRACKED` | 209 | The pueue daemon died without stopping it (killed outright, out of memory, a crash), so pueue lists it as killed, but its command still runs; the note lists its pids. Do not submit it again. Either wait for it with the `job wait <host> <id> --token T` the note prints (a wait after an `UNTRACKED` report follows its processes and ends with its real outcome), or stop it with the `job kill <host> <id> --token T` the note prints (a wait on it then ends `KILLED`). | **yes** |
 | `FAILED_TO_SPAWN` | 127 | pueue could not start the command. | no |
 | `ERRORED`, `DEPENDENCY_FAILED` | 203 | pueue-side error, or a dependency failed. | no |
 | `STALLED` | 200 | See "Stall detection". | **yes** |
@@ -171,10 +171,32 @@ the daemon before a clean stop, with no job queued, started or ended between
 them, is reported `KILLED_BY_RESTART`. A stop that took longer than 5 s to kill
 its jobs reports the ones it killed first as `KILLED`.
 
+The restart that can have killed a job is the first daemon start after the job
+started. `job` records each daemon start it sees (any `job` command on that
+host, in `~/.local/state/agent-pueue/daemon-starts`), so a job killed by one
+restart is still known as one after a later restart. Blind spot: two restarts
+with no `job` command on that host between them; a job killed by the first is
+then judged against the second, and is usually reported `KILLED`.
+
 A daemon that died outright does not kill its jobs: their processes live on,
 unknown to pueue. Before giving `KILLED_BY_RESTART`, `job` looks for the job's
-processes by its token (as `job kill` does); if any is alive, the verdict is
-`UNTRACKED` (exit 209) with their pids, so the job is never started twice. A
+processes by its token (as `job kill` does) and for the job's own exit record:
+
+- its command still runs: `UNTRACKED` (exit 209) with their pids, so the job is
+  never started twice. The note offers both: wait for it (`job wait` with its
+  token; a wait after the `UNTRACKED` report follows its processes like a
+  running job, with stall detection and `--check`, and ends with its real
+  outcome), or stop it (`job kill`; the wait then ends `KILLED`). `job wait
+  --mine` keeps such a job until its processes are gone and its outcome was
+  reported, however long ago pueue lost it.
+- its command ended on its own (its exit record was written after it started):
+  its real verdict (`SUCCESS`, `FAILED` with its code), with a note that pueue
+  lost track of it, and the pids of any process it left running.
+- its processes ended later without an exit record: `KILLED`, with a note that
+  something outside `job` killed them (not the restart); read its log first.
+
+A host sends such a job as killed by `daemon-lost`, not `daemon`, so a `job`
+from before this change reports it `KILLED`, never "submit it again". A
 restart also pauses the groups that had running
 jobs: a wait on a job queued or paused in a paused group ends with `ALERT` and
 the exact `job resume` command (the job stays queued). Without linger, logging
@@ -195,12 +217,16 @@ verdicts and early end as `job wait` on several ids. It also reports, with its
 verdict, each of the session's jobs that ended in the last 24 h and that no
 `job run` or `job wait` on this machine has reported (a wait records each job
 it reports, in `~/.local/state/agent-pueue/reported/`): the jobs that ended
-while no one waited. Jobs that already ended badly end the wait at once; the
+while no one waited, and each job pueue lost track of whose command still runs
+(see above). A job counts as reported only once the whole report was written
+out; a job left running (`STALLED`, `ALERT`, `UNREACHABLE`, `UNTRACKED`) is not
+counted, even when it ended right after. Jobs that already ended badly end the wait at once; the
 exit code is the worst verdict's (`UNTRACKED` first, then `WRAPPER_ERROR`,
 `GONE`, `UNREACHABLE`, `STALLED`, `ALERT`, `KILLED_BY_RESTART`, then the
-others). 24 h, because `job ls` hides finished jobs older than that and a
-session group keeps its finished jobs that long; an agent away for longer
-looks with `job ls --all`. A host that cannot be listed is named on stderr at
+others). 24 h, because `job ls` hides finished jobs older than that; an agent
+away for longer looks with `job ls --all`, which still lists every job whose
+outcome no wait reported (see "session group" below). Marks older than 24 h
+are pruned. A host that cannot be listed is named on stderr at
 once and in a `note:` line at the end (exit 202 if nothing else was found).
 `job ls` shows each job's token, for `job wait <host> <id> --token T`. A
 `--check` script given to `job run`, or to `job wait` with the job's token
@@ -283,8 +309,8 @@ job run gpu1 TASK-12 --check "$SCRATCH/nan-check.sh" -- 'python train.py'
 | `job log <host> <id> [--token T] [--lines N] [--grep RE] [--full]` | The job's output: its last N lines (default 50; N is at least 1), the last N lines matching the regular expression RE, or the whole log (up to its last 32 MB). Use it instead of `pueue log` or reading the log file over ssh; it finds the log the way `job` does, whatever the host's PATH. |
 | `job show <host> <id> [--token T]` | Everything about one job: task, state (with the verdict once it ended), group and whether it is paused, session, token, working directory, times, size and RAM limit on admission hosts, the log's path, and the full command. |
 | `job resume <host> --group G` | Start a paused group again (`pueue start --group G`). A pueue daemon restart leaves the groups that had running jobs paused; a wait on a job queued there ends with an `ALERT` naming this command. |
-| `job kill <host> <id> [--token T]` | Kill a running job, or remove a queued or held one from the queue. A running job's whole process tree ends: pueue's kill, then SIGKILL to every process of the job still alive (found by its token and as descendants, so children in their own process group, like `timeout`'s, or that called `setsid`, end too). It prints how many processes were running and whether any is left (exit 205 if one is, with a last `job: WRAPPER_ERROR` line). It also ends the processes of an `UNTRACKED` job. It cannot reach a process that cleared its environment (`env -i`) and whose parent then exited, so it is no longer anyone's descendant; for a job in a systemd scope (admission hosts), ending the scope reaches that one too. A wait on a job removed before it ran ends `KILLED` with `removed from the queue by job kill before it ran`. With `--token`, refuses if the id now belongs to another job. |
-| `job kill <host> --task NAME [--all-sessions]` | The same for every unfinished job of task id NAME on the host: queued and held ones first, so killing a running one cannot start them. Refused, killing nothing, when any of them belongs to another session, unless `--all-sessions`. |
+| `job kill <host> <id> [--token T]` | Kill a running job, or remove a queued or held one from the queue. A running job's whole process tree ends: pueue's kill, then SIGKILL to every process of the job still alive (found by its token and as descendants, so children in their own process group, like `timeout`'s, or that called `setsid`, end too). It prints how many processes were running and whether any is left (exit 205 if one is, with a last `job: WRAPPER_ERROR` line). It also ends the processes of an `UNTRACKED` job (one pueue lost track of whose processes still run), and nothing of a job that ended otherwise: a process a finished job left running on purpose is not its to kill. A `--token` that is not a 32-character job token is refused at once. It cannot reach a process that cleared its environment (`env -i`) and whose parent then exited, so it is no longer anyone's descendant; for a job in a systemd scope (admission hosts), ending the scope reaches that one too. A wait on a job removed before it ran ends `KILLED` with `removed from the queue by job kill before it ran`. With `--token`, refuses if the id now belongs to another job. |
+| `job kill <host> --task NAME [--all-sessions]` | The same for every unfinished job of task id NAME on the host, `UNTRACKED` ones included: queued and held ones first, so killing a running one cannot start them. Refused, killing nothing, when any of them belongs to another session, unless `--all-sessions`. |
 
 ## Queues of jobs
 
@@ -303,13 +329,15 @@ hear of it at once, and prints the command that waits on the rest. Do not wait o
 that runs several at a time, the last id can finish first.
 
 **A job without `--group` runs in its session's own group** (`session-<session id>`, created when needed), which
-runs as many jobs at a time as the host's `default` group (one, unless the host's owner raised it). So your jobs
+runs as many jobs at a time as the host's `default` group had when the session group was created (one, unless the
+host's owner raised it; a later change to `default` does not change it, use `job group` for that). So your jobs
 without a group never wait behind another session's jobs. A job submitted while that many of yours run there waits
 its turn; `job run` says so on stderr (`queued behind 1 running job(s) in group session-... (limit 1)`). Use a
 group of your own (`job group`) for a different limit. A session group is removed, by any later submit on that
-host, once no submit has used it for an hour and every job in it ended over 24 h ago; those finished jobs are
-removed from pueue's list with it (their logs go too; their exit codes stay in `job`'s records for 30 days, so
-`job wait` still reports them). Jobs of a session without a session id (see "Sessions") share `session-unknown`. On
+host, once no submit has used it for an hour, every job in it ended over 24 h ago, a wait reported each job's
+outcome, and no process of any of them still runs; those finished jobs are removed from pueue's list with it (their
+logs go too; their exit codes stay in `job`'s records for 30 days, so `job wait` still reports them). A job whose
+outcome no wait reported stays in pueue's list (and `job ls --all`) until one does. Jobs of a session without a session id (see "Sessions") share `session-unknown`. On
 admission hosts, a job without `--group` runs in the group `sched` instead (see below). pueue's `default` group
 is used only when you name it (`--group default`); it runs one job at a time and is shared by everyone.
 

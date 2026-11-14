@@ -190,9 +190,11 @@ def _pueue_error_text(text):
 def _pueue_status():
     p = _pueue(["status", "--json"])
     try:
-        return json.loads(p.stdout)
+        st = json.loads(p.stdout)
     except ValueError:
         raise JobError("pueue status --json returned no JSON: %r" % p.stdout[:300])
+    _record_daemon_start()
+    return st
 
 
 def _pueue_setting(key):
@@ -232,6 +234,39 @@ def _daemon_start(proc="/proc"):
     return None
 
 
+DAEMON_STARTS_KEEP = 200  # the daemon starts job saw, kept in STATE_DIR/daemon-starts
+
+
+def _daemon_starts():
+    """The start times of the pueue daemons a job command saw running here (epoch seconds, oldest first)."""
+    try:
+        with open(os.path.join(STATE_DIR, "daemon-starts"), encoding="utf-8") as f:
+            return sorted(float(x) for x in f.read().split() if x.strip())
+    except (OSError, ValueError):
+        return []
+
+
+def _record_daemon_start():
+    """Add the running daemon's start to STATE_DIR/daemon-starts, so a job killed by a restart is still known as one
+    after a later restart. Returns the start, or None when unknown."""
+    d = _daemon_start()
+    if d is None:
+        return None
+    starts = _daemon_starts()
+    if any(abs(x - d) < 2 for x in starts):
+        return d
+    path = os.path.join(STATE_DIR, "daemon-starts")
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("".join("%.3f\n" % x for x in sorted(starts + [d])[-DAEMON_STARTS_KEEP:]))
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a later call records it
+    return d
+
+
 STOP_SPREAD_S = 5.0  # a clean stop of the pueue daemon kills its running tasks within this many seconds of each other
 
 
@@ -249,16 +284,34 @@ def _stop_time(st, d):
     return last
 
 
+def _exit_record(token, start):
+    """The job's own exit record ({"exit", "end"}) when its wrapper wrote it after the task started, else None."""
+    path = os.path.join(STATE_DIR, "results", token + ".exit")
+    try:
+        at = os.path.getmtime(path)
+        with open(path) as f:
+            code = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if start is not None and at < start.timestamp() - 1:
+        return None
+    return {"exit": code, "end": dt.datetime.fromtimestamp(at).astimezone().isoformat()}
+
+
 def _killed_by(s, st=None):
     """Who ended a Killed task: "job kill" (or the admission loop's reason), "daemon" when it was running when the
-    pueue daemon stopped, or None when unknown. Only a task that started before the daemon now running (started at
-    d) can have been killed by a restart, and the restart must show in the times:
-      - it ended at or after d: the daemon died without stopping it (SIGKILL, out of memory, a crash), and the
-        new daemon marked it Killed when it started;
+    pueue daemon stopped, "daemon-lost" when that daemon died without stopping it, or None when unknown.
+    The restart that can have killed it is the first daemon start after the task started, among the running daemon
+    and the earlier ones job recorded (STATE_DIR/daemon-starts), and the restart must show in the times:
+      - it ended at or after that start d: the daemon died without stopping it (SIGKILL, out of memory, a crash),
+        and the new daemon marked it Killed when it started;
       - it ended before d, within STOP_SPREAD_S of the last task event before d (st's tasks): a clean stop kills
         every running task at once and nothing happens after it until the next start.
-    For "daemon", s gets daemon_start and alive_pids: the job's processes still alive, found by its token as job
-    kill finds them (a daemon that died outright does not kill its tasks)."""
+    For both, s gets daemon_start and alive_pids: the job's processes still alive, found by its token as job kill
+    finds them. When any is alive, or the job's own exit record was written after it started, or its processes were
+    seen alive before (STATE_DIR/results/<token>.lost), the daemon lost track of a job that ran on: "daemon-lost", and
+    s gets exit_record when there is one. A client that knows only "daemon" treats "daemon-lost" as a plain kill,
+    never as "submit it again"."""
     if s.get("result") != "Killed":
         return None
     tok = s.get("token")
@@ -269,10 +322,14 @@ def _killed_by(s, st=None):
             return killed.get("stopped_by") or "job kill"
         if os.path.exists(os.path.join(results, tok + ".jobkill")):
             return "job kill"
-    d = _daemon_start()
+    now = _daemon_start()
     start, end = _parse_time(s.get("start")), _parse_time(s.get("end"))
-    if d is None or start is None or end is None or start.timestamp() >= d:
+    if now is None or start is None or end is None:
         return None
+    after = sorted(x for x in set(_daemon_starts() + [now]) if x <= now + 1 and x > start.timestamp())
+    if not after:
+        return None
+    d = after[0]
     if end.timestamp() >= d - 1:  # the second: the pid file's start time and pueue's clock may differ by a little
         by_restart = end.timestamp() <= d + 120
     else:
@@ -282,6 +339,19 @@ def _killed_by(s, st=None):
         return None
     s["daemon_start"] = d
     s["alive_pids"] = sorted(_job_procs(tok)) if tok else []
+    if not tok:
+        return "daemon"
+    lost = os.path.join(results, tok + ".lost")
+    if s["alive_pids"] and not os.path.exists(lost):
+        try:
+            _mark(lost)  # so a later look, once they are gone, still knows they outlived the daemon
+        except OSError:
+            pass
+    rec = _exit_record(tok, start)
+    if rec is not None:
+        s["exit_record"] = rec
+    if s["alive_pids"] or rec is not None or os.path.exists(lost):
+        return "daemon-lost"
     return "daemon"
 
 
@@ -802,6 +872,12 @@ def _session_group(st, session):
                 ends = [_parse_time(x.get("end")) for x in mine]
                 if any(e is None or now - e.timestamp() < SESSION_GROUP_KEEP_S for e in ends):
                     continue  # its results are still shown and reported
+                if any(x.get("token") and not os.path.exists(os.path.join(STATE_DIR, "results",
+                                                                          x["token"] + ".delivered"))
+                       for x in mine):
+                    continue  # an outcome no wait has reported: job wait --mine and job ls --all still find it
+                if any(x.get("token") and _job_procs(x["token"]) for x in mine):
+                    continue  # pueue lost track of a job whose processes still run
                 if mine:  # these exact tasks, all finished: a job submitted meanwhile is not among them
                     _pueue(["remove"] + [str(int(x["id"])) for x in mine])
                 _pueue(["group", "remove", other])
@@ -990,7 +1066,7 @@ def host_probe(req):
     except OSError:
         size = 0
     s["log_size"] = size
-    if s["status"] == "Running":
+    if s["status"] == "Running" or _lost_running(s):
         s["cpu_ticks"], s["nprocs"], s["runnable"] = _proc_tree(s["token"])
     else:
         s["cpu_ticks"], s["nprocs"], s["runnable"] = None, 0, 0
@@ -1188,6 +1264,15 @@ def host_show(req):
     return s
 
 
+def host_delivered(req):
+    """A wait reported these jobs' outcomes: mark each (STATE_DIR/results/<token>.delivered), so the session-group
+    cleanup may remove them once they are old."""
+    toks = [t for t in (req.get("tokens") or []) if _token_ok(t)]
+    for t in toks:
+        _mark(os.path.join(STATE_DIR, "results", t + ".delivered"))
+    return {"marked": len(toks)}
+
+
 def host_resume(req):
     """Start a paused group again (pueue start --group)."""
     group = req.get("group")
@@ -1222,7 +1307,8 @@ def _mark(path):
 
 def host_kill(req):
     tid = int(req["id"])
-    t = _pueue_status().get("tasks", {}).get(str(tid))
+    st = _pueue_status()
+    t = st.get("tasks", {}).get(str(tid))
     if t is None:
         raise JobError("no task %d" % tid)
     tok = req.get("token")
@@ -1270,9 +1356,13 @@ def host_kill(req):
             raise
         return {"id": tid, "action": "removed from the queue"}
     if status == "Done" and token:
-        # pueue lost track of it (its daemon died without stopping it): its processes are found by the token
-        before = _job_procs(token)
-        if before:  # no job kill mark: its verdict stays KILLED_BY_RESTART (submit it again) once they are gone
+        # pueue lost track of it (its daemon died without stopping it): its processes are found by the token. Only
+        # such a job: the leftovers of a job that ended (a service it detached on purpose) are not job kill's.
+        s = _summarize_task(t)
+        before = _job_procs(token) if _killed_by(s, st) == "daemon-lost" else {}
+        if before:
+            if s.get("exit_record") is None:  # its command still ran: its verdict says job kill ended it
+                _mark(os.path.join(results, token + ".jobkill"))
             if os.path.exists(os.path.join(STATE_DIR, "scripts", token + ".shim")):
                 _stop_scope(token)
             left = _end_leftovers(token, before)
@@ -4152,7 +4242,7 @@ def host_history(req):
 HOST_OPS = {"submit": host_submit, "probe": host_probe, "ls": host_ls,
             "group": host_group, "kill": host_kill, "room": host_room, "admission": host_admission,
             "hold": host_hold, "history": host_history, "resize": host_resize, "log": host_log, "show": host_show,
-            "resume": host_resume}
+            "resume": host_resume, "delivered": host_delivered}
 
 
 def host_main(op):
@@ -4284,7 +4374,8 @@ def _fmt_et(t):
 
 
 def _runtime(s):
-    start, end = _parse_time(s.get("start")), _parse_time(s.get("end"))
+    rec = s.get("exit_record") if isinstance(s.get("exit_record"), dict) else {}
+    start, end = _parse_time(s.get("start")), _parse_time(rec.get("end") or s.get("end"))
     if start is None:
         return None
     end = end or dt.datetime.now(start.tzinfo)
@@ -4681,24 +4772,52 @@ def scope_verdict(verdict, code, scope):
 
 
 def _restart_verdict(verdict, code, note, s, host):
-    """KILLED_BY_RESTART for a job that was running when the pueue daemon stopped; UNTRACKED when its processes
-    still run (the daemon died without stopping them, so pueue lost track of them)."""
-    if verdict != "KILLED" or s.get("killed_by") != "daemon":
+    """The verdict of a job the pueue daemon's stop ended or lost track of (killed_by "daemon" or "daemon-lost"):
+    KILLED_BY_RESTART when the stop ended it; when the daemon died without stopping it, its real outcome from its
+    own exit record once its command ended, UNTRACKED while its command still runs, and KILLED when its processes
+    ended later without an exit record."""
+    kb = s.get("killed_by")
+    if verdict != "KILLED" or kb not in ("daemon", "daemon-lost"):
         return verdict, code, note
     d = s.get("daemon_start")
     when = " (it started again %s)" % _fmt_et(dt.datetime.fromtimestamp(d).astimezone()) if d else ""
     pids = s.get("alive_pids") or []
     tok = (" --token %s" % s["token"]) if s.get("token") else ""
+    ref = "%s %s%s" % (host, s.get("id"), tok)
+
+    def joined(*parts):
+        return "; ".join(x for x in parts if x)
+    lost = "the pueue daemon on %s stopped%s without stopping this job, so pueue lost track of it and lists it as " \
+           "killed" % (host, when)
+    rec = s.get("exit_record") if isinstance(s.get("exit_record"), dict) else None
+    if kb == "daemon-lost" and rec is not None:
+        stub = {"result": "Success" if rec.get("exit") == 0 else "Failed", "result_value": rec.get("exit")}
+        verdict, code = verdict_of(stub)
+        verdict, code, why_scope = scope_verdict(verdict, code, s.get("scope"))
+        why = "%s; it ran on and ended on its own%s with exit code %s, from its own exit record" % (
+            lost, (" at %s" % _fmt_et(_parse_time(rec.get("end")))) if rec.get("end") else "", rec.get("exit"))
+        left = ("%d process(es) it left still run (pids %s); stop them with: job kill %s" % (
+            len(pids), " ".join(map(str, pids)), ref)) if pids else None
+        return verdict, code, joined(why_scope, why, left)
     if pids:
-        why = ("the pueue daemon on %s stopped%s without stopping this job, and pueue lost track of it: pueue says "
-               "it was killed, but %d of its processes still run (pids %s). Do not submit it again while they run. "
-               "Stop them with: job kill %s %s%s ; then submit it again" % (
-                   host, when, len(pids), " ".join(map(str, pids)), host, s.get("id"), tok))
-        return "UNTRACKED", EXIT["UNTRACKED"], (note + "; " + why) if note else why
+        why = ("%s, but %d of its processes still run (pids %s). Do not submit it again. To wait for them to end and "
+               "get its real outcome: job wait %s (a wait after this one follows them); to stop them: job kill %s" % (
+                   lost, len(pids), " ".join(map(str, pids)), ref, ref))
+        return "UNTRACKED", EXIT["UNTRACKED"], joined(note, why)
+    if kb == "daemon-lost":
+        why = ("%s; its processes ran on but later ended without leaving an exit record, so something outside job "
+               "killed them (not the restart). Read its log before submitting it again: job log %s" % (lost, ref))
+        return "KILLED", EXIT["KILLED"], joined(note, why)
     why = ("it was still running when the pueue daemon on %s stopped%s; it did not end on its own. Submit it again; "
            "if jobs wait in a paused group, start it with: job resume %s --group %s" % (
                host, when, host, shlex.quote(str(s.get("group") or "default"))))
-    return "KILLED_BY_RESTART", EXIT["KILLED_BY_RESTART"], (note + "; " + why) if note else why
+    return "KILLED_BY_RESTART", EXIT["KILLED_BY_RESTART"], joined(note, why)
+
+
+def _lost_running(s):
+    """Whether s is a job pueue lost track of whose command still runs (its processes live, no exit record)."""
+    return (s.get("status") == "Done" and s.get("killed_by") == "daemon-lost" and bool(s.get("alive_pids"))
+            and s.get("exit_record") is None)
 
 
 def report(host, o, out):
@@ -4720,14 +4839,16 @@ def report(host, o, out):
             lines.append("command: %s" % (s.get("summary") or s.get("command")))
         if s.get("log_path"):
             lines.append("log: %s:%s" % (host, s.get("log_path")))
-    if verdict == "ALERT" and s.get("status") == "Done":
-        v, c = verdict_of(s)
+    still = s.get("status") not in (None, "Done") or _lost_running(s)
+    if verdict in ("ALERT", "STALLED") and s.get("status") == "Done" and not still:
+        v, c, _ = scope_verdict(*verdict_of(s), s.get("scope"))
+        v, c, _ = _restart_verdict(v, c, None, s, host)
         lines.append("the job has also ended: %s exit %d" % (v, c))
-    if verdict in URGENT and s.get("status") not in (None, "Done"):
+    if verdict in URGENT and still:
         tok = (" --token %s" % s["token"]) if s.get("token") else ""
         lines.append("the job was left %s; reattach: job wait %s %s%s ; stop it: job kill %s %s%s"
-                     % ("running" if s.get("status") == "Running" else "as it is (%s)" % s.get("status"),
-                        host, s.get("id"), tok, host, s.get("id"), tok))
+                     % ("running" if s.get("status") == "Running" or _lost_running(s)
+                        else "as it is (%s)" % s.get("status"), host, s.get("id"), tok, host, s.get("id"), tok))
     tail = o.get("tail")
     if tail:
         lines.append("--- last %d log lines ---" % len(tail))
@@ -4770,10 +4891,16 @@ class Waiter:
         self.told_held = None
         self.told_stale = False
         self.told_paused = False
+        self.following = False  # following the processes of a job pueue lost track of
+        self.told_untracked = False
 
     def _outcome(self, verdict, code, s, note=None, tail=True):
-        """The verdict is already decided; a last probe only refreshes what is shown (status, tail)."""
-        o = {"verdict": verdict, "code": code, "s": s, "note": note}
+        """The verdict is already decided; a last probe only refreshes what is shown (status, tail). ended says
+        whether the job had ended when the verdict was decided (a later probe may find it ended after a STALLED or
+        ALERT verdict that said it was left running: that is not a report of its end)."""
+        ended = not self.following and (verdict == "GONE" or (
+            s.get("status") == "Done" and verdict not in ("UNTRACKED", "STALLED", "UNREACHABLE")))
+        o = {"verdict": verdict, "code": code, "s": s, "note": note, "ended": ended}
         if tail and s.get("found"):
             try:
                 fresh = call(self.host, "probe", {"id": self.tid, "token": self.token, "tail_lines": self.tail})
@@ -4804,6 +4931,9 @@ class Waiter:
                                                             (" --token %s" % self.token) if self.token else ""),
                                  tail=False)
         except (Unreachable, JobError) as e:
+            if isinstance(e, JobError) and BAD_TOKEN_RX.search(str(e)):  # retrying cannot fix it
+                return self._outcome("WRAPPER_ERROR", EXIT["WRAPPER_ERROR"], {"id": self.tid}, tail=False,
+                                     note="%s; nothing was waited on" % e)
             now = time.monotonic()
             self.err_since = self.err_since or now
             if now - self.err_since >= self.unreachable_s:
@@ -4840,6 +4970,15 @@ class Waiter:
                                       "outright)" % why, tail=False)
         self.token = self.token or s.get("token")
         status, size = s.get("status"), s.get("log_size", 0)
+        self.following = _lost_running(s) and (self.following or _untracked_told(self.token))
+        if self.following:  # an earlier wait reported it UNTRACKED: wait for its processes as for a running job
+            status = "Running"
+            if not self.told_untracked:
+                self.told_untracked = True
+                sys.stderr.write("job: %s#%s: pueue lost track of it, but its processes still run (pids %s); waiting "
+                                 "for them to end. Stop them with: job kill %s %s%s\n" % (
+                                     self.host, self.tid, " ".join(map(str, s.get("alive_pids") or [])), self.host,
+                                     self.tid, (" --token %s" % self.token) if self.token else ""))
         if "alert_count" in s:
             if self.alert_cursor is None:
                 self.alert_cursor = s["alert_count"]
@@ -4966,25 +5105,55 @@ def _severity(o):
 
 
 REPORTED_DIR = os.path.join(STATE_DIR, "reported")  # one empty file per job token whose end a wait here reported
+UNTRACKED_DIR = os.path.join(STATE_DIR, "untracked")  # one per job token a wait here reported UNTRACKED
+BAD_TOKEN_RX = re.compile(r"(^|: )bad token")  # a host's refusal of a token: fatal, not retried
 
 
-def _mark_reported(token):
+def _prune(d, max_age):
+    """Remove the marks in d older than max_age seconds."""
+    cutoff = time.time() - max_age
+    try:
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _mark_in(d, token, max_age):
     if not _token_ok(token):
         return
     try:
-        os.makedirs(REPORTED_DIR, mode=0o700, exist_ok=True)
-        with open(os.path.join(REPORTED_DIR, token), "w"):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        _prune(d, max_age)
+        with open(os.path.join(d, token), "w"):
             pass
     except OSError:
         pass  # job wait --mine may report it again: noise, never a lost verdict
+
+
+def _mark_reported(token):
+    # a mark matters only while job wait --mine looks at the job's end, MINE_RECENT_S
+    _mark_in(REPORTED_DIR, token, MINE_RECENT_S)
 
 
 def _reported(token):
     return _token_ok(token) and os.path.exists(os.path.join(REPORTED_DIR, token))
 
 
+def _untracked_told(token):
+    return _token_ok(token) and os.path.exists(os.path.join(UNTRACKED_DIR, token))
+
+
 def _really_ended(o):
-    """Whether the job of an outcome has ended (not a STALLED, ALERT or UNREACHABLE job that still runs)."""
+    """Whether the job of an outcome had ended when its verdict was decided (not a STALLED, ALERT, UNREACHABLE or
+    UNTRACKED job that still runs)."""
+    if "ended" in o:
+        return o["ended"]
     return o["s"].get("status") == "Done" or o["verdict"] == "GONE"
 
 
@@ -5030,16 +5199,39 @@ def _keep_waiting(ws):
 
 
 def _finish(waiters, done, pending, urgent, out, notes=()):
+    """Print the report, then record what it reported: only once the whole report was written and flushed, so a
+    report lost to a closed pipe, a full disk or a killed app is given again by the next wait."""
+    import io
+    buf = io.StringIO()
+    code = _report_text(waiters, done, pending, urgent, buf, notes)
+    try:
+        out.write(buf.getvalue())
+        out.flush()
+    except (OSError, ValueError):
+        return code
+    delivered = {}
     for w, o in done:
         if _really_ended(o):
             _mark_reported(w.token)
+            if _token_ok(w.token):
+                delivered.setdefault(w.host, []).append(w.token)
+        elif o["verdict"] == "UNTRACKED":
+            _mark_in(UNTRACKED_DIR, w.token, SCRIPT_KEEP_DAYS * 86400)  # the next wait follows its processes
+    for h, toks in delivered.items():  # the host keeps them in pueue's list until then (session-group cleanup)
+        try:
+            call(h, "delivered", {"tokens": toks}, timeout=30)
+        except Exception:
+            pass  # a host whose job predates the op, or unreachable: it keeps the jobs longer, nothing is lost
+    return code
+
+
+def _report_text(waiters, done, pending, urgent, out, notes=()):
     if len(waiters) == 1:
         w, o = done[0]
         report(w.host, o, out)
         for n in notes:
             out.write("note: %s\n" % n)
         out.write(_last_line(o["verdict"], _ref(w), o["code"]))
-        out.flush()
         return o["code"]
     by_id = sorted(done, key=lambda wo: (wo[0].host, wo[0].tid))
     ended = sum(1 for _, o in done if _really_ended(o))
@@ -5243,10 +5435,11 @@ def cmd_wait_mine(args):
         for s in r["tasks"]:
             if s.get("session") != me or not s.get("token"):
                 continue
-            if s["status"] != "Done":
+            if s["status"] != "Done" or _lost_running(s):  # a job pueue lost track of runs until its processes end
                 waiters.append(_waiter(args, s["id"], s["token"], host=h))
                 continue
-            end = _parse_time(s.get("end"))
+            rec = s.get("exit_record") if isinstance(s.get("exit_record"), dict) else {}
+            end = _parse_time(rec.get("end") or s.get("end"))
             if end and (dt.datetime.now(end.tzinfo) - end).total_seconds() < MINE_RECENT_S and not _reported(
                     s["token"]):
                 waiters.append(_waiter(args, s["id"], s["token"], host=h))
@@ -5526,7 +5719,8 @@ def cmd_kill(args):
     if args.id is not None or args.token:
         raise JobError("give a job id or --task NAME, not both")
     tasks = [s for s in call(args.host, "ls", {}, timeout=60)["tasks"]
-             if s.get("label") == args.task and s["status"] != "Done"]
+             if s.get("label") == args.task and (s["status"] != "Done" or (
+                 s.get("killed_by") == "daemon-lost" and s.get("alive_pids")))]
     if not tasks:
         print("%s: no unfinished job of task %s" % (args.host, args.task))
         return 0
@@ -5537,7 +5731,7 @@ def cmd_kill(args):
                        "--all-sessions to kill them too" % (args.task, args.host, len(others), ", ".join(
                            "#%s of %s" % (s["id"], s.get("session") or "unknown") for s in others)))
     # waiting jobs first: killing a running job frees its slot, and pueue would start a queued one in it
-    tasks.sort(key=lambda s: (s["status"] in ("Running", "Paused"), int(s["id"])))
+    tasks.sort(key=lambda s: (s["status"] in ("Running", "Paused", "Done"), int(s["id"])))
     failed = []
     for s in tasks:
         try:
@@ -5764,6 +5958,11 @@ def main(argv=None):
     if getattr(args, "host", None) is not None and args.host not in HOSTS and not auto:
         sys.stdout.write("job: WRAPPER_ERROR unknown host %r; known hosts: %s (add it to %s)\njob: WRAPPER_ERROR exit %d\n"
                          % (args.host, ", ".join(HOSTS), HOSTS_FILE, EXIT["WRAPPER_ERROR"]))
+        return EXIT["WRAPPER_ERROR"]
+    tok = getattr(args, "token", None)
+    if tok is not None and not _token_ok(tok):
+        sys.stdout.write("job: WRAPPER_ERROR --token %r is not a job token: a token is the 32-character token job "
+                         "printed (job ls shows it)\njob: WRAPPER_ERROR exit %d\n" % (str(tok)[:40], EXIT["WRAPPER_ERROR"]))
         return EXIT["WRAPPER_ERROR"]
     handlers = {"run": cmd_run, "submit": lambda a: cmd_run(a, queue_only=True), "wait": cmd_wait,
                 "ls": cmd_ls, "group": cmd_group, "kill": cmd_kill, "room": cmd_room, "admission": cmd_admission, "history": cmd_history,
