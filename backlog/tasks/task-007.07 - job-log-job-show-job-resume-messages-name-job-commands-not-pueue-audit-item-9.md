@@ -3,10 +3,10 @@ id: TASK-007.07
 title: >-
   job log, job show, job resume; messages name job commands, not pueue (audit
   item 9)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-14T17:41:00Z'
-updated_date: '2026-11-14T19:24:00Z'
+updated_date: '2026-11-14T22:22:00Z'
 labels: []
 dependencies: []
 parent_task_id: TASK-007
@@ -26,11 +26,13 @@ About 100 raw pueue calls; pueue not on the hosts' non-login ssh PATH; job log g
 - [x] #2 job show HOST ID: command, task, group, size, state, times, token, log path
 - [x] #3 job resume HOST --group G
 - [x] #4 No message tells agents to run a pueue command; the paused-group ALERT gives the exact job resume command
-- [ ] #5 Remote test (tests.test_remote against a real host) passes
+- [x] #5 Remote test (tests.test_remote against a real host) passes
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-11-14 13:59 ET, commit d2dd953. New host ops log, show, resume (additive, PROTOCOL unchanged as for resize); a host with an older job gets 'predates job <op>'. --full sends at most the last 32 MB. The loop's group_paused alert carries {resume: {group}} and the waiter, which knows the host's name, prints the command. Tests: LogShowResumeTests (4), paused-group alert test extended.
+
+Released in job 0.8.0 (v0.8.0, 603eeda), 2026-11-14 17:15-17:21 ET: sttp1, then sttp2, then this PC; remote tests passed on sttp1 and sttp2; two full review cycles (Claude Sonnet sonnet at high) plus a final judged repair.
 <!-- SECTION:NOTES:END -->

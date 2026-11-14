@@ -3,10 +3,10 @@ id: TASK-007.06
 title: >-
   Piping and help: verdict word on the last line, never-pipe rule and key rules
   in job --help (audit items 8, 16)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-14T17:41:00Z'
-updated_date: '2026-11-14T19:24:00Z'
+updated_date: '2026-11-14T22:22:00Z'
 labels: []
 dependencies: []
 parent_task_id: TASK-007
@@ -25,11 +25,13 @@ About 140 piped job run/wait calls; 8 failed jobs reported as exit 0 by the harn
 - [x] #1 The last line of a run or wait is job: VERDICT HOST#ID exit N (wrapper errors: job: WRAPPER_ERROR exit 205)
 - [x] #2 docs/usage.md and job run/wait --help say never pipe, use --tail N
 - [x] #3 job --help epilog: never pipe, session groups, size with --pilot then --like, kill removes queued/held, reattach, job log/show/resume
-- [ ] #4 Remote test (tests.test_remote against a real host) passes
+- [x] #4 Remote test (tests.test_remote against a real host) passes
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-11-14 13:53 ET, commit 697cf3e (epilog lines for --mine and job log/show/resume added with those commits). Several jobs: the last line names the job that decided the exit code, with a summary. Tests: HelpAndLastLineTests (3) and updated success/failure tests.
+
+Released in job 0.8.0 (v0.8.0, 603eeda), 2026-11-14 17:15-17:21 ET: sttp1, then sttp2, then this PC; remote tests passed on sttp1 and sttp2; two full review cycles (Claude Sonnet sonnet at high) plus a final judged repair.
 <!-- SECTION:NOTES:END -->
