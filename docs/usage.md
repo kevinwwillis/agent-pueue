@@ -302,8 +302,8 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   - `--like TOKEN` (or `HOST#ID`): sized from that earlier job's measured peaks plus margins, printed as
     `sized like ...`, and run on the host that holds that record. Refused when that run was killed or
     crashed (its peaks are only a lower bound) or was measured fewer than 3 times.
-  - `--like last`: sized from the last good run (exit 0, or a pilot that reached its time limit) of the same task
-    id on that host; it prints which run and its peaks.
+  - `--like last`: sized from the newest run of the same task id on that host that exited 0, or, only when none
+    did, from the newest pilot of it that reached its time limit (it says so); it prints which run and its peaks.
   - `--ram SIZE` (required, at least 16 MiB) with `--cpus N` (more than 0), `--gpus N`, `--gpu-mem SIZE` (per
     GPU), `--gpu-share PCT`; or `--small`. Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
 - `job run auto <task-id> ...` lets `job` choose the host: one with room now, else the job waits (is held) on
@@ -317,8 +317,9 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   needs. When the running jobs holding the room it lacks have projected ends (see `$JOB_PROGRESS` below), the
   reason says when enough room should free (`enough room should free about ...`); otherwise it says no start
   estimate is known, and why.
-  Don't shrink a held job's size below what it needs to get it started: it then ends in exit 137 at its limit. Size
-  it from a measured run (`--pilot`, then `--like`).
+  A job held short of RAM whose size was not measured gets one extra line, once: a size below what it needs ends in
+  exit 137, so size it from a measured run (`--pilot`, then `--like`). Don't shrink a held job's size below what it
+  needs to get it started.
 - Release is oldest first. Once the oldest held job has waited `fairness_wait_min` (30 minutes), younger jobs that
   need the room it lacks wait behind it, except a small one: one counted at under a tenth
   (`fairness_small_fraction`) of what the oldest still lacks of each resource they share.
@@ -326,8 +327,10 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   size the host could run, keeps its place in the queue, and is refused a RAM size below the highest RAM peak of an
   earlier finished run of the same task id there. A running job may only shrink: its RAM limit is lowered at once
   and it is counted at the new limit from the loop's next cycle, so held jobs can use the room freed. The new limit
-  must cover its measured peak times the host's `resize_margin` (default 1.25) and its use now. A pilot is not
-  resized. `job history` shows the size a job ended with, and the size it was resized from.
+  must cover its measured peak times the host's `resize_margin` (default 1.25), the kernel's peak of its cgroup
+  (`memory.peak`, which counts file cache), and its use now; its RAM limit is never raised, so a `--cpus`-only
+  resize keeps the limit it runs under, and `--cpus` may not go under its measured CPU peak. A refused or failed
+  resize changes nothing. A pilot is not resized. `job history` shows the size a job ended with, and the size it was resized from.
 - A running job that has used under half of its RAM size for its first 30 minutes (`oversize_fraction`,
   `oversize_after_min`) gets one `ALERT` saying what it peaked at, its size, what it is counted at, and the exact
   `job resize` command that shrinks it to the size `--like` would give. `job room` shows the same while it holds.

@@ -52,9 +52,11 @@ job release host2 <hold-id>
     holds the record: `HOST#ID` is sent only to HOST, and `auto` with a token tries the hosts in turn, the
     others refusing for want of the record. Sampled peaks are a lower bound even for a clean run; the margins
     and `ram_hard_factor` cover the gap between samples.
-  - **`--like last`**: the same, from the newest record on that host of the same task id that exited 0 or was a
-    pilot that reached its time limit, measured at least 3 times. The printed size names that run (pueue id, how
-    and when it ended) and its peaks. An older host reads `last` as a token and refuses it for want of a record.
+  - **`--like last`**: the same, from the newest record on that host of the same task id that exited 0, measured
+    at least 3 times; only when no such run exists, from the newest pilot of that task id that reached its time
+    limit (a pilot stopped early may not have reached the job's peak, so a complete run, even an older one, is the
+    better measure), and the printed size says so. The printed size names that run (pueue id, how and when it
+    ended) and its peaks. An older host reads `last` as a token and refuses it for want of a record.
   - **Explicit sizes:** `--ram SIZE` (required; the job's hard RAM limit is `ram_hard_factor` times it), with
     `--cpus N` (default: the small size's CPUs), `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or
     `--small`, the settings file's small size.
@@ -74,15 +76,21 @@ job release host2 <hold-id>
     alert fires once per job.
   - While a job is held, its wait prints a line saying why (for example `held: needs 18.0 GB on GPU 0, 9.4 GB
     free`) every 10 minutes, and `job ls` shows `Held` with the reason. Being held is not a verdict and does not
-    end a multi-job wait. The submit itself computes the first reason from the loop's last snapshot, counting
-    the jobs held ahead of it as `fit_now` does (with no snapshot: the loop is measuring the host; with a stale
-    heartbeat: the loop is not running), so the first line is never a placeholder. A job held by the fairness
-    rule names the older job (task id and token) and that job's own reason. When a job is short of RAM, CPU or
+    end a multi-job wait. The submit itself computes the first reason by the loop's checks in the loop's order:
+    its group (paused, or full), then the room in the loop's last snapshot, counting the jobs held ahead of it as
+    `fit_now` does, then the fairness rule as the last cycle applied it (with no snapshot: the loop is measuring
+    the host; with a stale heartbeat: the loop is not running), so the first line is never a placeholder and does
+    not promise a start the loop would refuse. A job held by the fairness rule names the older job (task id and
+    token) and that job's own reason. Task ids another session chose are shown with control characters removed
+    and cut to 60 characters. A job held short of RAM whose size was not measured (not `--like`, not a pilot)
+    gets one extra line, once per wait: a size below what the job needs ends in exit 137, so size it from a
+    measured run. When a job is short of RAM, CPU or
     GPU memory, the loop adds a start estimate: the running jobs that hold that room, in order of their
     projected ends (see "Progress"), until what they free covers what it lacks (for GPUs, on as many cards as it
-    still needs); the reason gives that time and the job whose end it waits for, or says none is known because a
-    job on the way has no projected end, or the room it lacks is outside use or holds, or it waits on a busy
-    disk or GPU. The time is in the host's zone; `job room --json` has it as `start_estimate`.
+    still needs); the reason gives that time and the job whose end it waits for (or, when that job is already
+    past its projected end, says room should free any time now), or says none is known because a job on the
+    way has no projected end, or the room it lacks is outside use or holds, or it waits on a busy disk. A busy
+    GPU (over `gpu_busy_max_pct`) does not stop an estimate from another card a running job frees. The time is in the host's zone; `job room --json` has it as `start_estimate`.
   - A submit that cannot fit on any host even when that host is empty (its capacity minus headroom; for RAM, the
     job's hard limit must fit) is refused at once with `WRAPPER_ERROR` and the reason.
   - When a job's command ends, any processes it left running (for example a `nohup ... &`) are stopped within one
@@ -339,8 +347,11 @@ once.
   services should name their processes.
 - **RAM, per host:** the lowest over `outside_window_s` of `MemAvailable + Σ admitted jobs' current use + Σ RAM
   holds' own use` (what would be free with no admitted jobs and no RAM holds), minus `ram_headroom`, minus `Σ
-  over admitted jobs of max(hard limit, current use)`, minus `Σ over RAM holds of max(size, own use)`. A job is
-  counted at its hard limit (`ram_hard_factor` times its size, a pilot's counted room), not its size, and fits
+  over admitted jobs of max(hard limit, current use)`, minus `Σ over RAM holds of max(size, own use)`. Admitted
+  jobs are the jobs in this loop's queue or records: another job scope of the user (a job this loop did not
+  admit) is outside use, since it is not counted. A job is
+  counted at its hard limit (`ram_hard_factor` times its size, a pilot's counted room), not its size, and never
+  below the `memory.max` its cgroup has now (a running resize lowers the limit before the count), and fits
   only if its limit fits, so jobs that grow up to their limits together still leave `ram_headroom` free. A RAM
   hold's own use is its cgroup's `memory.current` less file cache (`--unit`/`--cgroup`), or the sum of
   `Pss_Anon + Pss_Shmem` of `--while-pid` and its descendants. Where a process's `smaps_rollup` can't be read
@@ -375,9 +386,12 @@ card, or one host's RAM, CPU or disk. Little means: what the younger job is coun
 at its hard limit, CPU at its size, GPU memory at its size), added to what the younger jobs already let past the
 oldest and still in flight take there, stays under `fairness_small_fraction` of what the oldest lacks of it. What it
 lacks is the smaller of its shortfall now and its shortfall when it was first blocked, kept in its queue entry, so
-a stream of small jobs cannot set it back by more than that share. A resource it is short of in a way no amount
-measures (a GPU busy over `gpu_busy_max_pct`, a busy disk) and a pilot's RAM (it takes all the RAM room) lack 0, so
-no younger job takes from them, as before. A held job does not block others when it is held for a reason other than room (its group is
+a stream of small jobs cannot set it back by more than that share; a held resize of the oldest job starts that
+measure again from its new size. A resource it is short of in a way no amount measures (a GPU busy over
+`gpu_busy_max_pct`, a busy disk) lacks 0, so no younger job takes from it, as before. A pilot lacks the RAM it is
+short of its floor (`pilot.ram_floor_gb`, or its size if larger), like any other job, so a younger job counted at
+under the small share of that may pass it; a pilot that has its floor of RAM room is not short of RAM, and younger
+jobs may take RAM it would otherwise get at its release (a pilot is counted at all the RAM room when released). A held job does not block others when it is held for a reason other than room (its group is
 full or paused), or when it would be short even with every admitted job on the host ended, because outside use
 and holds alone leave too little.
 
@@ -389,24 +403,40 @@ let its owner give that room back:
 - **Oversize ALERT.** When an admitted job that is not a pilot (and does not run its work in containers) has run for
   `oversize_after_min` and was measured at least 3 times, and its RAM peak so far is under `oversize_fraction` of
   its size, its owner gets one ALERT: what it peaked at, its size, what it is counted at, and a size to shrink to
-  (what `--like` would give: the peak times `margins.ram`, at least the resize floor below, rounded up to 0.1 GB).
+  (what `--like` would give: the peak times `margins.ram`, at least the resize floor below, rounded up to 0.1 GB, and
+  up again if that size as written would parse to a limit under the floor, so the suggestion is always accepted).
   A new client prints the exact `job resize` command; `job room` shows the same under the job while it holds.
 - **`job resize HOST ID [--token T] --ram SIZE [--cpus N]`**, a host operation (`resize`) under the queue lock:
   - A **held** job takes the new size and keeps its submit time, so its place in the queue does not change. It is
     refused a RAM size below the highest RAM peak recorded for an earlier finished run of the same task id on that
     host (the reply names that run), and a size that could never fit the host (the submit check).
-  - A **running** job (released, its task in flight) may only shrink. Its new hard limit must be at least its
-    measured peak times `resize_margin` and at least its RAM use now, and it must have been measured at least 3
-    times. Its scope's `job/memory.max` is lowered and read back first, then its count: a failure in between
-    counts it too high, never too low. Its assignment file gets the new limit too, for a scope still starting, and
-    each cycle the loop lowers a resized job's `memory.max` again if a starting scope set the old one. It is
-    counted at the new limit from the next cycle.
+  - A **running** job (released, its task in flight) may only shrink, and its RAM limit is never raised. It must
+    have been measured at least 3 times, and its scope must be one of this user's job scopes on the host, with a
+    writable `job/memory.max`; otherwise the resize is refused and nothing changes.
+    - What happens to its RAM limit: with `--ram`, its new hard limit is `ram_hard_factor` times the new size, by
+      the host's settings now. It is refused when that is above the limit it runs under now (the lower of its
+      recorded limit and its cgroup's `memory.max`; `ram_hard_factor` may have grown since its release), and when
+      it is under the resize floor: the largest of its sampled RAM peak times `resize_margin`, the kernel's peak of
+      its `job/` cgroup (`memory.peak`, which catches spikes between samples; it counts file cache too, so a
+      cache-heavy job may not shrink much, but a limit under a real spike would end the job while a limit too
+      high only keeps room idle), and its RAM use now. A `--cpus`-only resize keeps the limit it runs under.
+    - `--cpus` may not go under its measured CPU peak.
+    - Order: its scope's `job/memory.max` is lowered and read back first, then the record, then the resize file
+      the loop counts by; a step that fails puts back the ones before it, so a reported failure leaves nothing
+      changed. The loop counts a running job at the larger of its recorded limit and its cgroup's `memory.max`,
+      so between the steps it is never counted below its real limit. A restart of the job reads the new limit
+      from its assignment file, and each cycle the loop lowers a resized job's `memory.max` again if a starting
+      scope set the old one. It is counted at the new limit from the next cycle.
+    - Its verdict, if it later goes over its limit, names the limit it ended under (its cgroup's `memory.max` at
+      its end), and its record keeps that limit.
   - A pilot is refused (it is measuring).
   - `resize_margin` defaults to 1.25: the peak is sampled every `sample_interval_s`, so it is a lower bound, and
     1.25 is the margin `--like` already puts on a measured peak.
   - The change goes to `state_dir/resize/<token>.json`, not to the queue file, which the loop rewrites from the copy
     it read at the start of its cycle; every reader of the queue applies it, and the loop applies it again under
-    the lock before it releases. The record gets the new size, limit and count, and `resized` (each change: when,
+    the lock before it releases. A resize touches the queue folder, which wakes the loop. The loop ends a job
+    under the same lock, so a resize either lands before the job's end (and its change is in the final record) or
+    finds the job gone; resize files whose job left the queue are removed each cycle. The record gets the new size, limit and count, and `resized` (each change: when,
     held or running, from and to).
 
 ### Records

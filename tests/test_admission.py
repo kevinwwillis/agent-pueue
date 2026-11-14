@@ -17,7 +17,7 @@ import tempfile
 import time
 import unittest
 
-from test_job import JOB, Base
+from test_job import JOB, Base, own_tmpdir, remove_own_dir
 from test_scope import SCOPES
 
 GB, MiB, GiB = 10 ** 9, 1 << 20, 1 << 30
@@ -60,16 +60,10 @@ class RoomRules(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import tempfile
         cls.j = load()
-        cls.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        cls.tmp = own_tmpdir()
+        cls.addClassCleanup(remove_own_dir, cls.tmp)
         cls.s = settings(cls.j, cls.tmp)
-
-    @classmethod
-    def tearDownClass(cls):
-        import shutil
-        if cls.tmp.startswith("/tmp/jobt."):
-            shutil.rmtree(cls.tmp)
 
     def room(self, samples, inflight=(), now=None):
         return self.j.compute_room(self.s, samples, list(inflight), [], now or samples[-1]["t"])
@@ -209,14 +203,9 @@ class RoomRulesCycle2(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.j = load()
-        cls.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        cls.tmp = own_tmpdir()
+        cls.addClassCleanup(remove_own_dir, cls.tmp)
         cls.s = settings(cls.j, cls.tmp)
-
-    @classmethod
-    def tearDownClass(cls):
-        import shutil
-        if cls.tmp.startswith("/tmp/jobt."):
-            shutil.rmtree(cls.tmp)
 
     def test_gpu_use_on_a_card_the_job_was_not_given_still_counts(self):
         tok = "d" * 32
@@ -253,14 +242,9 @@ class RoomRulesCycle2(unittest.TestCase):
 
 class Settings(unittest.TestCase):
     def setUp(self):
-        import tempfile
         self.j = load()
-        self.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
-
-    def tearDown(self):
-        import shutil
-        if self.tmp.startswith("/tmp/jobt."):
-            shutil.rmtree(self.tmp)
+        self.tmp = own_tmpdir()
+        self.addCleanup(remove_own_dir, self.tmp)
 
     def write(self, text):
         p = os.path.join(self.tmp, "a.json")
@@ -308,9 +292,10 @@ class ClientTests(unittest.TestCase):
         self.args = argparse.Namespace(host="auto", only_hosts=None)
         room = {"cpu": {"room": 8, "placed_room": 8, "iowait": 0, "outside": 0, "committed": 0},
                 "ram": {"room": 10 * GB}, "gpus": {}, "disks": {}, "pressure_ok": True, "psi": 0}
+        tmp = own_tmpdir()
+        self.addCleanup(remove_own_dir, tmp)
         self.snap = lambda **kw: dict({"admission": True, "stale": False, "room": room, "held": [], "paths": [],
-                                       "settings": settings(self.j, tempfile.mkdtemp(prefix="jobt.", dir="/tmp"))},
-                                      **kw)
+                                       "settings": settings(self.j, tmp)}, **kw)
         self.refuse = {}
 
         def submit_to(args, host, command, adm):
@@ -390,15 +375,14 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(self.j._ram_at_total(flat))
 
     def fake_ssh(self, script):
-        d = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        d = own_tmpdir()
+        self.addCleanup(remove_own_dir, d)
         with open(os.path.join(d, "ssh"), "w") as f:
             f.write("#!/bin/sh\ncat > /dev/null\n" + script + "\n")
         os.chmod(os.path.join(d, "ssh"), 0o755)
         old = os.environ["PATH"]
         os.environ["PATH"] = d + ":" + old
         self.addCleanup(lambda: os.environ.__setitem__("PATH", old))
-        import shutil
-        self.addCleanup(shutil.rmtree, d)
 
     def test_a_host_that_gives_no_reply_is_unreachable_not_a_refusal(self):
         self.fake_ssh("echo 'Killed' >&2; exit 137")
@@ -412,8 +396,8 @@ class ClientTests(unittest.TestCase):
         self.assertNotIsInstance(e.exception, self.j.Unreachable)
 
     def test_sizes_of_nothing_are_refused(self):
-        tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
-        self.addCleanup(__import__("shutil").rmtree, tmp)
+        tmp = own_tmpdir()
+        self.addCleanup(remove_own_dir, tmp)
         s = settings(self.j, tmp)
         adm = self.j.Admission(s)
         cap = {"mem_total": 64 * GB, "threads": 8, "gpus": []}
@@ -424,7 +408,8 @@ class ClientTests(unittest.TestCase):
             self.assertNotIn("admission setting", str(e.exception))
 
     def test_job_use_measures_the_disk_rate(self):
-        root = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        root = own_tmpdir()
+        self.addCleanup(remove_own_dir, root)
         try:
             scope = os.path.join(root, "scope")
             os.makedirs(os.path.join(scope, "job"))
@@ -652,13 +637,9 @@ class ResizeRules(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.j = load()
-        cls.tmp = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        cls.tmp = own_tmpdir()
+        cls.addClassCleanup(remove_own_dir, cls.tmp)
         cls.s = settings(cls.j, cls.tmp, ram_hard_factor=1.25)
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.tmp.startswith("/tmp/jobt."):
-            shutil.rmtree(cls.tmp)
 
     def test_new_settings_have_defaults_and_are_checked(self):
         self.assertEqual((self.s["oversize_after_min"], self.s["oversize_fraction"], self.s["resize_margin"]),
@@ -677,12 +658,18 @@ class ResizeRules(unittest.TestCase):
         # a job using more now than its peak times the margin is never offered a limit below its use
         self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._resize_suggestion(self.s, 10 * GB, 40 * GB)), 40 * GB)
 
-    def test_the_held_reason_for_ram_warns_about_exit_137(self):
+    def test_the_exit_137_hint_is_only_for_a_size_that_was_not_measured(self):
         r = self.j.compute_room(self.s, [sample(100, avail=5 * GB)], [], [], 100)
         ok, why = self.j.fits(self.s, r, held(ram=8 * GB))
         self.assertFalse(ok)
-        self.assertIn("ends in exit 137", why)
-        self.assertIn("--pilot, then --like", why)
+        self.assertNotIn("exit 137", why)  # the reason itself, which younger jobs embed, has no hint
+        lack = self.j._lack(self.s, r, held(ram=8 * GB))
+        hint = self.j._ram_hint(held(ram=8 * GB, size_source="explicit"), lack)
+        self.assertIn("ends in exit 137", hint)
+        self.assertIn("--pilot, then --like", hint)
+        self.assertIsNone(self.j._ram_hint(held(ram=8 * GB, size_source="like"), lack))  # sized from a measured run
+        self.assertIsNone(self.j._ram_hint(held(ram=8 * GB, size_source="explicit"), {"cpu": 1.0}))  # not short of RAM
+        self.assertIsNone(self.j._ram_hint(held(pilot=True), {"ram": GB}))
 
     def test_a_pilot_needs_its_ram_floor(self):
         self.assertEqual(self.s["pilot"]["ram_floor_gb"], 16)
@@ -713,10 +700,85 @@ class ResizeRules(unittest.TestCase):
         self.assertIsNone(got)
         self.assertIn("no projected end", why)
         self.assertIn("not held by running jobs", est({"ram": 10 * GB}, running)[1])
-        self.assertIn("busy disk or GPU", est({"disk:sda": 0.0}, running)[1])
+        self.assertIn("busy disk", est({"disk:sda": 0.0}, running)[1])
         gpu = [(500.0, {"gpu:a": 4 * GB}, "T-a"), (300.0, {"gpu:b": 4 * GB}, "T-b")]
         self.assertEqual(est({"gpu:a": 2 * GB, "gpu:b": GB}, gpu, 1, 0)[0], (300.0, "T-b"))  # either card will do
         self.assertEqual(est({"gpu:a": 2 * GB, "gpu:b": GB}, gpu, 2, 0)[0], (500.0, "T-a"))  # it needs both
+
+    def test_a_busy_gpu_does_not_hide_an_estimate_for_another_card(self):
+        est = self.j.start_estimate
+        gpu = [(300.0, {"gpu:b": 4 * GB}, "T-b")]
+        self.assertEqual(est({"gpu:a": 0.0, "gpu:b": GB}, gpu, 1, 0)[0], (300.0, "T-b"))
+        got, why = est({"gpu:a": 0.0, "gpu:b": GB}, gpu, 2, 0)
+        self.assertIsNone(got)
+        self.assertIn("1 of the GPUs it could use is busy", why)
+
+    def test_a_pilot_short_only_of_cpu_gets_a_cpu_estimate(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=40 * GB, busy=7.5)], [], [], 100)
+        lack = self.j._lack(self.s, r, held(cpus=2, pilot=True))
+        self.assertEqual(set(lack), {"cpu"})  # it has its RAM floor, so it lacks no RAM
+        got, why = self.j.start_estimate(lack, [(900.0, {"ram": GB, "cpu": 2}, "T-a")])
+        self.assertEqual(got, (900.0, "T-a"), why)
+
+    def test_a_pilot_lacks_the_ram_it_is_short_of_its_floor(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=11 * GB)], [], [], 100)  # 10 GB of room, floor 16 GB
+        self.assertAlmostEqual(self.j._lack(self.s, r, held(pilot=True))["ram"], 6 * GB, delta=1e6)
+
+    def test_an_estimate_past_its_projected_end_says_any_time_now(self):
+        r = self.j.compute_room(self.s, [sample(100, avail=5 * GB)], [], [], 100)
+        q = held(ram=8 * GB)
+        evil = "T-\x1b[31mred\x07" + "x" * 200
+        text = self.j.Loop._estimate_text(None, q, r, {"ram": GB}, [(1000.0, {"ram": 2 * GB}, evil)], 5000.0)
+        self.assertIn("past its projected end", text)
+        self.assertIn("any time now", text)
+        self.assertNotIn("should free about", text)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x07", text)
+        self.assertIn("T-[31mred" + "x" * 48 + "...", text)  # cut to 60 characters
+        text = self.j.Loop._estimate_text(None, q, r, {"ram": GB}, [(9000.0, {"ram": 2 * GB}, "T-a")], 5000.0)
+        self.assertIn("should free about", text)
+
+    def test_the_suggestion_always_parses_to_an_accepted_limit(self):
+        # a floor of 5.125 GB wants 4.1 GB at 1.25x, and "4.1G" parses to 4099999999 bytes, one under
+        for kernel_peak in range(10 ** 9, 6 * 10 ** 9, 7777777):
+            n = self.j._resize_suggestion(self.s, GB, 0, kernel_peak)
+            self.assertGreaterEqual(self.j.ram_limit(self.s, self.j._parse_size(self.j._size_arg(n))),
+                                    self.j._resize_floor(self.s, GB, 0, kernel_peak), kernel_peak)
+        self.assertGreaterEqual(self.j._resize_floor(self.s, GB, 0, 5 * GB), 5 * GB)  # memory.peak counts
+
+    def test_a_held_resize_restarts_the_fairness_measure(self):
+        adm = self.j.Admission(self.s)
+        q = {"token": "c" * 32, "size": {"cpus": 1, "ram": 8 * GB}, "fair_base": {"ram": GB}, "fair_base_at": 100.0,
+             "fair_passed": {"d" * 32: {"ram": 1}}, "state": "held"}
+        adm.write_json(adm.resize_path(q["token"]), {"size": {"cpus": 1, "ram": 2 * GB},
+                                                     "resized": [{"t": 50.0}]})
+        self.assertEqual(adm.overlay(dict(q))["fair_base"], {"ram": GB})  # a resize older than the measure
+        adm.write_json(adm.resize_path(q["token"]), {"size": {"cpus": 1, "ram": 2 * GB},
+                                                     "resized": [{"t": 50.0}, {"t": 200.0}]})
+        got = adm.overlay(dict(q))
+        self.assertNotIn("fair_base", got)
+        self.assertNotIn("fair_passed", got)
+        os.remove(adm.resize_path(q["token"]))
+
+    def test_like_last_prefers_the_newest_run_that_exited_0(self):
+        adm = self.j.Admission(self.s)
+        cap = {"mem_total": 64 * GB, "threads": 8, "gpus": []}
+        con = adm.db()
+        rows = [("1" * 32, "T-last", "exit", 0, 1000.0, 2 * GB), ("2" * 32, "T-last", "pilot time limit", None, 2000.0,
+                                                                   GB // 2)]
+        for tok, task, how, ex, ended, peak in rows:
+            con.execute("INSERT INTO jobs (token, task, how, exit, ended, peak_ram, peak_cpu, peak_samples, gpus) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 1.0, 10, '[]')", (tok, task, how, ex, ended, peak))
+        con.execute("INSERT INTO jobs (token, task, how, exit, ended, peak_ram, peak_cpu, peak_samples, gpus) "
+                    "VALUES (?, 'T-pilot-only', 'pilot time limit', NULL, 3000.0, ?, 1.0, 10, '[]')", ("3" * 32, GB))
+        con.commit()
+        con.close()
+        size, source, _, like_from = self.j._size_from(self.s, adm, cap, {"task": "T-last", "admission": {"like": "last"}})
+        self.assertEqual(like_from, "1" * 32)  # the older complete run, not the newer pilot
+        self.assertEqual(size["ram"], int(2 * GB * 1.25))
+        like_from = self.j._size_from(self.s, adm, cap, {"task": "T-pilot-only", "admission": {"like": "last"}})[3]
+        self.assertEqual(like_from, "3" * 32)  # no run exited 0: the pilot
+        self.assertIn("pilot stopped at its time limit", self.j._like_source_text(adm, "3" * 32))
 
     def test_what_a_held_job_lacks(self):
         r = self.j.compute_room(self.s, [sample(100, avail=5 * GB, busy=7.0, gpus={CARD: card(20 * GB)})], [], [], 100)
@@ -831,9 +893,11 @@ class LoopTests(Base):
         m = self.j.Measure(proc=self.host.proc, gpu_file=self.host.gpu_file)
         return self.j.Loop(self.settings, measure=m, clock=clock)
 
-    def submit_sized(self, command, protocol=5, **admission):
+    def submit_sized(self, command, protocol=5, group=None, **admission):
         req = {"protocol": protocol, "command": command, "task": "T-adm", "cwd": self.d.dir, "session": "test",
                "from": "test", "env": {}, "admission": admission}
+        if group:
+            req["group"] = group
         p = subprocess.run([sys.executable, JOB, "_host", "submit"], input=json.dumps(req), capture_output=True,
                            text=True, env=self.d.env(**self.env()), timeout=60)
         return json.loads(p.stdout.strip().splitlines()[-1])
@@ -960,7 +1024,8 @@ class LoopTests(Base):
         # --like last: the last good run of the same task id here, named with its peaks
         r3 = self.submit_sized("echo sized-last", like="last")
         self.assertTrue(r3["ok"], r3)
-        self.assertIn("last good run of T-adm here, #%d (pilot stopped at its time limit" % tid, r3["data"]["sized"])
+        self.assertIn("no run of T-adm here exited 0, so it is sized from the newest pilot that reached its time limit, #%d (pilot "
+                      "stopped at its time limit" % tid, r3["data"]["sized"])
         self.assertIn("peaks", r3["data"]["sized"])
         with open(os.path.join(self.settings["state_dir"], "queue", r3["data"]["token"] + ".json")) as f:
             self.assertEqual(json.load(f)["like_from"], tok)
@@ -2296,10 +2361,229 @@ class LoopTests(Base):
             self.assertIn("waiting behind an older job, T-adm (token %s), that needs: needs 6.0 GB RAM"
                           % big["data"]["token"], why)
             self.assertIn("start estimate: none known: a running job that holds that room has no projected end", why)
+            self.assertNotIn("exit 137", why)  # the older job's hint is its own, said once
         finally:
             for r in [first] + tiny:
                 self.job("kill", "local", str(r["data"]["id"]))
             self.d.pueue("remove", str(big["data"]["id"]))
+
+    # -- review 1 of TASK-007.01-04 ------------------------------------------------------------------------------
+
+    def running_job(self, command="python3 -c 'b = bytearray(60 * 1024 * 1024); import time; time.sleep(300)'",
+                    min_peak=60 * MiB, **over):
+        """A job sized 2 CPU, 400 MiB, running and measured at least 3 times, with a loop on a settable clock."""
+        self.write_settings(oversize_after_min=1, **over)
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized(command, cpus=2, ram=400 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.addCleanup(lambda: self.job("kill", "local", str(tid)))
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+        self.assertTrue(self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= min_peak
+                                    and loop.peaks[tok]["n"] >= 3, n=40))
+        return loop, tid, tok, now
+
+    def drop(self, tid):
+        """Remove a test's held task, if it is still there."""
+        subprocess.run(["pueue", "-c", self.d.cfg, "remove", str(tid)], capture_output=True)
+
+    def memory_max(self, loop, tok):
+        with open(os.path.join(loop.m.scopes()[tok], "job", "memory.max")) as f:
+            return int(f.read())
+
+    def counted(self, tok):
+        with open(os.path.join(self.state, "room.json")) as f:
+            return [x for x in json.load(f)["jobs"] if x["token"] == tok][0]["ram_counted"]
+
+    def test_an_out_of_memory_verdict_names_the_limit_it_ended_under(self):
+        loop, tid, tok, now = self.running_job(
+            "python3 -c 'import time; b = bytearray(60 * 1024 * 1024); time.sleep(12); "
+            "c = bytearray(300 * 1024 * 1024); c[::4096] = b\"x\" * len(c[::4096]); time.sleep(100)'")
+        p = self.job("resize", "local", str(tid), "--ram", "100Mi", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        limit = self.j.ram_limit(self.settings, 100 * MiB)
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done", n=120))
+        p = self.wait(tid, tok)
+        self.assertIn("over its RAM limit of %s" % self.j._gb(limit), p.stdout)
+        self.assertNotIn(self.j._gb(self.j.ram_limit(self.settings, 400 * MiB)), p.stdout)
+        self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+        final = self.j._read_kv(os.path.join(self.j.STATE_DIR, "results", tok + ".final"))
+        self.assertLess(abs(int(final["memory.max"]) - limit), 65536)  # the shim read the limit at its end
+        self.assertEqual(self.record(tok)["memory_max"], int(final["memory.max"]))
+        self.assertEqual(self.record(tok)["how"], "memory limit")
+
+    def test_a_cpus_only_resize_never_raises_the_ram_limit(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        self.host.tick()
+        loop.cycle()
+        counted = self.counted(tok)
+        self.write_settings(oversize_after_min=1, ram_hard_factor=2.0)  # changed since the job was released
+        p = self.job("resize", "local", str(tid), "--cpus", "1", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(self.counted(tok), counted)
+        # a --ram whose limit by the new factor is above the limit it runs under is refused
+        p = self.job("resize", "local", str(tid), "--ram", "350Mi", **self.env())
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("never raised", p.stdout)
+        self.assertEqual(self.memory_max(loop, tok), was)
+
+    def test_a_running_resize_whose_scope_is_not_found_is_refused_and_changes_nothing(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        self.host.tick()
+        loop.cycle()
+        counted = self.counted(tok)
+        env = dict(self.env(), JOB_TEST_CGROUP="/nonexistent")
+        p = self.job("resize", "local", str(tid), "--ram", "300Mi", **env)
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("not among this user's job scopes", p.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "resize", tok + ".json")))
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(self.counted(tok), counted)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        # and a recorded count below the cgroup's real limit (as that resize left it) counts at the real limit
+        q = self.queue_file(tok)
+        q.update(memory_max=150 * MiB, ram_counted=150 * MiB)
+        with open(os.path.join(self.state, "queue", tok + ".json"), "w") as f:
+            json.dump(q, f)
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(self.memory_max(loop, tok), was)
+        self.assertGreaterEqual(self.counted(tok), was)
+
+    def test_the_running_floor_counts_the_kernels_peak_and_cpus_their_measured_use(self):
+        loop, tid, tok, now = self.running_job(
+            "python3 -c 'b = bytearray(200 * 1024 * 1024); b[::4096] = b\"x\" * len(b[::4096]); del b; "
+            "c = bytearray(20 * 1024 * 1024); import time; time.sleep(300)'", min_peak=15 * MiB)
+        # the spike came and went between samples: the record knows only the use now
+        con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"))
+        con.execute("UPDATE jobs SET peak_ram = ?, peak_cpu = 1.5 WHERE token = ?", (30 * MiB, tok))
+        con.commit()
+        con.close()
+        was = self.memory_max(loop, tok)
+        p = self.job("resize", "local", str(tid), "--ram", "80Mi", **self.env())  # limit 120 MiB, over 1.25 x 30 MiB
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("memory.peak", p.stdout)
+        self.assertEqual(self.memory_max(loop, tok), was)
+        p = self.job("resize", "local", str(tid), "--cpus", "1", **self.env())
+        self.assertEqual(p.returncode, 205, p.stdout)
+        self.assertIn("under its measured CPU use, 1.50 threads", p.stdout)
+
+    def test_a_job_ends_under_the_queue_lock_so_a_resize_cannot_outlive_it(self):
+        import threading
+        loop = self.loop()
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        self.assertTrue(self.cycles(loop, lambda: self.queue_file(tok)["state"] == "released"))
+        for _ in range(200):  # it ends; no cycle runs, so the loop has not ended it yet
+            if self.status(tid) == "Done":
+                break
+            time.sleep(0.05)
+        time.sleep(0.5)
+        adm = self.j.Admission(self.settings)
+        fd = adm.lock("queue.lock")  # a resize in progress
+        t = threading.Thread(target=lambda: (self.host.tick(), loop.cycle()))
+        try:
+            t.start()
+            time.sleep(1.5)
+            self.assertTrue(os.path.exists(os.path.join(self.state, "queue", tok + ".json")))  # the end waits
+            adm.write_json(adm.resize_path(tok), {"size": {"cpus": 1, "ram": 50 * MiB}, "resized": [{"t": 1.0}]})
+        finally:
+            os.close(fd)
+        t.join(60)
+        self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "queue", tok + ".json")))
+        self.assertFalse(os.path.exists(adm.resize_path(tok)))
+        self.assertIsNotNone(self.record(tok)["ended"])
+        # an orphan resize file (from a host before this fix) is swept
+        adm.write_json(adm.resize_path("f" * 32), {"size": {}})
+        self.host.tick()
+        loop.cycle()
+        self.assertFalse(os.path.exists(adm.resize_path("f" * 32)))
+
+    def test_a_failed_resize_changes_nothing(self):
+        loop, tid, tok, now = self.running_job()
+        was = self.memory_max(loop, tok)
+        os.environ.update(self.env())  # host_resize runs in this process
+        self.addCleanup(os.environ.pop, "JOB_ADMISSION_CONFIG", None)
+        real = self.j.Admission.record
+
+        def failing(adm, con, row):
+            if "resized" in row:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(adm, con, row)
+        self.j.Admission.record = failing
+        try:
+            with self.assertRaises(self.j.JobError) as e:
+                self.j.host_resize({"id": tid, "ram": 300 * MiB})
+        finally:
+            self.j.Admission.record = real
+        self.assertIn("was not resized", str(e.exception))
+        self.assertEqual(self.memory_max(loop, tok), was)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "resize", tok + ".json")))
+        self.assertIsNone(self.record(tok)["resized"])
+
+    def test_a_held_resize_wakes_the_loop(self):
+        self.host.set(avail=3 * GB)
+        r = self.submit_sized("true", cpus=1, ram=4 * GB)
+        self.addCleanup(self.drop, r["data"]["id"])
+        q = os.path.join(self.state, "queue")
+        os.utime(q, (1.0, 1.0))
+        p = self.job("resize", "local", str(r["data"]["id"]), "--ram", "1G", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertGreater(os.path.getmtime(q), 1.0)
+
+    def test_the_first_held_line_follows_the_loops_order(self):
+        # a paused group, and a full one
+        self.d.pueue("group", "add", "rv-paused")
+        self.d.pueue("pause", "--group", "rv-paused")
+        self.d.pueue("group", "add", "rv-full")
+        self.d.pueue("parallel", "1", "--group", "rv-full")
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB, group="rv-paused")
+        self.addCleanup(self.drop, r["data"]["id"])
+        self.assertIn("its group rv-paused is paused", r["data"]["held_reason"])
+        busy = self.d.pueue("add", "--group", "rv-full", "--", "sleep", "60")
+        self.addCleanup(lambda: self.d.pueue("kill", "--group", "rv-full"))
+        r = self.submit_sized("true", cpus=1, ram=100 * MiB, group="rv-full")
+        self.addCleanup(self.drop, r["data"]["id"])
+        self.assertIn("its group rv-full is full", r["data"]["held_reason"])
+        self.assertTrue(busy)
+
+    def test_the_first_held_line_says_when_the_fairness_rule_holds_a_job(self):
+        now = [time.time()]
+        self.host.set(avail=12 * GB)
+        loop = self.loop(clock=lambda: now[0])
+        first = self.submit_sized("sleep 60", cpus=1, ram=4 * GB)  # runs, counted at its 6 GB limit: 5 GB left
+        self.addCleanup(lambda: self.job("kill", "local", str(first["data"]["id"])))
+        self.assertTrue(self.cycles(loop, lambda: self.status(first["data"]["id"]) == "Running"))
+        big = self.submit_sized("echo big", cpus=1, ram=4 * GB)  # lacks 1 GB of RAM
+        self.addCleanup(self.drop, big["data"]["id"])
+        self.assertIn("ends in exit 137", big["data"]["held_hint"])  # its size was not measured
+        now[0] += 120
+        self.host.tick()
+        loop.cycle()
+        # fits the 5 GB room (3 GB limit), but takes far over a tenth of the 1 GB the oldest lacks
+        r = self.submit_sized("echo young", cpus=1, ram=2 * GB)
+        self.addCleanup(self.drop, r["data"]["id"])
+        self.assertIn("waiting behind an older job, T-adm (token %s)" % big["data"]["token"], r["data"]["held_reason"])
+        self.assertNotIn("exit 137", r["data"]["held_reason"])
+
+    def test_scopes_of_jobs_this_loop_did_not_admit_are_outside_use(self):
+        loop = self.loop()
+        r = self.submit_sized("sleep 30", cpus=1, ram=100 * MiB)
+        self.addCleanup(lambda: self.job("kill", "local", str(r["data"]["id"])))
+        tok = r["data"]["token"]
+        other = "a" * 32
+        got = loop.own_scopes({tok: "/x", other: "/y"})
+        self.assertEqual(got, {tok: "/x"})
 
     def test_admission_status(self):
         p = self.job("admission", "local", "status", **self.env())
