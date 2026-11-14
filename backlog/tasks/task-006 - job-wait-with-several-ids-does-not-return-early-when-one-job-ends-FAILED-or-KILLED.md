@@ -3,10 +3,10 @@ id: TASK-006
 title: >-
   job wait with several ids does not return early when one job ends FAILED or
   KILLED
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-14T16:15:00Z'
-updated_date: '2026-11-14T17:41:00Z'
+updated_date: '2026-11-14T19:24:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -19,8 +19,16 @@ ordinal: 13000
 Found 2026-11-14 11:20 ET by a review of the Starla full HMI run staging. wait_all in bin/job returns early only for URGENT = STALLED, ALERT, UNREACHABLE, GONE, WRAPPER_ERROR (around line 99). A FAILED (e.g. exit 137 RAM-limit kill) or KILLED (daemon restart) job in a multi-id wait stays silent until every job in the wait has ended, so a long queue (Starla: ~197 month jobs over weeks) learns of the failure days late. Also: a job printing a status line every minute is never STALLED even when its worker hangs (log growth only). Proposed: return early (or report and continue) on any job ending non-SUCCESS; optional stall rule on a pattern of progress lines.
 <!-- SECTION:DESCRIPTION:END -->
 
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [x] #1 A wait on several ids ends as soon as one ends badly (anything but SUCCESS or PILOT_TIME_LIMIT), naming it and giving the exact command to keep waiting on the rest
+- [x] #2 N of M ended counts only jobs that really ended
+- [x] #3 ID:TOKEN pairs are accepted; --token with several ids is refused with that hint, documented
+- [ ] #4 Remote test (tests.test_remote against a real host) passes
+<!-- AC:END -->
+
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Audit 2026-11-14 item 12 (Kevin: fix now): also (a) a multi-id wait ends for all ids when one is STALLED, (b) 'N of M ended' counts STALLED/ALERT jobs that still run, (c) --token is refused with several ids (exit 205), undocumented; accept id:token pairs.
+2026-11-14 14:10 ET, commit e36eaf9. Not built: the optional stall rule on a pattern of progress lines (not in this batch's brief). Tests: MultiWaitTests (5), updated multi-wait tests.
 <!-- SECTION:NOTES:END -->
