@@ -4,6 +4,7 @@ title: job kill leaves the job's child processes running
 status: To Do
 assignee: []
 created_date: '2026-11-06T21:10:00Z'
+updated_date: '2026-11-14T17:41:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -22,3 +23,9 @@ Reported 2026-11-06 16:09 ET by the MARVELS optics lead session (via the MARVELS
 - [ ] #2 job kill ends every descendant process on local, sttp1 and sttp2
 - [ ] #3 A test covers it
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Audit 2026-11-14 item 15 (Kevin: fix now): also kill help text says only 'running'; removing a queued job makes its waiting job run end GONE 204 (shown as failed) - end it KILLED 'removed by job kill'; kill prints only 'killed'; add --task NAME.
+<!-- SECTION:NOTES:END -->
