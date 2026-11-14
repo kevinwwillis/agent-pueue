@@ -1401,6 +1401,53 @@ class LoopTests(Base):
             svc.kill()
             svc.wait()
 
+    def fake_process(self, pid, start):
+        d = os.path.join(self.host.proc, str(pid))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "stat"), "w") as f:
+            f.write("%d (svc) S 1 %d %d 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 %d 0 0\n" % (pid, pid, pid, start))
+        return d
+
+    def test_a_reload_right_after_its_process_exits_is_not_refused_against_its_own_dead_hold(self):
+        loop = self.loop()
+        self.host.set(avail=50 * GB)
+        self.host.tick()
+        loop.cycle()
+        d = self.fake_process(6161, 100)
+        first = self.hold("--ram", "30G", "--name", "svc", "--while-pid", "6161")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.host.tick()
+        loop.cycle()  # the snapshot now counts the hold: 49 - 30 = 19 GB left
+        self.assertAlmostEqual(loop.room["ram"]["room"], 19 * GB, delta=2 * MiB)
+        os.remove(os.path.join(d, "stat"))  # the service exits and reloads at once, before the loop's next cycle
+        self.fake_process(6162, 200)
+        again = self.hold("--ram", "30G", "--name", "svc", "--while-pid", "6162")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        holds = os.listdir(os.path.join(self.state, "holds"))
+        self.assertEqual(holds, [again.stdout.strip() + ".json"])  # the dead hold was ended, not left to the loop
+        con = sqlite3.connect(os.path.join(self.state, "admission.sqlite"))
+        how = con.execute("SELECT how FROM holds WHERE id = ?", (first.stdout.strip(),)).fetchone()[0]
+        con.close()
+        self.assertEqual(how, "process 6161 exited")
+        big = self.hold("--ram", "25G", "--name", "other")  # the live hold still counts: 19 GB is left
+        self.assertEqual(big.returncode, 206, big.stdout + big.stderr)
+
+    def test_a_gpu_hold_whose_process_exited_is_credited_back_on_its_card(self):
+        self.model_card()
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        d = self.fake_process(6171, 100)
+        first = self.hold("--gpu", "0", "--mem", "18G", "--name", "model", "--while-pid", "6171")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.host.tick()
+        loop.cycle()
+        refused = self.hold("--gpu", "0", "--mem", "18G", "--name", "model2")
+        self.assertEqual(refused.returncode, 206, refused.stdout + refused.stderr)
+        os.remove(os.path.join(d, "stat"))
+        again = self.hold("--gpu", "0", "--mem", "18G", "--name", "model")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+
     def test_a_hold_granted_during_a_cycle_counts_as_a_hold_on_its_card(self):
         self.model_card()
         loop = self.loop()

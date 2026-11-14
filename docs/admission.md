@@ -449,7 +449,10 @@ hold ends when that process exits), `--unit NAME` or `--cgroup PATH` (a service 
 `--ttl MIN` (it ends unless renewed with `job hold --renew <id>`). A hold on a unit or cgroup also ends once that
 unit or cgroup, seen before, is gone. Under the queue lock, a hold is granted only if the card has the room:
 the loop writes its snapshot under the same lock after each cycle's releases, and the grant takes from that
-room the holds granted since. In each cycle the loop reads the holds again under the lock before it releases,
+room the holds granted since. Before it counts, the grant ends every hold whose owner is already gone, by the
+loop's own test (its process exited, its time to live ran out, or its unit or cgroup, seen before, is gone), and
+adds back what the snapshot counted for those (at least their size), so a service that reloads right after its
+process exits is not refused against its own dead hold. In each cycle the loop reads the holds again under the lock before it releases,
 and takes out of its room any hold granted since it measured. A hold the host has no room for is refused at
 once with its own exit status (206, `NO_ROOM`), apart from admission being unavailable, and the service decides
 what to do. A caller that wants room kept for a later step registers a hold the same way.

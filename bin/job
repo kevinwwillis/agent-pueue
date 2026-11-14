@@ -3191,6 +3191,10 @@ def host_hold(req):
         if not snap.get("room"):
             raise JobError("the admission loop on %s is still measuring the host, so no hold can be granted yet"
                            % socket.gethostname())
+        # a hold whose owner is already gone (its process exited, its time to live ran out, its unit or cgroup went)
+        # still counts in the snapshot until the loop's next cycle: end it now and credit back what the snapshot
+        # counted for it, so a service that reloads at once is not refused against its own dead hold
+        credit_ram, credit_gpu = _end_dead_holds(adm, snap)
         # the snapshot is written under this lock after each cycle's releases; holds since then are not in it
         newer = [h for h in _holds(adm) if h["start"] > snap.get("written", snap["t"])]
         if ram:
@@ -3199,7 +3203,7 @@ def host_hold(req):
                 raise JobError("the admission loop on %s runs job %s, which does not count RAM holds as job %s does; "
                                "no RAM hold can be granted until it restarts" % (socket.gethostname(), running or "?",
                                                                                  VERSION))
-            free_ram = snap["room"]["ram"]["room"] - sum(h.get("ram") or 0 for h in newer)
+            free_ram = snap["room"]["ram"]["room"] + credit_ram - sum(h.get("ram") or 0 for h in newer)
             if ram > free_ram:
                 raise NoRoom("%s has %s of RAM free to hold; the hold needs %s" % (
                     socket.gethostname(), _gbs(max(0, free_ram)), _gbs(ram)))
@@ -3212,8 +3216,9 @@ def host_hold(req):
                 raise JobError("no GPU %s on %s" % (want, socket.gethostname()))
             g, index = gpus[gid], gpus[gid]["index"]
             on_card = [h for h in newer if h.get("uuid") == gid]
-            free = g["room"] - sum(h.get("size") or 0 for h in on_card)
-            if not g.get("jobs") and not g.get("holds") and not g.get("others", 1) and not on_card:
+            free = g["room"] + credit_gpu.get(gid, 0) - sum(h.get("size") or 0 for h in on_card)
+            holds_left = (g.get("holds") or 0) - credit_gpu.get(gid, 0)
+            if not g.get("jobs") and holds_left <= 0 and not g.get("others", 1) and not on_card:
                 # the headroom keeps parties on one card apart; a hold alone on its card may use it (a snapshot
                 # from before the loop counted other users gives no headroom)
                 free += settings["gpu_headroom_mb"] * MB
@@ -3247,6 +3252,29 @@ def host_hold(req):
         return out
     finally:
         os.close(fd)
+
+
+def _end_dead_holds(adm, snap):
+    """End every hold whose owner is gone, by the loop's own test (update_holds), and return what the snapshot
+    counted for those it counted: (RAM bytes, {GPU uuid: bytes}). The snapshot counted a hold at the larger of its
+    size and its measured use; only its size is credited back, the safe side."""
+    m = _measure_from_env()
+    counted = {h.get("id") for h in snap.get("holds") or []}
+    ram, gpu = 0, {}
+    for h in _holds(adm):
+        alive, why = _hold_alive(h, m.proc)
+        if alive and h.get("seen") and (h.get("unit") or h.get("cgroup")):
+            cgs = _hold_cgroups(h)  # None: systemd could not be asked, so the hold is kept
+            if cgs is not None and not any(os.path.isdir(m.cg + c) for c in cgs):
+                alive, why = False, "its unit or cgroup is gone"
+        if alive:
+            continue
+        _end_hold(adm, h, why)
+        if h.get("id") in counted:
+            ram += h.get("ram") or 0
+            if h.get("uuid"):
+                gpu[h["uuid"]] = gpu.get(h["uuid"], 0) + (h.get("size") or 0)
+    return ram, gpu
 
 
 def _holds(adm):

@@ -330,7 +330,9 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   or `--cgroup PATH` for its processes, and optionally `--ttl MIN` (renew with `job hold HOST --renew ID`). It
   prints the hold id; `job release HOST ID` ends it. A hold is granted only if the host has the room now, else
   refused at once with exit 206 (`NO_ROOM`). A GPU hold alone on its card may use the card's headroom. Holds and
-  jobs are first come.
+  jobs are first come. A hold whose process (or unit or cgroup) is already gone is ended by the next `job hold` on
+  that host, which gets its room back at once, so a service that reloads right away is not refused against its own
+  old hold.
 - `job history [HOST ...] [--task T]` lists the records on admission hosts, newest first: size (for a pilot,
   the free room it was counted at), measured peaks, how each job ended, and its token for `--like`.
 - `job admission HOST start|stop|status` installs and starts, stops, or shows the host's admission loop
