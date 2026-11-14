@@ -1204,7 +1204,7 @@ class LoopTests(Base):
             self.d.pueue("start", "--group", "palert")
         self.assertEqual(w.returncode, 201, out + err)
         self.assertIn("job: ALERT", out)
-        self.assertIn("its pueue group palert is paused", out)
+        self.assertIn("its pueue group palert on local is paused; start it with: job resume local --group palert", out)
 
     def test_auto_places_on_a_host_with_room_or_holds(self):
         loop = self.loop()
@@ -1496,6 +1496,34 @@ class LoopTests(Base):
         self.assertEqual(how, "process 6161 exited")
         big = self.hold("--ram", "25G", "--name", "other")  # the live hold still counts: 19 GB is left
         self.assertEqual(big.returncode, 206, big.stdout + big.stderr)
+
+    def test_a_reload_after_the_loop_itself_ended_the_dead_hold_is_not_refused(self):
+        loop = self.loop()
+        self.host.set(avail=50 * GB)
+        self.host.tick()
+        loop.cycle()
+        d = self.fake_process(6181, 100)
+        first = self.hold("--ram", "30G", "--name", "svc", "--while-pid", "6181")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.host.tick()
+        loop.cycle()
+        self.assertAlmostEqual(loop.room["ram"]["room"], 19 * GB, delta=2 * MiB)
+        os.remove(os.path.join(d, "stat"))  # the service exits; the loop's next cycle ends its hold
+        self.host.tick()
+        loop.cycle()
+        self.assertEqual(loop.holds, [])
+        self.assertAlmostEqual(loop.room["ram"]["room"], 49 * GB, delta=2 * MiB)  # what it counted came back
+        self.fake_process(6182, 200)
+        again = self.hold("--ram", "30G", "--name", "svc", "--while-pid", "6182")  # the reload, right after
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+
+    def test_the_grant_asks_systemd_outside_the_queue_lock(self):
+        with open(JOB) as f:
+            src = f.read()
+        body = src[src.index("def host_hold(req):"):src.index("def _gone_hold_cgroups(adm):")]
+        self.assertLess(body.index("_gone_hold_cgroups(adm)"), body.index('adm.lock("queue.lock")'))
+        dead = src[src.index("def _end_dead_holds("):src.index("def _holds(adm):")]
+        self.assertNotIn("_hold_cgroups(", dead)
 
     def test_a_gpu_hold_whose_process_exited_is_credited_back_on_its_card(self):
         self.model_card()

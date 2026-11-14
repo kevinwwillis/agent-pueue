@@ -98,6 +98,7 @@ EXIT = {
     "NO_ROOM": 206,
     "PILOT_TIME_LIMIT": 207,
     "KILLED_BY_RESTART": 208,
+    "UNTRACKED": 209,
 }
 # Outcomes that end a multi-job wait at once (the agent must look now).
 URGENT = ("STALLED", "ALERT", "UNREACHABLE", "GONE", "WRAPPER_ERROR")
@@ -231,14 +232,33 @@ def _daemon_start(proc="/proc"):
     return None
 
 
-RESTART_WINDOW_S = 24 * 3600  # a job killed this long before the daemon's start may have been ended by its stop
+STOP_SPREAD_S = 5.0  # a clean stop of the pueue daemon kills its running tasks within this many seconds of each other
 
 
-def _killed_by(s):
+def _stop_time(st, d):
+    """When the previous pueue daemon stopped, from the state: the last task event (queued, started, ended) before
+    the daemon now running started at d. After a clean stop nothing happens until the next start, so the tasks the
+    stop killed are the last thing that happened; None when the state holds no event before d."""
+    last = None
+    for t in (st or {}).get("tasks", {}).values():
+        x = _summarize_task(t)
+        for k in ("enqueued_at", "start", "end"):
+            v = _parse_time(x.get(k))
+            if v is not None and v.timestamp() < d and (last is None or v.timestamp() > last):
+                last = v.timestamp()
+    return last
+
+
+def _killed_by(s, st=None):
     """Who ended a Killed task: "job kill" (or the admission loop's reason), "daemon" when it was running when the
-    pueue daemon stopped, or None when unknown. A daemon restart is read from the times: the task started before
-    the daemon now running did, and ended at most RESTART_WINDOW_S before the daemon started (a stop kills its
-    running tasks then) or within two minutes after (a daemon that died marks them Killed when it starts again)."""
+    pueue daemon stopped, or None when unknown. Only a task that started before the daemon now running (started at
+    d) can have been killed by a restart, and the restart must show in the times:
+      - it ended at or after d: the daemon died without stopping it (SIGKILL, out of memory, a crash), and the
+        new daemon marked it Killed when it started;
+      - it ended before d, within STOP_SPREAD_S of the last task event before d (st's tasks): a clean stop kills
+        every running task at once and nothing happens after it until the next start.
+    For "daemon", s gets daemon_start and alive_pids: the job's processes still alive, found by its token as job
+    kill finds them (a daemon that died outright does not kill its tasks)."""
     if s.get("result") != "Killed":
         return None
     tok = s.get("token")
@@ -251,12 +271,18 @@ def _killed_by(s):
             return "job kill"
     d = _daemon_start()
     start, end = _parse_time(s.get("start")), _parse_time(s.get("end"))
-    if d is None or start is None or end is None:
+    if d is None or start is None or end is None or start.timestamp() >= d:
+        return None
+    if end.timestamp() >= d - 1:  # the second: the pid file's start time and pueue's clock may differ by a little
+        by_restart = end.timestamp() <= d + 120
+    else:
+        stop = _stop_time(st, d)  # no state given: no evidence of the stop
+        by_restart = stop is not None and end.timestamp() >= stop - STOP_SPREAD_S
+    if not by_restart:
         return None
     s["daemon_start"] = d
-    if start.timestamp() < d and d - RESTART_WINDOW_S <= end.timestamp() <= d + 120:
-        return "daemon"
-    return None
+    s["alive_pids"] = sorted(_job_procs(tok)) if tok else []
+    return "daemon"
 
 
 def _pueue_directory():
@@ -398,6 +424,17 @@ def _end_leftovers(token, before, wait_s=3.0):
         time.sleep(0.1)
 
 
+def _token_ok(tok):
+    """Whether tok is a job token as job makes them (32 lowercase hex characters), so it can name a file."""
+    return isinstance(tok, str) and len(tok) == 32 and all(c in "0123456789abcdef" for c in tok)
+
+
+def _env_token(t):
+    """A pueue task's job token, or None when it has none or one job could not have made (it names files)."""
+    tok = (t.get("envs") or {}).get("JOB_TOKEN")
+    return tok if _token_ok(tok) else None
+
+
 def _summarize_task(t):
     status = t.get("status") or {}
     kind = next(iter(status), "Unknown") if isinstance(status, dict) else str(status)
@@ -423,7 +460,7 @@ def _summarize_task(t):
         "enqueued_at": info.get("enqueued_at"),
         "start": info.get("start"),
         "end": info.get("end"),
-        "token": envs.get("JOB_TOKEN"),
+        "token": _env_token(t),
         "session": envs.get("JOB_SESSION"),
         "summary": envs.get("JOB_SUMMARY"),
         "submitted_from": envs.get("JOB_SUBMITTED_FROM"),
@@ -738,27 +775,39 @@ def _session_group_name(session):
     return SESSION_GROUP_PREFIX + clean
 
 
+SESSION_GROUP_KEEP_S = 24 * 3600  # a session group's finished jobs are kept this long (job ls, job wait --mine)
+
+
 def _session_group(st, session):
-    """Make sure the session's own group exists (runs one job at a time) and return its name. Groups job made for
-    sessions are remembered in STATE_DIR/session-groups (each submit touches its mark); one that holds no task and
-    was last used over SESSION_GROUP_IDLE_S ago is removed here."""
+    """Make sure the session's own group exists and return its name. It runs as many jobs at a time as the host's
+    default group. Groups job made for sessions are remembered in STATE_DIR/session-groups (each submit touches its
+    mark). A group whose mark is over SESSION_GROUP_IDLE_S old, that holds no unfinished job and whose jobs all
+    ended over SESSION_GROUP_KEEP_S ago is removed here, with those finished jobs (their logs go with them; their
+    exit records stay in STATE_DIR/results for SCRIPT_KEEP_DAYS)."""
     name = _session_group_name(session)
     marks = os.path.join(STATE_DIR, "session-groups")
     os.makedirs(marks, mode=0o700, exist_ok=True)
     groups = st.setdefault("groups", {})
-    used = {t.get("group") for t in st.get("tasks", {}).values()}
+    now = time.time()
     for other in os.listdir(marks):
         if other == name:
             continue
         try:
-            if time.time() - os.path.getmtime(os.path.join(marks, other)) < SESSION_GROUP_IDLE_S:
+            if now - os.path.getmtime(os.path.join(marks, other)) < SESSION_GROUP_IDLE_S:
                 continue  # a submit may be about to add its job to it
-            if other in groups and other not in used:
+            if other in groups:
+                mine = [_summarize_task(t) for t in st.get("tasks", {}).values() if t.get("group") == other]
+                if any(x["status"] != "Done" for x in mine):
+                    continue
+                ends = [_parse_time(x.get("end")) for x in mine]
+                if any(e is None or now - e.timestamp() < SESSION_GROUP_KEEP_S for e in ends):
+                    continue  # its results are still shown and reported
+                if mine:  # these exact tasks, all finished: a job submitted meanwhile is not among them
+                    _pueue(["remove"] + [str(int(x["id"])) for x in mine])
                 _pueue(["group", "remove", other])
                 groups.pop(other, None)
-            if other not in groups:
-                os.remove(os.path.join(marks, other))
-        except (JobError, OSError):
+            os.remove(os.path.join(marks, other))
+        except (JobError, OSError, ValueError):
             pass  # a task arrived in it meanwhile, or another submit removed it: try again next time
     with open(os.path.join(marks, name), "w"):
         pass  # touched: in use now
@@ -766,7 +815,10 @@ def _session_group(st, session):
         p = _pueue(["group", "add", name], check=False)
         if p.returncode != 0 and name not in _pueue_status().get("groups", {}):  # not a submit that raced us
             raise JobError("could not create the pueue group %s: %s" % (name, _pueue_error_text(p.stderr or p.stdout)))
-        groups[name] = {"status": "Running", "parallel_tasks": 1}  # pueue's limit for a new group is 1
+        n = (groups.get("default") or {}).get("parallel_tasks") or 1
+        if p.returncode == 0 and n > 1:  # pueue's limit for a new group is 1
+            _pueue(["parallel", str(int(n)), "--group", name], check=False)
+        groups[name] = {"status": "Running", "parallel_tasks": n}
     return name
 
 
@@ -793,7 +845,7 @@ def host_submit(req, _admission_checked=False):
         if bad:
             raise JobError("%s is set by admission; do not pass it with --env" % ", ".join(bad))
     token = req.get("token") or uuid.uuid4().hex
-    if not all(c in "0123456789abcdef" for c in token):
+    if not _token_ok(token):
         raise JobError("bad token")
     st = _pueue_status()
     tokens = {}
@@ -810,7 +862,7 @@ def host_submit(req, _admission_checked=False):
     group = req.get("group")
     if not group and not admitted:
         # without --group, a job queues only behind its own session's jobs, not behind every session's in the shared
-        # default group (which runs one job at a time)
+        # default group
         group = _session_group(st, req.get("session") or "unknown")
     group = group or "default"
     if group != "default" and group not in st.get("groups", {}):
@@ -897,9 +949,11 @@ def host_submit(req, _admission_checked=False):
 
 def host_probe(req):
     tid = int(req["id"])
+    want_token = req.get("token")
+    if want_token is not None and not _token_ok(want_token):
+        raise JobError("bad token %r: a token is the 32-character token job printed" % str(want_token)[:40])
     st = _pueue_status()
     t = st.get("tasks", {}).get(str(tid))
-    want_token = req.get("token")
     if t is None or (want_token and (t.get("envs") or {}).get("JOB_TOKEN") != want_token):
         out = {"found": t is not None, "token_mismatch": t is not None}
         removed = os.path.join(STATE_DIR, "results", "%s.removed" % want_token) if want_token else None
@@ -921,7 +975,7 @@ def host_probe(req):
     s["token_mismatch"] = False
     if s["status"] == "Done":
         s["scope"] = _scope_result(s["token"])
-        s["killed_by"] = _killed_by(s)
+        s["killed_by"] = _killed_by(s, st)
     g = st.get("groups", {}).get(s["group"]) or {}
     s["group_parallel"] = g.get("parallel_tasks")
     s["group_status"] = g.get("status")
@@ -1015,7 +1069,7 @@ def host_ls(req):
     for s in out:
         if s["status"] == "Done" and s.get("token"):
             s["scope"] = _scope_result(s["token"])
-            s["killed_by"] = _killed_by(s)
+            s["killed_by"] = _killed_by(s, st)
         elif s["status"] == "Stashed" and s.get("token"):
             _probe_admission(s, {})
         elif s["status"] == "Running" and s.get("token"):
@@ -1071,7 +1125,11 @@ def host_log(req):
         size = os.path.getsize(path)
     except OSError:
         raise JobError("task %d on %s has no log file (%s)" % (tid, socket.gethostname(), path))
-    n = req.get("lines") if isinstance(req.get("lines"), int) and req["lines"] > 0 else 50
+    n = req.get("lines", 50)
+    if n is None:
+        n = 50
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise JobError("lines must be a whole number of at least 1")
     out = {"id": tid, "log_path": path, "size": size, "status": _task_status(t)}
     if req.get("full"):
         with open(path, "rb") as f:
@@ -1115,7 +1173,7 @@ def host_show(req):
             pass
     if s["status"] == "Done":
         s["scope"] = _scope_result(tok)
-        s["killed_by"] = _killed_by(s)
+        s["killed_by"] = _killed_by(s, st)
     try:
         settings = _admission_settings()
     except JobError:
@@ -1171,7 +1229,7 @@ def host_kill(req):
     if tok and (t.get("envs") or {}).get("JOB_TOKEN") != tok:
         raise JobError("task %d now belongs to a different job; not killed" % tid)
     status = next(iter(t.get("status") or {"?": 0}))
-    token = (t.get("envs") or {}).get("JOB_TOKEN")
+    token = _env_token(t)
     results = os.path.join(STATE_DIR, "results")
     if status in ("Running", "Paused"):
         scoped = bool(token) and os.path.exists(os.path.join(STATE_DIR, "scripts", token + ".shim"))
@@ -1211,6 +1269,15 @@ def host_kill(req):
                     pass
             raise
         return {"id": tid, "action": "removed from the queue"}
+    if status == "Done" and token:
+        # pueue lost track of it (its daemon died without stopping it): its processes are found by the token
+        before = _job_procs(token)
+        if before:  # no job kill mark: its verdict stays KILLED_BY_RESTART (submit it again) once they are gone
+            if os.path.exists(os.path.join(STATE_DIR, "scripts", token + ".shim")):
+                _stop_scope(token)
+            left = _end_leftovers(token, before)
+            return {"id": tid, "action": "killed (pueue had lost track of it)", "processes": len(before),
+                    "left": left}
     raise JobError("task %d is %s; nothing to kill" % (tid, status))
 
 
@@ -2269,7 +2336,7 @@ def _submit_reason(settings, adm, job, st=None):
     if st is not None:
         g = (st.get("groups") or {}).get(job.get("group")) or {}
         if g.get("status") == "Paused":
-            return "its group %s is paused; resume it with job resume" % job["group"], None
+            return "its group %s is paused; start it with: %s" % (job["group"], _resume_command(job["group"])), None
         busy = len([t for t in (st.get("tasks") or {}).values()
                     if t.get("group") == job.get("group") and _task_status(t) in ("Running", "Queued")])
         if g and busy >= (g.get("parallel_tasks") or 1):
@@ -2567,7 +2634,7 @@ def host_resize(req):
         t = _pueue_status().get("tasks", {}).get(str(tid))
         if t is None:
             raise JobError("no task %d on %s" % (tid, host))
-        token = (t.get("envs") or {}).get("JOB_TOKEN")
+        token = _env_token(t)
         if req.get("token") and token != req["token"]:
             raise JobError("task %d now belongs to a different job; not resized" % tid)
         q = adm.read_queue(token) if token else None
@@ -2705,6 +2772,15 @@ def _resize_running(settings, con, q, old, new):
 HOW_LABEL = {"exit": "exit", "memory_limit": "memory limit", "host_oom": "host out of memory", "sigkill": "killed",
              "scope_killed": "killed", "killed": "killed", "setup_error": "wrapper error",
              "wrapper_error": "wrapper error"}
+
+
+def _short_hostname():
+    return socket.gethostname().split(".")[0]
+
+
+def _resume_command(group, host=None):
+    """The command that starts a paused group, for a message (the host as job names it, or this host's name)."""
+    return "job resume %s --group %s" % (host or _short_hostname(), shlex.quote(str(group)))
 
 
 def _task_status(t):
@@ -2870,7 +2946,7 @@ class Loop:
             if st is not None:
                 tasks = {}
                 for _, t in st.get("tasks", {}).items():
-                    tok = (t.get("envs") or {}).get("JOB_TOKEN")
+                    tok = _env_token(t)
                     if tok:
                         tasks[tok] = t
                 self.account(con, now, queue, tasks, use, st)
@@ -3197,8 +3273,8 @@ class Loop:
                     pass
 
     def update_holds(self, now, room, counted):
-        """End holds whose process, time to live, unit or cgroup is gone; take holds this cycle's room did not
-        count (granted since it read them) out of the room."""
+        """End holds whose process, time to live, unit or cgroup is gone, and give back to the room what it counted
+        for them; take holds this cycle's room did not count (granted since it read them) out of the room."""
         live = []
         for h in _holds(self.adm):
             alive, why = _hold_alive(h, self.m.proc, now)
@@ -3207,6 +3283,15 @@ class Loop:
                 alive, why = False, "its unit or cgroup is gone"
             if not alive:
                 _end_hold(self.adm, h, why)
+                if room is not None and h["id"] in counted:
+                    # the room counted it at the larger of its size and its use; its size comes back (the safe
+                    # side, as for a hold ended at a grant), so a service that reloads now finds its room
+                    if h.get("uuid") in room["gpus"]:
+                        g = room["gpus"][h["uuid"]]
+                        g["room"] += h.get("size") or 0
+                        g["holds"] -= h.get("size") or 0
+                    room["ram"]["room"] += h.get("ram") or 0
+                    room["ram"]["holds"] -= h.get("ram") or 0
                 continue
             if present and not h.get("seen"):
                 h["seen"] = True
@@ -3239,9 +3324,10 @@ class Loop:
                 continue
             g = groups.get(q["group"]) or {}
             if g.get("status") == "Paused":
-                q["reason"], q["hint"] = "its group %s is paused" % q["group"], None
-                self.adm.alert(q, "group_paused", "held: its pueue group %s is paused; resume it with job resume"
-                               % q["group"], {"resume": {"group": q["group"]}})
+                q["reason"], q["hint"] = "its group %s is paused; start it with: %s" % (
+                    q["group"], _resume_command(q["group"])), None
+                self.adm.alert(q, "group_paused", "held: its pueue group %s on %s is paused; start it with: %s" % (
+                    q["group"], _short_hostname(), _resume_command(q["group"])), {"resume": {"group": q["group"]}})
                 self.adm.save(q)
                 continue
             if running.get(q["group"], 0) >= (g.get("parallel_tasks") or 1):
@@ -3543,6 +3629,9 @@ def host_hold(req):
         raise JobError("%s is not an admission host" % socket.gethostname())
     adm = Admission(settings)
     os.makedirs(adm.path("holds"), mode=0o700, exist_ok=True)
+    # systemd is asked before the lock, which every submit and loop cycle waits on; a unit found gone a moment before
+    # the lock is treated as gone, as the loop treats a unit it found gone at its last sample
+    gone = set() if req.get("release") or req.get("renew") else _gone_hold_cgroups(adm)
     fd = adm.lock("queue.lock")
     try:
         if req.get("release") or req.get("renew"):
@@ -3578,7 +3667,7 @@ def host_hold(req):
         # a hold whose owner is already gone (its process exited, its time to live ran out, its unit or cgroup went)
         # still counts in the snapshot until the loop's next cycle: end it now and credit back what the snapshot
         # counted for it, so a service that reloads at once is not refused against its own dead hold
-        credit_ram, credit_gpu = _end_dead_holds(adm, snap)
+        credit_ram, credit_gpu = _end_dead_holds(adm, snap, gone)
         # the snapshot is written under this lock after each cycle's releases; holds since then are not in it
         newer = [h for h in _holds(adm) if h["start"] > snap.get("written", snap["t"])]
         if ram:
@@ -3638,19 +3727,31 @@ def host_hold(req):
         os.close(fd)
 
 
-def _end_dead_holds(adm, snap):
-    """End every hold whose owner is gone, by the loop's own test (update_holds), and return what the snapshot
-    counted for those it counted: (RAM bytes, {GPU uuid: bytes}). The snapshot counted a hold at the larger of its
-    size and its measured use; only its size is credited back, the safe side."""
+def _gone_hold_cgroups(adm):
+    """The ids of seen holds whose unit or cgroup is gone. It asks systemd (up to 5 s a call), so it runs before
+    the queue lock is taken; _end_dead_holds acts on it under the lock."""
+    m = _measure_from_env()
+    gone = set()
+    for h in _holds(adm):
+        if h.get("seen") and (h.get("unit") or h.get("cgroup")):
+            cgs = _hold_cgroups(h)  # None: systemd could not be asked, so the hold is kept
+            if cgs is not None and not any(os.path.isdir(m.cg + c) for c in cgs):
+                gone.add(h["id"])
+    return gone
+
+
+def _end_dead_holds(adm, snap, gone=frozenset()):
+    """Under the queue lock: end every hold whose owner is gone, by the loop's own test (update_holds; gone: the
+    holds _gone_hold_cgroups found without their unit or cgroup), and return what the snapshot counted for those it
+    counted: (RAM bytes, {GPU uuid: bytes}). The snapshot counted a hold at the larger of its size and its measured
+    use; only its size is credited back, the safe side."""
     m = _measure_from_env()
     counted = {h.get("id") for h in snap.get("holds") or []}
     ram, gpu = 0, {}
     for h in _holds(adm):
         alive, why = _hold_alive(h, m.proc)
-        if alive and h.get("seen") and (h.get("unit") or h.get("cgroup")):
-            cgs = _hold_cgroups(h)  # None: systemd could not be asked, so the hold is kept
-            if cgs is not None and not any(os.path.isdir(m.cg + c) for c in cgs):
-                alive, why = False, "its unit or cgroup is gone"
+        if alive and h["id"] in gone:
+            alive, why = False, "its unit or cgroup is gone"
         if alive:
             continue
         _end_hold(adm, h, why)
@@ -4351,11 +4452,20 @@ def scope_verdict(verdict, code, scope):
 
 
 def _restart_verdict(verdict, code, note, s, host):
-    """KILLED_BY_RESTART for a job that was running when the pueue daemon stopped."""
+    """KILLED_BY_RESTART for a job that was running when the pueue daemon stopped; UNTRACKED when its processes
+    still run (the daemon died without stopping them, so pueue lost track of them)."""
     if verdict != "KILLED" or s.get("killed_by") != "daemon":
         return verdict, code, note
     d = s.get("daemon_start")
     when = " (it started again %s)" % _fmt_et(dt.datetime.fromtimestamp(d).astimezone()) if d else ""
+    pids = s.get("alive_pids") or []
+    tok = (" --token %s" % s["token"]) if s.get("token") else ""
+    if pids:
+        why = ("the pueue daemon on %s stopped%s without stopping this job, and pueue lost track of it: pueue says "
+               "it was killed, but %d of its processes still run (pids %s). Do not submit it again while they run. "
+               "Stop them with: job kill %s %s%s ; then submit it again" % (
+                   host, when, len(pids), " ".join(map(str, pids)), host, s.get("id"), tok))
+        return "UNTRACKED", EXIT["UNTRACKED"], (note + "; " + why) if note else why
     why = ("it was still running when the pueue daemon on %s stopped%s; it did not end on its own. Submit it again; "
            "if jobs wait in a paused group, start it with: job resume %s --group %s" % (
                host, when, host, shlex.quote(str(s.get("group") or "default"))))
@@ -4511,8 +4621,9 @@ class Waiter:
                     m = a.get("message") or a.get("kind") or "?"
                     rs = a.get("resize") if isinstance(a.get("resize"), dict) else {}
                     rg = a.get("resume") if isinstance(a.get("resume"), dict) else {}
-                    if rg.get("group"):
-                        m += " (exact command: job resume %s --group %s)" % (self.host, shlex.quote(str(rg["group"])))
+                    if rg.get("group"):  # the host's message names the machine; here it is named as job knows it
+                        m = "held: its pueue group %s on %s is paused; start it with: %s" % (
+                            rg["group"], self.host, _resume_command(rg["group"], self.host))
                     if rs.get("ram"):
                         m += " (exact command: job resize %s %s%s --ram %s)" % (
                             self.host, self.tid, (" --token %s" % self.token) if self.token else "", rs["ram"])
@@ -4617,6 +4728,30 @@ class Waiter:
 
 
 GOOD = ("SUCCESS", "PILOT_TIME_LIMIT")  # outcomes that do not end a wait on several jobs early
+# the worst first: when several jobs ended badly, the wait reports the worst and exits with its code
+SEVERITY = ("UNTRACKED", "WRAPPER_ERROR", "GONE", "UNREACHABLE", "STALLED", "ALERT", "KILLED_BY_RESTART")
+
+
+def _severity(o):
+    return SEVERITY.index(o["verdict"]) if o["verdict"] in SEVERITY else len(SEVERITY)
+
+
+REPORTED_DIR = os.path.join(STATE_DIR, "reported")  # one empty file per job token whose end a wait here reported
+
+
+def _mark_reported(token):
+    if not _token_ok(token):
+        return
+    try:
+        os.makedirs(REPORTED_DIR, mode=0o700, exist_ok=True)
+        with open(os.path.join(REPORTED_DIR, token), "w"):
+            pass
+    except OSError:
+        pass  # job wait --mine may report it again: noise, never a lost verdict
+
+
+def _reported(token):
+    return _token_ok(token) and os.path.exists(os.path.join(REPORTED_DIR, token))
 
 
 def _really_ended(o):
@@ -4632,6 +4767,7 @@ def wait_all(host, waiters, poll=None, out=sys.stdout, notes=()):
     pending = list(waiters)
     done = []
     while pending:
+        bad = []
         for w in list(pending):
             for _ in range(10000):
                 o = w.step()
@@ -4641,8 +4777,12 @@ def wait_all(host, waiters, poll=None, out=sys.stdout, notes=()):
                 continue
             pending.remove(w)
             done.append((w, o))
-            if len(waiters) > 1 and o["verdict"] not in GOOD:
-                return _finish(waiters, done, pending, o, out, notes)
+            if o["verdict"] not in GOOD:
+                bad.append(o)
+        if len(waiters) > 1 and bad:
+            # the round is finished first: every job was looked at, so each knows its token for the reattach line,
+            # and every job that has already ended is reported now, the worst first
+            return _finish(waiters, done, pending, min(bad, key=_severity), out, notes)
         if pending:
             time.sleep(poll)
     return _finish(waiters, done, [], None, out, notes)
@@ -4661,6 +4801,9 @@ def _keep_waiting(ws):
 
 
 def _finish(waiters, done, pending, urgent, out, notes=()):
+    for w, o in done:
+        if _really_ended(o):
+            _mark_reported(w.token)
     if len(waiters) == 1:
         w, o = done[0]
         report(w.host, o, out)
@@ -4688,7 +4831,7 @@ def _finish(waiters, done, pending, urgent, out, notes=()):
         others = [wo for wo in by_id if wo[1] is not urgent]
         last = _last_line(urgent["verdict"], _ref(uw), code, "%d of %d jobs ended" % (ended, len(waiters)))
     else:
-        bad = [wo for wo in by_id if wo[1]["code"] != 0]
+        bad = sorted((wo for wo in by_id if wo[1]["code"] != 0), key=lambda wo: _severity(wo[1]))
         code = bad[0][1]["code"] if bad else 0
         out.write("job: ALL ENDED %s: %s\n" % (", ".join(hosts), count_text))
         others = by_id
@@ -4744,7 +4887,7 @@ CHECKS_DIR = os.path.join(STATE_DIR, "checks")  # --check scripts kept per job t
 def _keep_check(token, path):
     """Keep a copy of a job's --check script, so a later `job wait` (after a restart cleared a temporary folder)
     still runs it. Copies older than SCRIPT_KEEP_DAYS are removed."""
-    if not token or not path:
+    if not _token_ok(token) or not path:
         return
     try:
         os.makedirs(CHECKS_DIR, mode=0o700, exist_ok=True)
@@ -4766,7 +4909,7 @@ def _keep_check(token, path):
 
 
 def _kept_check(token):
-    p = os.path.join(CHECKS_DIR, token) if token else None
+    p = os.path.join(CHECKS_DIR, token) if _token_ok(token) else None
     return p if p and os.path.isfile(p) and os.access(p, os.X_OK) else None
 
 
@@ -4848,40 +4991,46 @@ def _ls_all(hosts):
     return results
 
 
+MINE_RECENT_S = 24 * 3600  # job wait --mine reports a job of the session that ended this recently, if not yet reported
+
+
 def cmd_wait_mine(args):
-    """Wait on every unfinished job this session submitted, on every host."""
+    """Wait on every unfinished job this session submitted, on every host, and report each of its jobs that ended in
+    the last MINE_RECENT_S without a wait on this machine reporting it."""
     me = _session()
     if me == "unknown":
         raise JobError("this shell has no session id (JOB_SESSION, or Claude Code's session variables), so --mine "
                        "cannot tell your jobs from others'; wait on them by id")
     hosts = _ls_hosts()
     results = _ls_all(hosts)
-    waiters, notes, unlisted = [], [], False
+    waiters, notes, unlisted, ended = [], [], False, 0
     for h in hosts:
         r = results.get(h)
         if isinstance(r, Exception):
             notes.append("%s could not be listed (%s); its jobs are not in this wait" % (h, r))
+            sys.stderr.write("job: %s\n" % notes[-1])  # now, not only when the wait ends
             unlisted = True
             continue
         for s in r["tasks"]:
-            if s.get("session") != me:
+            if s.get("session") != me or not s.get("token"):
                 continue
-            if s["status"] != "Done" and s.get("token"):
+            if s["status"] != "Done":
                 waiters.append(_waiter(args, s["id"], s["token"], host=h))
-            elif s["status"] == "Done" and s.get("killed_by") == "daemon":
-                end = _parse_time(s.get("end"))
-                if end and (dt.datetime.now(end.tzinfo) - end).total_seconds() < RESTART_WINDOW_S:
-                    notes.append("%s#%s (%s) ended KILLED_BY_RESTART at %s: it was running when the pueue daemon "
-                                 "there stopped; submit it again" % (h, s["id"], s.get("label"), _fmt_et(end)))
+                continue
+            end = _parse_time(s.get("end"))
+            if end and (dt.datetime.now(end.tzinfo) - end).total_seconds() < MINE_RECENT_S and not _reported(
+                    s["token"]):
+                waiters.append(_waiter(args, s["id"], s["token"], host=h))
+                ended += 1
     if not waiters:
-        print("job: no unfinished job of session %s on %s" % (me, ", ".join(hosts)))
+        print("job: no unfinished or unreported job of session %s on %s" % (me, ", ".join(hosts)))
         for n in notes:
             print("note: " + n)
         code = EXIT["UNREACHABLE"] if unlisted else 0
         print("job: %s exit %d" % ("UNREACHABLE" if unlisted else "NONE", code))
         return code
-    sys.stderr.write("job: waiting on %d unfinished job(s) of session %s: %s\n" % (
-        len(waiters), me, " ".join(_ref(w) for w in waiters)))
+    sys.stderr.write("job: waiting on %d job(s) of session %s (%d of them ended and not reported yet): %s\n" % (
+        len(waiters), me, ended, " ".join(_ref(w) for w in waiters)))
     return wait_all(None, waiters, poll=args.poll, notes=notes)
 
 
@@ -5054,6 +5203,8 @@ def _newer_op(host, op, req):
 
 
 def cmd_log(args):
+    if args.lines < 1:
+        raise JobError("--lines must be at least 1 (use --full for the whole log)")
     r = _newer_op(args.host, "log", {"id": args.id, "token": args.token, "lines": args.lines, "grep": args.grep,
                                      "full": bool(args.full)})
     if args.full:
@@ -5125,7 +5276,7 @@ def cmd_group(args):
 
 def _kill_text(host, tid, r):
     text = "%s#%s %s" % (host, tid, r["action"])
-    if r["action"] == "killed" and "left" in r:
+    if r["action"].startswith("killed") and "left" in r:
         text += ": %d process(es) of the job were running" % r.get("processes", 0)
         text += ("; none is left" if not r["left"] else
                  "; %d still alive after SIGKILL: pids %s" % (len(r["left"]), " ".join(map(str, r["left"]))))
@@ -5138,7 +5289,11 @@ def cmd_kill(args):
             raise JobError("job kill needs a job id, or --task NAME")
         r = call(args.host, "kill", {"id": int(args.id), "token": args.token})
         print(_kill_text(args.host, args.id, r))
-        return 0 if not r.get("left") else EXIT["WRAPPER_ERROR"]
+        if r.get("left"):
+            sys.stdout.write(_last_line("WRAPPER_ERROR", "%s#%s" % (args.host, args.id), EXIT["WRAPPER_ERROR"],
+                                        "%d process(es) of the job still alive after SIGKILL" % len(r["left"])))
+            return EXIT["WRAPPER_ERROR"]
+        return 0
     if args.id is not None or args.token:
         raise JobError("give a job id or --task NAME, not both")
     tasks = [s for s in call(args.host, "ls", {}, timeout=60)["tasks"]
@@ -5152,17 +5307,23 @@ def cmd_kill(args):
         raise JobError("task %s on %s has %d unfinished job(s) of other sessions (%s); nothing was killed. Add "
                        "--all-sessions to kill them too" % (args.task, args.host, len(others), ", ".join(
                            "#%s of %s" % (s["id"], s.get("session") or "unknown") for s in others)))
-    code = 0
+    # waiting jobs first: killing a running job frees its slot, and pueue would start a queued one in it
+    tasks.sort(key=lambda s: (s["status"] in ("Running", "Paused"), int(s["id"])))
+    failed = []
     for s in tasks:
         try:
             r = call(args.host, "kill", {"id": int(s["id"]), "token": s.get("token")})
             print(_kill_text(args.host, s["id"], r))
             if r.get("left"):
-                code = EXIT["WRAPPER_ERROR"]
+                failed.append("#%s left %d process(es) alive" % (s["id"], len(r["left"])))
         except JobError as e:
             print("%s#%s not killed: %s" % (args.host, s["id"], e))
-            code = EXIT["WRAPPER_ERROR"]
-    return code
+            failed.append("#%s not killed" % s["id"])
+    if failed:
+        sys.stdout.write(_last_line("WRAPPER_ERROR", "%s task %s" % (args.host, _shown_task(args.task)),
+                                    EXIT["WRAPPER_ERROR"], "; ".join(failed)))
+        return EXIT["WRAPPER_ERROR"]
+    return 0
 
 
 HELP_RULES = """rules (docs/usage.md has the rest):
@@ -5170,9 +5331,10 @@ HELP_RULES = """rules (docs/usage.md has the rest):
     verdict can be cut off. Use --tail N for fewer log lines. The first and the last line carry the verdict.
   - run job run / job wait in the background; their exit is the wake-up. Lost the wait? Reattach with
     job wait HOST ID --token T (job run printed it; job ls shows tokens), or after a restart of this machine or
-    the app, job wait --mine: every unfinished job of this session on every host. --check scripts are kept.
-  - a job without --group runs in your session's own group, one at a time; it never waits behind another
-    session's jobs. For jobs side by side: job group HOST NAME N, then --group NAME.
+    the app, job wait --mine: every unfinished job of this session on every host, and each that ended in the
+    last 24 h with no wait here reporting it. --check scripts are kept.
+  - a job without --group runs in your session's own group, as many at a time as the host's default group; it
+    never waits behind another session's jobs. For a limit of your own: job group HOST NAME N, then --group NAME.
   - on admission hosts every job needs a size: best --pilot first, then --like TOKEN (or --like last).
   - job kill HOST ID also removes a queued or held job.
   - job log HOST ID, job show HOST ID and job resume HOST --group G instead of raw pueue (not on ssh's PATH).
@@ -5187,6 +5349,7 @@ def build_parser():
                                 epilog=HELP_RULES, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version="job %s" % VERSION)
     sub = p.add_subparsers(dest="cmd")
+    p.intermixed = {}  # subcommands parsed with parse_intermixed_args (see main)
 
     def waitopts(q):
         q.add_argument("--stall", type=float, default=30.0, metavar="MIN",
@@ -5239,10 +5402,12 @@ def build_parser():
         if name == "run":
             waitopts(q)
 
-    q = sub.add_parser("wait", help="wait on one or more queued or finished jobs on one host", epilog=RUN_RULES)
+    q = p.intermixed["wait"] = sub.add_parser("wait", help="wait on one or more queued or finished jobs on one host",
+                                              epilog=RUN_RULES)
     q.add_argument("host", nargs="?", default=None, help="local, or a name from %s" % HOSTS_FILE)
     q.add_argument("--mine", action="store_true",
-                   help="every unfinished job this session submitted, on every host (after a restart)")
+                   help="every unfinished job this session submitted, on every host, and each that ended in the last "
+                        "24 h with no wait on this machine reporting it (after a restart)")
     q.add_argument("ids", nargs="*", metavar="ID[:TOKEN]",
                    help="job ids; ID:TOKEN refuses an id that now belongs to another job")
     q.add_argument("--token", default=None, help="with one id: the token 'job submit' printed; refuses a reused id")
@@ -5317,7 +5482,7 @@ def build_parser():
     q.add_argument("--group", required=True, help="the paused group")
 
     kill_help = "kill a running job (and every process it started) or remove a queued or held one"
-    q = sub.add_parser("kill", help=kill_help, description=kill_help)
+    q = p.intermixed["kill"] = sub.add_parser("kill", help=kill_help, description=kill_help)
     q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
     q.add_argument("id", type=int, nargs="?", default=None)
     q.add_argument("--token", default=None, help="refuse if the id now belongs to another job")
@@ -5325,6 +5490,19 @@ def build_parser():
     q.add_argument("--all-sessions", action="store_true",
                    help="with --task: also other sessions' jobs (refused without it)")
     return p
+
+
+def parse_args(argv):
+    """(parser, args) for the arguments before any --."""
+    parser = build_parser()
+    if argv[:1] and argv[0] in parser.intermixed:
+        # an optional positional (wait's host and ids, kill's id) followed by options and then more positionals
+        # ("wait local --token T 5") parses only with intermixed parsing before Python 3.12
+        args = parser.intermixed[argv[0]].parse_intermixed_args(argv[1:])
+        args.cmd = argv[0]
+    else:
+        args = parser.parse_args(argv)
+    return parser, args
 
 
 def main(argv=None):
@@ -5341,8 +5519,7 @@ def main(argv=None):
     if "--" in argv:  # everything after the first -- is the job's command, untouched
         i = argv.index("--")
         argv, command = argv[:i], argv[i + 1:]
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    parser, args = parse_args(argv)
     args.command = command
     if command is not None and args.cmd not in ("run", "submit"):
         parser.error("only run and submit take a command after --")
