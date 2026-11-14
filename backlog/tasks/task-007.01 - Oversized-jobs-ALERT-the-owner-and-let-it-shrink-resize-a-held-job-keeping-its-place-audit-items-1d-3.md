@@ -3,9 +3,10 @@ id: TASK-007.01
 title: >-
   Oversized jobs: ALERT the owner and let it shrink; resize a held job keeping
   its place (audit items 1d, 3)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-14T17:41:00Z'
+updated_date: '2026-11-14T17:42:00Z'
 labels: []
 dependencies: []
 parent_task_id: TASK-007
