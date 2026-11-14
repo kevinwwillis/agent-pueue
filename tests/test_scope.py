@@ -35,9 +35,14 @@ SCOPES = _scopes_work()
 
 
 def _own_cgroup_entries():
+    """What a shim run in this process's cgroup could change there: its child cgroups and which controllers it
+    enables for them. Not the cgroup's own control files: systemd adds and removes those (cpu.* when a sibling
+    scope with CPUWeight starts or ends, as other tests' jobs do), which made this check fail now and then."""
     with open("/proc/self/cgroup") as f:
-        cg = f.read().split("::", 1)[1].strip()
-    return sorted(os.listdir("/sys/fs/cgroup" + cg))
+        cg = "/sys/fs/cgroup" + f.read().split("::", 1)[1].strip()
+    with open(os.path.join(cg, "cgroup.subtree_control")) as f:
+        enabled = f.read().split()
+    return sorted(e.name for e in os.scandir(cg) if e.is_dir()), sorted(enabled)
 
 
 @unittest.skipUnless(SCOPES, "systemd-run --user --scope does not work here")
