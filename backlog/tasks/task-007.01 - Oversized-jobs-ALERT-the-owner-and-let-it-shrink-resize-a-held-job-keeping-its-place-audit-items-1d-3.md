@@ -3,7 +3,7 @@ id: TASK-007.01
 title: >-
   Oversized jobs: ALERT the owner and let it shrink; resize a held job keeping
   its place (audit items 1d, 3)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-14T17:41:00Z'
 updated_date: '2026-11-14T18:20:00Z'
