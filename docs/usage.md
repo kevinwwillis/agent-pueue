@@ -220,7 +220,7 @@ job run gpu1 TASK-12 --check "$SCRATCH/nan-check.sh" -- 'python train.py'
 |---|---|
 | `job submit <host> <task-id> [--group G] [--cwd DIR] [--normal-priority] -- <command>` | Queue only. Prints the pueue id on stdout and, on stderr, the exact `job wait ... --token T` to wait on it. |
 | `job wait <host> <id> [--token T] [--from-start] [--stall MIN] [--check SCRIPT] [--poll SEC] [--tail N]` | Wait on a job queued earlier, or one that already finished; same output and exit code as `job run`. With `--token`, a pueue id that now belongs to another job (pueue reuses ids after `pueue clean`) ends with `GONE` instead of waiting on the wrong job. |
-| `job wait <host> <id> <id> ...` | Wait on several jobs on one host at once. Ends when all have ended (first line `job: ALL ENDED ...`, exit 0 if all succeeded, else the exit code of the lowest-id job that did not), or as soon as one of them is `STALLED`, `ALERT`, `UNREACHABLE` or `GONE` (first line names it and lists the ids still running). |
+| `job wait <host> <id>[:<token>] <id>[:<token>] ...` | Wait on several jobs on one host at once. Ends as soon as one of them ends badly (anything but `SUCCESS` or `PILOT_TIME_LIMIT`: `FAILED`, `KILLED`, `STALLED`, `ALERT`, `UNREACHABLE`, `GONE`, ...); the first line names it, says how many of the jobs really ended (a `STALLED` or `ALERT` job still runs, so it is not counted) and which have not, and a line gives the exact command to keep waiting on the others (`job wait <host> 13:<token> 14:<token>`). Otherwise it ends when all have ended (first line `job: ALL ENDED ...`, exit 0 if all succeeded, else the exit code of the lowest-id job that did not). `ID:TOKEN` refuses an id that now belongs to another job, like `--token` does for a single id; `--token` with several ids is refused (exit 205). |
 | `job ls [host ...] [--all] [--recent H]` | Every job on this machine and every host in the hosts file: host, id, task id, status, run time, group, session, command. Finished jobs older than `--recent` hours (default 24) are hidden unless `--all`. Exits 202 if a host could not be reached (the reachable ones are still listed). |
 | `job group <host> <name> <n>` | Create a pueue group (if missing) and let it run `n` jobs at a time. Then `job submit/run ... --group <name>`. |
 | `job room [host ...] [--json]` | Each admission host's room: CPU, RAM, memory pressure, disks, each GPU's free memory and outside use, the jobs running and the jobs held with their reasons. |
@@ -241,7 +241,8 @@ done
 ```
 
 `submit` prints each id. Then wait on all of them in **one** background call,
-`job wait gpu1 <id1> <id2> <id3>`. Do not wait on only the last id: in a group
+`job wait gpu1 <id1> <id2> <id3>` (or `<id>:<token>` each). The wait ends as soon as one of them fails, so you
+hear of it at once, and prints the command that waits on the rest. Do not wait on only the last id: in a group
 that runs several at a time, the last id can finish first.
 
 **A job without `--group` runs in its session's own group** (`session-<session id>`, created when needed), which

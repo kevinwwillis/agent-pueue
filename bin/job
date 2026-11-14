@@ -4194,9 +4194,19 @@ class Waiter:
                                   % (_fmt_dur(span), what))
 
 
-def wait_all(host, waiters, poll=None, out=sys.stdout):
-    """Wait on one or more jobs on one host. Returns the exit code."""
-    poll = poll if poll is not None else (POLL_REMOTE if HOSTS.get(host) else POLL_LOCAL)
+GOOD = ("SUCCESS", "PILOT_TIME_LIMIT")  # outcomes that do not end a wait on several jobs early
+
+
+def _really_ended(o):
+    """Whether the job of an outcome has ended (not a STALLED, ALERT or UNREACHABLE job that still runs)."""
+    return o["s"].get("status") == "Done" or o["verdict"] == "GONE"
+
+
+def wait_all(host, waiters, poll=None, out=sys.stdout, notes=()):
+    """Wait on one or more jobs (each waiter knows its host). A wait on several jobs ends as soon as one of them
+    ends badly (any outcome not in GOOD), or when all have ended. Returns the exit code."""
+    if poll is None:
+        poll = min(POLL_REMOTE if HOSTS.get(w.host) else POLL_LOCAL for w in waiters)
     pending = list(waiters)
     done = []
     while pending:
@@ -4209,49 +4219,70 @@ def wait_all(host, waiters, poll=None, out=sys.stdout):
                 continue
             pending.remove(w)
             done.append((w, o))
-            if o["verdict"] in URGENT:
-                return _finish(host, waiters, done, pending, o, out)
+            if len(waiters) > 1 and o["verdict"] not in GOOD:
+                return _finish(waiters, done, pending, o, out, notes)
         if pending:
             time.sleep(poll)
-    return _finish(host, waiters, done, [], None, out)
+    return _finish(waiters, done, [], None, out, notes)
 
 
-def _finish(host, waiters, done, pending, urgent, out):
+def _ref(w):
+    return "%s#%s" % (w.host, w.tid)
+
+
+def _keep_waiting(ws):
+    """The exact commands that wait on these jobs again, one per host."""
+    by = {}
+    for w in ws:
+        by.setdefault(w.host, []).append("%d:%s" % (w.tid, w.token) if w.token else str(w.tid))
+    return " ; ".join("job wait %s %s" % (h, " ".join(ids)) for h, ids in by.items())
+
+
+def _finish(waiters, done, pending, urgent, out, notes=()):
     if len(waiters) == 1:
-        o = done[0][1]
-        report(host, o, out)
-        out.write(_last_line(o["verdict"], "%s#%s" % (host, o["s"].get("id")), o["code"]))
+        w, o = done[0]
+        report(w.host, o, out)
+        for n in notes:
+            out.write("note: %s\n" % n)
+        out.write(_last_line(o["verdict"], _ref(w), o["code"]))
         out.flush()
         return o["code"]
-    by_id = sorted(done, key=lambda wo: wo[0].tid)
-    bad = [wo for wo in by_id if wo[1]["code"] != 0]
+    by_id = sorted(done, key=lambda wo: (wo[0].host, wo[0].tid))
+    ended = sum(1 for _, o in done if _really_ended(o))
     counts = {}
+    for _, o in by_id:
+        counts[o["verdict"]] = counts.get(o["verdict"], 0) + 1
+    count_text = ", ".join("%d %s" % (n, v) for v, n in sorted(counts.items()))
+    hosts = sorted({w.host for w in waiters})
     if urgent:
+        uw = next(w for w, o in done if o is urgent)
         code = urgent["code"]
-        out.write("job: %s %s#%s; %d of %d jobs ended, still waiting: %s\n" % (
-            urgent["verdict"], host, urgent["s"].get("id"), len(done), len(waiters),
-            " ".join(str(w.tid) for w in pending) or "none"))
-        report(host, urgent, out)
+        not_ended = [_ref(w) for w, o in by_id if not _really_ended(o)] + [_ref(w) for w in pending]
+        out.write("job: %s %s; %d of %d jobs ended; not ended: %s\n" % (
+            urgent["verdict"], _ref(uw), ended, len(waiters), " ".join(not_ended) or "none"))
+        report(uw.host, urgent, out)
+        if pending:
+            out.write("keep waiting on the others with: %s\n" % _keep_waiting(pending))
         others = [wo for wo in by_id if wo[1] is not urgent]
+        last = _last_line(urgent["verdict"], _ref(uw), code, "%d of %d jobs ended" % (ended, len(waiters)))
     else:
+        bad = [wo for wo in by_id if wo[1]["code"] != 0]
         code = bad[0][1]["code"] if bad else 0
-        for _, o in by_id:
-            counts[o["verdict"]] = counts.get(o["verdict"], 0) + 1
-        out.write("job: ALL ENDED %s: %s\n" % (host, ", ".join("%d %s" % (n, v) for v, n in sorted(counts.items()))))
+        out.write("job: ALL ENDED %s: %s\n" % (", ".join(hosts), count_text))
         others = by_id
-    for _, o in others:
+        if bad:
+            last = _last_line(bad[0][1]["verdict"], _ref(bad[0][0]), code,
+                              "all %d jobs ended: %s" % (len(waiters), count_text))
+        else:
+            last = _last_line("SUCCESS" if counts.get("SUCCESS") == len(waiters) else "ALL ENDED",
+                              " ".join("%s#%s" % (h, ",".join(str(w.tid) for w, _ in by_id if w.host == h))
+                                       for h in hosts), code)
+    for w, o in others:
         out.write("\n")
-        report(host, o, out)
-    if urgent:
-        out.write(_last_line(urgent["verdict"], "%s#%s" % (host, urgent["s"].get("id")), code,
-                             "%d of %d jobs ended" % (len(done), len(waiters))))
-    elif bad:
-        first = bad[0][1]
-        out.write(_last_line(first["verdict"], "%s#%s" % (host, first["s"].get("id")), code, "all %d jobs ended: %s" % (
-            len(waiters), ", ".join("%d %s" % (n, v) for v, n in sorted(counts.items())))))
-    else:
-        out.write(_last_line("SUCCESS" if all(o["verdict"] == "SUCCESS" for _, o in by_id) else "ALL ENDED",
-                             "%s#%s" % (host, ",".join(str(w.tid) for w, _ in by_id)), code))
+        report(w.host, o, out)
+    for n in notes:
+        out.write("note: %s\n" % n)
+    out.write(last)
     out.flush()
     return code
 
@@ -4312,11 +4343,26 @@ def cmd_run(args, queue_only=False):
     return wait_all(args.host, [_waiter(args, tid, tok)], poll=args.poll)
 
 
+def _id_token(text):
+    """ID or ID:TOKEN."""
+    tid, _, tok = str(text).partition(":")
+    try:
+        tid = int(tid)
+    except ValueError:
+        raise JobError("%r is not a job id (ID or ID:TOKEN)" % text)
+    if tok and not (len(tok) == 32 and all(c in "0123456789abcdef" for c in tok)):
+        raise JobError("%r: the token after the colon is the 32-character token job printed" % text)
+    return tid, tok or None
+
+
 def cmd_wait(args):
     _check_ok(args)
-    if args.token and len(args.ids) != 1:
-        raise JobError("--token goes with a single job id")
-    return wait_all(args.host, [_waiter(args, tid, args.token) for tid in args.ids], poll=args.poll)
+    pairs = [_id_token(x) for x in args.ids]
+    if args.token:
+        if len(pairs) != 1:
+            raise JobError("--token goes with a single job id; for several, give each as ID:TOKEN")
+        pairs = [(pairs[0][0], args.token)]
+    return wait_all(args.host, [_waiter(args, tid, tok) for tid, tok in pairs], poll=args.poll)
 
 
 def _history_size(j):
@@ -4618,8 +4664,9 @@ def build_parser():
 
     q = sub.add_parser("wait", help="wait on one or more queued or finished jobs on one host", epilog=RUN_RULES)
     q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
-    q.add_argument("ids", type=int, nargs="+", metavar="id")
-    q.add_argument("--token", default=None, help="the token 'job submit' printed; refuses a reused id")
+    q.add_argument("ids", nargs="+", metavar="ID[:TOKEN]",
+                   help="job ids; ID:TOKEN refuses an id that now belongs to another job")
+    q.add_argument("--token", default=None, help="with one id: the token 'job submit' printed; refuses a reused id")
     q.add_argument("--from-start", action="store_true",
                    help="with --check: check the output already written too (default: only new output)")
     waitopts(q)

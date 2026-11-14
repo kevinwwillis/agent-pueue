@@ -518,18 +518,18 @@ class RegressionTests(Base):
         self.assertNotIn("queued", p.stderr)
 
     def test_wait_on_several_jobs(self):
-        ids = [self.submit(c, task="T-multi") for c in ("sleep 1", "sleep 2; exit 3", "true")]
+        ids = [self.submit(c, task="T-multi") for c in ("sleep 1", "sleep 2", "true")]
         p = self.job("wait", "local", *[str(i) for i in ids], "--poll", "0.3")
-        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
-        self.assertTrue(p.stdout.startswith("job: ALL ENDED local: 1 FAILED, 2 SUCCESS"), p.stdout)
-        self.assertEqual(p.stdout.count("job: SUCCESS"), 2)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(p.stdout.startswith("job: ALL ENDED local: 3 SUCCESS"), p.stdout)
+        self.assertEqual(p.stdout.count("job: SUCCESS local#"), 4)  # three reports and the last line
 
     def test_several_jobs_end_early_on_a_stall(self):
         self.job("group", "local", "stallpair", "2")
         ids = [self.submit(c, task="T-multi-stall", extra=("--group", "stallpair")) for c in ("sleep 300", "sleep 20")]
         p = self.job("wait", "local", *[str(i) for i in ids], "--poll", "0.3", "--stall", "0.05")
         self.assertEqual(p.returncode, 200, p.stdout + p.stderr)
-        self.assertIn("still waiting", p.stdout.splitlines()[0])
+        self.assertIn("0 of 2 jobs ended", p.stdout.splitlines()[0])
         for i in ids:
             self.d.pueue("kill", str(i))
 
@@ -789,7 +789,8 @@ class HelpAndLastLineTests(Base):
         self.assertEqual(p.stdout.rstrip().splitlines()[-1], "job: WRAPPER_ERROR exit 205")
 
     def test_several_jobs_last_line(self):
-        ids = [self.submit("true", task="T-ll2") for _ in range(2)]
+        self.job("group", "local", "ll2", "2")
+        ids = [self.submit("true", task="T-ll2", extra=("--group", "ll2")) for _ in range(2)]
         p = self.job("wait", "local", *[str(i) for i in ids], "--poll", "0.3")
         self.assertEqual(p.returncode, 0, p.stdout)
         self.assertEqual(p.stdout.rstrip().splitlines()[-1], "job: SUCCESS local#%d,%d exit 0" % tuple(ids))
@@ -856,6 +857,77 @@ class LogShowResumeTests(Base):
         with self.assertRaises(job.JobError) as e:
             job._newer_op("gpu1", "log", {})
         self.assertIn("predates job log", str(e.exception))
+
+
+class MultiWaitTests(Base):
+    """A wait on several jobs (TASK-006)."""
+
+    def sub(self, cmd, task="T-mw"):
+        p = self.job("submit", "local", task, "--group", "mw", "--", cmd)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return int(p.stdout), p.stderr.split("--token ", 1)[1].split()[0]
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.d.pueue("group", "add", "mw")
+        cls.d.pueue("parallel", "8", "--group", "mw")
+
+    def test_a_failure_ends_the_wait_at_once(self):
+        long1, t1 = self.sub("sleep 60")
+        bad, tb = self.sub("sleep 1; exit 3")
+        long2, t2 = self.sub("sleep 60")
+        p = self.job("wait", "local", str(long1), "%d:%s" % (bad, tb), str(long2), "--poll", "0.3")
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertLess(p.elapsed, 30)
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[0], "job: FAILED local#%d; 1 of 3 jobs ended; not ended: local#%d local#%d" % (
+            bad, long1, long2))
+        self.assertIn("keep waiting on the others with: job wait local %d:%s %d:%s" % (long1, t1, long2, t2),
+                      p.stdout)
+        self.assertEqual(lines[-1], "job: FAILED local#%d exit 3 (1 of 3 jobs ended)" % bad)
+        for i in (long1, long2):
+            self.d.pueue("kill", str(i))
+
+    def test_a_kill_ends_the_wait_at_once(self):
+        a, _ = self.sub("sleep 60")
+        b, _ = self.sub("sleep 60")
+        self.wait_status(b, "Running")
+        w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(a), str(b), "--poll", "0.3"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.d.env())
+        time.sleep(1)
+        self.d.pueue("kill", str(b))
+        out, err = w.communicate(timeout=30)
+        self.assertEqual(w.returncode, 137, out + err)
+        self.assertTrue(out.startswith("job: KILLED local#%d; 1 of 2 jobs ended" % b), out)
+        self.d.pueue("kill", str(a))
+
+    def test_a_stall_is_not_counted_as_ended(self):
+        a, _ = self.sub("sleep 300")
+        b, _ = self.sub("true")
+        self.wait_status(b, "Done")
+        p = self.job("wait", "local", str(a), str(b), "--poll", "0.3", "--stall", "0.05")
+        self.assertEqual(p.returncode, 200, p.stdout + p.stderr)
+        self.assertIn("1 of 2 jobs ended; not ended: local#%d" % a, p.stdout.splitlines()[0])
+        self.d.pueue("kill", str(a))
+
+    def test_id_token_pairs(self):
+        a, ta = self.sub("true")
+        b, tb = self.sub("true")
+        self.wait_status(b, "Done")
+        p = self.job("wait", "local", "%d:%s" % (a, ta), "%d:%s" % (b, tb), "--poll", "0.3")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        wrong = self.job("wait", "local", "%d:%s" % (a, tb), "--poll", "0.3")
+        self.assertIn("now belongs to a different job", wrong.stdout)
+        both = self.job("wait", "local", str(a), str(b), "--token", ta)
+        self.assertEqual(both.returncode, 205)
+        self.assertIn("ID:TOKEN", both.stdout)
+        bad = self.job("wait", "local", "%d:xyz" % a)
+        self.assertEqual(bad.returncode, 205)
+
+    def test_a_pilot_time_limit_does_not_end_the_wait_early(self):
+        job = self.load_job()
+        self.assertIn("PILOT_TIME_LIMIT", job.GOOD)
 
 
 if __name__ == "__main__":
