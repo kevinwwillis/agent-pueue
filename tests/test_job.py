@@ -24,6 +24,27 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOB = os.path.join(REPO, "bin", "job")
 
 
+def own_tmpdir():
+    """A fresh folder for one test or class, removed by remove_own_dir."""
+    return tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+
+
+def remove_own_dir(path):
+    """Remove a folder a test made with own_tmpdir, and nothing else. A job killed at the end of a test can still be
+    writing its results there for a moment, so a removal that meets a changing tree is tried again."""
+    if not (isinstance(path, str) and path.startswith("/tmp/jobt.") and os.path.isdir(path)):
+        return
+    for _ in range(40):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            continue
+        except OSError:
+            time.sleep(0.25)
+    shutil.rmtree(path)  # still failing after 10 s: let the error show
+
+
 def _read(path):
     with open(path) as f:
         return f.read().strip()
@@ -31,7 +52,15 @@ def _read(path):
 
 class Daemon:
     def __init__(self):
-        self.dir = tempfile.mkdtemp(prefix="jobt.", dir="/tmp")
+        self.dir = own_tmpdir()
+        self.stopped = False
+        try:
+            self._start()
+        except BaseException:
+            remove_own_dir(self.dir)
+            raise
+
+    def _start(self):
         self.cfg = os.path.join(self.dir, "pueue.yml")
         os.makedirs(os.path.join(self.dir, "run"))
         with open(self.cfg, "w") as f:
@@ -85,24 +114,31 @@ class Daemon:
         return st["tasks"][str(tid)]["status"]
 
     def stop(self):
+        """Stop the daemon and remove its folder; safe to call more than once."""
+        if self.stopped:
+            return
+        self.stopped = True
         try:
-            self.pueue("kill", "--all")
-        except subprocess.CalledProcessError:
-            pass
-        self.proc.send_signal(signal.SIGTERM)
-        try:
-            self.proc.wait(10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-        self.log.close()
-        if self.dir.startswith("/tmp/jobt.") and os.path.isdir(self.dir):
-            shutil.rmtree(self.dir)
+            try:
+                self.pueue("kill", "--all")
+            except subprocess.CalledProcessError:
+                pass
+            self.proc.send_signal(signal.SIGTERM)
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(10)
+            self.log.close()
+        finally:
+            remove_own_dir(self.dir)
 
 
 class Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.d = Daemon()
+        cls.addClassCleanup(cls.d.stop)  # also when a subclass's setUpClass fails after this
 
     @classmethod
     def tearDownClass(cls):
@@ -661,9 +697,7 @@ class FreshDaemonTests(Base):
 
     def setUp(self):
         self.d = Daemon()
-
-    def tearDown(self):
-        self.d.stop()
+        self.addCleanup(self.d.stop)  # also when a test fails in setUp
 
     @classmethod
     def setUpClass(cls):
