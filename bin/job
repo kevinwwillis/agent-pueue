@@ -4085,10 +4085,12 @@ def _finish(host, waiters, done, pending, urgent, out):
     if len(waiters) == 1:
         o = done[0][1]
         report(host, o, out)
-        out.write("job: exit %d\n" % o["code"])
+        out.write(_last_line(o["verdict"], "%s#%s" % (host, o["s"].get("id")), o["code"]))
         out.flush()
         return o["code"]
     by_id = sorted(done, key=lambda wo: wo[0].tid)
+    bad = [wo for wo in by_id if wo[1]["code"] != 0]
+    counts = {}
     if urgent:
         code = urgent["code"]
         out.write("job: %s %s#%s; %d of %d jobs ended, still waiting: %s\n" % (
@@ -4097,9 +4099,7 @@ def _finish(host, waiters, done, pending, urgent, out):
         report(host, urgent, out)
         others = [wo for wo in by_id if wo[1] is not urgent]
     else:
-        bad = [wo for wo in by_id if wo[1]["code"] != 0]
         code = bad[0][1]["code"] if bad else 0
-        counts = {}
         for _, o in by_id:
             counts[o["verdict"]] = counts.get(o["verdict"], 0) + 1
         out.write("job: ALL ENDED %s: %s\n" % (host, ", ".join("%d %s" % (n, v) for v, n in sorted(counts.items()))))
@@ -4107,9 +4107,23 @@ def _finish(host, waiters, done, pending, urgent, out):
     for _, o in others:
         out.write("\n")
         report(host, o, out)
-    out.write("job: exit %d\n" % code)
+    if urgent:
+        out.write(_last_line(urgent["verdict"], "%s#%s" % (host, urgent["s"].get("id")), code,
+                             "%d of %d jobs ended" % (len(done), len(waiters))))
+    elif bad:
+        first = bad[0][1]
+        out.write(_last_line(first["verdict"], "%s#%s" % (host, first["s"].get("id")), code, "all %d jobs ended: %s" % (
+            len(waiters), ", ".join("%d %s" % (n, v) for v, n in sorted(counts.items())))))
+    else:
+        out.write(_last_line("SUCCESS" if all(o["verdict"] == "SUCCESS" for _, o in by_id) else "ALL ENDED",
+                             "%s#%s" % (host, ",".join(str(w.tid) for w, _ in by_id)), code))
     out.flush()
     return code
+
+
+def _last_line(verdict, where, code, more=None):
+    """The last line of a run or wait: the verdict, which job, and the exit code, so it survives `| tail`."""
+    return "job: %s %s exit %d%s\n" % (verdict, where, code, " (%s)" % more if more else "")
 
 
 QUEUED_HINT = None
@@ -4322,8 +4336,24 @@ def cmd_kill(args):
     return 0
 
 
+HELP_RULES = """rules (docs/usage.md has the rest):
+  - never pipe job run or job wait (| tail, | head, | grep): the pipe's exit code replaces the job's, and the
+    verdict can be cut off. Use --tail N for fewer log lines. The first and the last line carry the verdict.
+  - run job run / job wait in the background; their exit is the wake-up. Lost the wait? Reattach with
+    job wait HOST ID --token T (job run printed it).
+  - a job without --group runs in your session's own group, one at a time; it never waits behind another
+    session's jobs. For jobs side by side: job group HOST NAME N, then --group NAME.
+  - on admission hosts every job needs a size: best --pilot first, then --like TOKEN (or --like last).
+  - job kill HOST ID also removes a queued or held job.
+"""
+
+RUN_RULES = """never pipe it (| tail, | head, | grep): the pipe's exit code replaces the job's and the verdict can be
+cut off; use --tail N. The first and the last line carry the verdict; the exit code is the job's own."""
+
+
 def build_parser():
-    p = argparse.ArgumentParser(prog="job", description="Run long jobs under pueue and wait on them correctly.")
+    p = argparse.ArgumentParser(prog="job", description="Run long jobs under pueue and wait on them correctly.",
+                                epilog=HELP_RULES, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version="job %s" % VERSION)
     sub = p.add_subparsers(dest="cmd")
 
@@ -4338,10 +4368,12 @@ def build_parser():
                             "ends the wait with ALERT")
         q.add_argument("--poll", type=float, default=None, metavar="SEC",
                        help="seconds between probes (default %g local, %g remote)" % (POLL_LOCAL, POLL_REMOTE))
-        q.add_argument("--tail", type=int, default=40, metavar="N", help="log lines to print at the end (default 40)")
+        q.add_argument("--tail", type=int, default=40, metavar="N",
+                       help="log lines to print at the end (default 40); use this, never | tail")
 
     for name in ("run", "submit"):
-        q = sub.add_parser(name, help="queue a command and wait for it" if name == "run" else "queue a command, print its id")
+        q = sub.add_parser(name, help="queue a command and wait for it" if name == "run" else "queue a command, print its id",
+                           epilog=RUN_RULES if name == "run" else None)
         q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
         q.add_argument("task", help="the task id the job belongs to (becomes the pueue label)")
         q.add_argument("--group", default=None,
@@ -4376,7 +4408,7 @@ def build_parser():
         if name == "run":
             waitopts(q)
 
-    q = sub.add_parser("wait", help="wait on one or more queued or finished jobs on one host")
+    q = sub.add_parser("wait", help="wait on one or more queued or finished jobs on one host", epilog=RUN_RULES)
     q.add_argument("host", help="local, or a name from %s" % HOSTS_FILE)
     q.add_argument("ids", type=int, nargs="+", metavar="id")
     q.add_argument("--token", default=None, help="the token 'job submit' printed; refuses a reused id")
@@ -4469,7 +4501,7 @@ def main(argv=None):
             args.host = mine[0]
     auto = args.cmd in ("run", "submit") and args.host == "auto"  # admission chooses the host
     if getattr(args, "host", None) is not None and args.host not in HOSTS and not auto:
-        sys.stdout.write("job: WRAPPER_ERROR unknown host %r; known hosts: %s (add it to %s)\njob: exit %d\n"
+        sys.stdout.write("job: WRAPPER_ERROR unknown host %r; known hosts: %s (add it to %s)\njob: WRAPPER_ERROR exit %d\n"
                          % (args.host, ", ".join(HOSTS), HOSTS_FILE, EXIT["WRAPPER_ERROR"]))
         return EXIT["WRAPPER_ERROR"]
     handlers = {"run": cmd_run, "submit": lambda a: cmd_run(a, queue_only=True), "wait": cmd_wait,
@@ -4478,20 +4510,20 @@ def main(argv=None):
     try:
         return handlers[args.cmd](args)
     except NoRoom as e:  # a hold the host has no room for: the service refuses its load (other errors: its own guard)
-        sys.stdout.write("job: NO_ROOM %s\njob: exit %d\n" % (e, EXIT["NO_ROOM"]))
+        sys.stdout.write("job: NO_ROOM %s\njob: NO_ROOM exit %d\n" % (e, EXIT["NO_ROOM"]))
         return EXIT["NO_ROOM"]
     except JobError as e:
-        sys.stdout.write("job: WRAPPER_ERROR %s\n%sjob: exit %d\n" % (
+        sys.stdout.write("job: WRAPPER_ERROR %s\n%sjob: WRAPPER_ERROR exit %d\n" % (
             e, ("note: %s\n" % QUEUED_HINT) if QUEUED_HINT else "", EXIT["WRAPPER_ERROR"]))
         return EXIT["WRAPPER_ERROR"]
     except Unreachable as e:
-        sys.stdout.write("job: UNREACHABLE %s\njob: exit %d\n" % (e, EXIT["UNREACHABLE"]))
+        sys.stdout.write("job: UNREACHABLE %s\njob: UNREACHABLE exit %d\n" % (e, EXIT["UNREACHABLE"]))
         return EXIT["UNREACHABLE"]
     except KeyboardInterrupt:
         sys.stderr.write("job: interrupted; the job itself keeps running under pueue\n")
         return 130
     except Exception as e:  # never exit 1, which would look like the job's own exit 1
-        sys.stdout.write("job: WRAPPER_ERROR internal error %s: %s\n%sjob: exit %d\n"
+        sys.stdout.write("job: WRAPPER_ERROR internal error %s: %s\n%sjob: WRAPPER_ERROR exit %d\n"
                          % (type(e).__name__, e, ("note: %s\n" % QUEUED_HINT) if QUEUED_HINT else "",
                             EXIT["WRAPPER_ERROR"]))
         return EXIT["WRAPPER_ERROR"]

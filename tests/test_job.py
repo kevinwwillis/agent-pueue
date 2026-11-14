@@ -72,7 +72,8 @@ class Daemon:
         e["JOB_PUEUE_CONFIG"] = self.cfg
         e["XDG_STATE_HOME"] = os.path.join(self.dir, "state")
         e["JOB_ADMISSION_CONFIG"] = os.path.join(self.dir, "no-admission.json")  # not an admission host
-        e.pop("JOB_SESSION", None)
+        # each call its own session, so jobs without --group do not queue behind each other in one session group
+        e["JOB_SESSION"] = "t-" + os.urandom(4).hex()
         e.update(extra)
         return e
 
@@ -148,13 +149,16 @@ class JobTests(Base):
         self.assertTrue(first.startswith("job: SUCCESS local#"), first)
         self.assertIn("(T-ok)", first)
         self.assertIn("world", p.stdout)
-        self.assertTrue(p.stdout.rstrip().endswith("job: exit 0"))
+        last = p.stdout.rstrip().splitlines()[-1]
+        self.assertEqual(last, "job: SUCCESS %s exit 0" % first.split()[2])
 
     def test_failure_passes_exit_code(self):
         p = self.job("run", "local", "T-fail", "--poll", "0.3", "--", "echo before; exit 7")
         self.assertEqual(p.returncode, 7, p.stdout + p.stderr)
         self.assertIn("job: FAILED local#", p.stdout)
         self.assertIn("exit 7", p.stdout.splitlines()[0])
+        tid = p.stdout.split("#", 1)[1].split()[0]
+        self.assertEqual(p.stdout.rstrip().splitlines()[-1], "job: FAILED local#%s exit 7" % tid)
         self.assertIn("before", p.stdout)
 
     def test_argv_command_is_quoted(self):
@@ -521,7 +525,8 @@ class RegressionTests(Base):
         self.assertEqual(p.stdout.count("job: SUCCESS"), 2)
 
     def test_several_jobs_end_early_on_a_stall(self):
-        ids = [self.submit(c, task="T-multi-stall") for c in ("sleep 300", "sleep 20")]
+        self.job("group", "local", "stallpair", "2")
+        ids = [self.submit(c, task="T-multi-stall", extra=("--group", "stallpair")) for c in ("sleep 300", "sleep 20")]
         p = self.job("wait", "local", *[str(i) for i in ids], "--poll", "0.3", "--stall", "0.05")
         self.assertEqual(p.returncode, 200, p.stdout + p.stderr)
         self.assertIn("still waiting", p.stdout.splitlines()[0])
@@ -773,6 +778,30 @@ class SessionGroupTests(Base):
                "Backtrace omitted. Run with RUST_BACKTRACE=1 environment variable to display it.\n"
                "Run with RUST_BACKTRACE=full to include source snippets.\n")
         self.assertEqual(job._pueue_error_text(raw), "Failed to connect to the daemon")
+
+
+class HelpAndLastLineTests(Base):
+    """The last line carries the verdict; help carries the rules agents missed (TASK-007.06)."""
+
+    def test_wrapper_error_last_line_names_the_verdict(self):
+        p = self.job("submit", "local", "T-ll", "--group", "nope", "--", "true")
+        self.assertEqual(p.returncode, 205)
+        self.assertEqual(p.stdout.rstrip().splitlines()[-1], "job: WRAPPER_ERROR exit 205")
+
+    def test_several_jobs_last_line(self):
+        ids = [self.submit("true", task="T-ll2") for _ in range(2)]
+        p = self.job("wait", "local", *[str(i) for i in ids], "--poll", "0.3")
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertEqual(p.stdout.rstrip().splitlines()[-1], "job: SUCCESS local#%d,%d exit 0" % tuple(ids))
+
+    def test_help_has_the_rules(self):
+        h = self.job("--help").stdout
+        for text in ("never pipe", "--tail N", "session's own group", "--pilot", "--like", "also removes a queued",
+                     "job wait HOST ID --token T"):
+            self.assertIn(text, h)
+        r = self.job("run", "--help").stdout
+        self.assertIn("never pipe", r)
+        self.assertIn("--tail", r)
 
 
 if __name__ == "__main__":

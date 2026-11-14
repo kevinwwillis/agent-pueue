@@ -91,9 +91,9 @@ job run <host> <task-id> [--cwd DIR] [--group G] [--env NAME[=VALUE]] [--script 
   `--env PYTHONUNBUFFERED=1`) so the log, `--check` and stall detection see
   output as it is written.
 
-Run it with the Bash tool's `run_in_background: true`. Do not add `&`, a
-`pgrep` loop, a log grep or a PID file: the background command's exit is the
-wake-up.
+Run it with the Bash tool's `run_in_background: true`. Do not add `&`, a pipe,
+a `pgrep` loop, a log grep or a PID file: the background command's exit is the
+wake-up. `job --help` lists the rules agents most often miss.
 
 ```bash
 job run gpu1 TASK-12 --cwd /data/runs -- 'python -u bootstrap.py --n 500'
@@ -116,12 +116,17 @@ log: gpu1:/home/me/.local/share/pueue/task_logs/14.log
 --- last 40 log lines ---
 ...
 --- end of log tail ---
-job: exit 3
+job: FAILED gpu1#14 exit 3
 ```
 
 **Read the first line.** It is the verdict. The exit code alone can be
 ambiguous: a job that itself exits 200 looks like `STALLED` to anyone reading
-only the code. The last line repeats the exit code.
+only the code. The last line repeats the verdict, the job and the exit code
+(`job: FAILED gpu1#14 exit 3`), so it survives a cut-off output too.
+
+**Never pipe `job run` or `job wait`** (`| tail`, `| head`, `| grep`). The
+pipe's exit code replaces the job's, so a failed job reads as exit 0, and
+`head` or `tail` can cut off the verdict. For fewer log lines use `--tail N`.
 
 ## Verdicts and exit codes
 
