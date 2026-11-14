@@ -1,0 +1,25 @@
+---
+id: TASK-005
+title: >-
+  pueued -vv floods sttp1/sttp2 journals; every other log survives only about 5
+  hours
+status: To Do
+assignee: []
+created_date: '2026-11-14T14:24:00Z'
+labels: []
+dependencies: []
+priority: high
+ordinal: 12000
+---
+
+## Description
+
+<!-- SECTION:DESCRIPTION:BEGIN -->
+Found 2026-11-14 09:23 ET by the TARS/MO manager. pueued.service on sttp1 and sttp2 (jge user unit) runs 'pueued -vv'. On sttp2 it wrote 1,108,294 journal lines in the last hour (the next unit had 6,659), mostly debug dumps of the task list (status: Done { priority: 0, label: Some(..., envs: hidden ...). The journal is capped at 4G (journald.conf.d/50-retention.conf), so it now reaches back only to 2026-11-14 04:14 ET: logs of every service (TARS worker, Meeting Ops, JupyterHub, sshd) are gone after ~5 h. This also explains TASK-004's 'journalctl has no entries for those minutes'. Needed: run pueued at normal verbosity (no -vv) on both servers and in the install path that writes the unit; check the journal then reaches back days.
+<!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 pueued runs without -vv on sttp1 and sttp2, and the installer writes it that way
+- [ ] #2 sttp2's journal covers more than 3 days a few days after the change
+<!-- AC:END -->
