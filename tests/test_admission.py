@@ -684,6 +684,24 @@ class ResizeRules(unittest.TestCase):
         self.assertIn("ends in exit 137", why)
         self.assertIn("--pilot, then --like", why)
 
+    def test_a_pilot_needs_its_ram_floor(self):
+        self.assertEqual(self.s["pilot"]["ram_floor_gb"], 16)
+        r = self.j.compute_room(self.s, [sample(100, avail=11 * GB)], [], [], 100)  # 10 GB of room
+        ok, why = self.j.fits(self.s, r, held(pilot=True))
+        self.assertFalse(ok)
+        self.assertIn("a pilot needs at least 16.0 GB of RAM room (pilot.ram_floor_gb), 10.0 GB free", why)
+        r = self.j.compute_room(self.s, [sample(100, avail=17 * GB)], [], [], 100)
+        self.assertTrue(self.j.fits(self.s, r, held(pilot=True))[0])
+        cap = {"mem_total": 12 * GB, "threads": 8, "gpus": []}
+        self.assertIn("a pilot needs at least 16.0 GB", self.j.fits_empty(self.s, cap, held(pilot=True)))
+
+    def test_a_pilot_stopped_at_its_time_limit_has_its_own_verdict(self):
+        v = self.j.scope_verdict("KILLED", 137, {"how": "killed", "stopped_by": "pilot time limit"})
+        self.assertEqual(v[:2], ("PILOT_TIME_LIMIT", 207))
+        self.assertNotIn(207, [c for k, c in self.j.EXIT.items() if k != "PILOT_TIME_LIMIT"])
+        self.assertEqual(self.j.scope_verdict("KILLED", 137, {"how": "killed", "stopped_by": "stop-at"})[:2],
+                         ("KILLED", 137))
+
     def test_what_a_held_job_lacks(self):
         r = self.j.compute_room(self.s, [sample(100, avail=5 * GB, busy=7.0, gpus={CARD: card(20 * GB)})], [], [], 100)
         lack = self.j._lack(self.s, r, held(cpus=3, ram=4 * GB, gpus=1, gpu_mem=6 * GB))
@@ -912,7 +930,10 @@ class LoopTests(Base):
         self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
         rec = self.record(tok)
         self.assertEqual(rec["how"], "pilot time limit")
-        self.assertIn("stopped this pilot at its time limit, as planned", self.wait(tid, tok).stdout)
+        w = self.wait(tid, tok)
+        self.assertIn("stopped this pilot at its time limit, as planned", w.stdout)
+        self.assertEqual(w.returncode, 207, w.stdout)  # its own verdict, not 137 (an out-of-memory kill)
+        self.assertIn("job: PILOT_TIME_LIMIT local#%d" % tid, w.stdout)
         self.assertGreaterEqual(rec["peak_ram"], 60 * MiB)
         r2 = self.submit_sized("echo sized", like=tok)
         self.assertTrue(r2["ok"], r2)
@@ -920,6 +941,36 @@ class LoopTests(Base):
             q = json.load(f)
         self.assertEqual(q["size_source"], "like")
         self.assertGreaterEqual(q["size"]["ram"], 60 * MiB * 1.25)
+        # --like last: the last good run of the same task id here, named with its peaks
+        r3 = self.submit_sized("echo sized-last", like="last")
+        self.assertTrue(r3["ok"], r3)
+        self.assertIn("last good run of T-adm here, #%d (pilot stopped at its time limit" % tid, r3["data"]["sized"])
+        self.assertIn("peaks", r3["data"]["sized"])
+        with open(os.path.join(self.settings["state_dir"], "queue", r3["data"]["token"] + ".json")) as f:
+            self.assertEqual(json.load(f)["like_from"], tok)
+        for r in (r2, r3):
+            self.d.pueue("remove", str(r["data"]["id"]))
+
+    def test_like_last_without_a_good_run_is_refused(self):
+        r = self.submit_sized("true", like="last")
+        self.assertFalse(r["ok"], r)
+        self.assertIn("--like last: no run of T-adm", r["error"])
+
+    def test_a_pilot_waits_for_its_ram_floor(self):
+        self.write_settings(pilot={"max_minutes": 1, "ram_floor_gb": 8})
+        self.host.set(avail=6 * GB)  # 5 GB of room, under the 8 GB floor
+        loop = self.loop()
+        r = self.submit_sized("echo pilot-ran", pilot=True)
+        tid = r["data"]["id"]
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        self.assertEqual(self.status(tid), "Stashed")
+        with open(os.path.join(self.state, "room.json")) as f:
+            self.assertIn("a pilot needs at least 8.0 GB of RAM room", json.load(f)["held"][0]["reason"])
+        self.host.set(avail=10 * GB)
+        loop.samples = []
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
 
     def test_like_refuses_a_run_killed_for_memory(self):
         loop = self.loop()

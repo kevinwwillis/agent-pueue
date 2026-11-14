@@ -137,6 +137,7 @@ only the code. The last line repeats the exit code.
 | `UNREACHABLE` | 202 | For 15 minutes `job` could not get the job's state: the host was unreachable over ssh, or pueue there did not answer. Shorter gaps are retried quietly. | probably |
 | `GONE` | 204 | The pueue task no longer exists, or its id now belongs to another job. | no |
 | `WRAPPER_ERROR` | 205 | `job` could not do what was asked (bad group, missing directory, bad `--check` path, pueue down at submit time, client and host versions differ, or an admitted job's systemd scope or memory limit could not be set up, so the job never ran); the message says what. If a `note:` line says the job was queued, it was, and keeps running; otherwise it was not queued. | see the message |
+| `PILOT_TIME_LIMIT` | 207 | A `--pilot` on an admission host was stopped at its time limit, as planned. Its peaks are recorded; size the next run with `--like`. | no |
 | `NO_ROOM` | 206 | `job hold` only: the host has no room for the hold now. Any other failure of `job hold` (not an admission host, its loop stopped or still measuring, unreachable) exits as above, so a service refuses its load on 206 and otherwise falls back to its own check. | the service decides |
 
 After `STALLED`, `ALERT` or `UNREACHABLE` the job is left alone. Look at the
@@ -253,10 +254,13 @@ when it fits. The design is [admission.md](admission.md). On such a host:
 - **Every job needs a size**, one of:
   - `--pilot`: a first run to measure the job. It gets all the free RAM (and, with `--gpus N`, all the free
     memory on those cards) and stops at its time limit (`--max-minutes`, or the host's setting).
-    It takes `--cpus N` and `--gpus N`, not `--ram`. Its time limit counts from its start.
+    It takes `--cpus N` and `--gpus N`, not `--ram`. Its time limit counts from its start. It starts only when
+    the host has at least `pilot.ram_floor_gb` (16 GB by default) of RAM room, so it is not limited to a few GB.
   - `--like TOKEN` (or `HOST#ID`): sized from that earlier job's measured peaks plus margins, printed as
     `sized like ...`, and run on the host that holds that record. Refused when that run was killed or
     crashed (its peaks are only a lower bound) or was measured fewer than 3 times.
+  - `--like last`: sized from the last good run (exit 0, or a pilot that reached its time limit) of the same task
+    id on that host; it prints which run and its peaks.
   - `--ram SIZE` (required, at least 16 MiB) with `--cpus N` (more than 0), `--gpus N`, `--gpu-mem SIZE` (per
     GPU), `--gpu-share PCT`; or `--small`. Sizes: `20G` is 20×10⁹ bytes, `512Mi` is 512×2²⁰.
 - `job run auto <task-id> ...` lets `job` choose the host: one with room now, else the job waits (is held) on
@@ -287,10 +291,10 @@ when it fits. The design is [admission.md](admission.md). On such a host:
 - GPUs are given by UUID in `CUDA_VISIBLE_DEVICES` (also in `JOB_GPU_UUIDS`); a job without `--gpus` sees none.
   `--env CUDA_VISIBLE_DEVICES=...` is refused. Code should use devices 0..N-1.
 - `ALERT` (exit 201) can also come from the loop: the job's group is paused, it uses more GPU memory than its
-  size or a GPU it was not given, its RAM trend reaches its limit, a stop at its time limit failed, or the
+  size or a GPU it was not given, its RAM trend reaches its limit, it is oversized, a stop at its time limit failed, or the
   host's loop has stopped while the job is held. The job keeps its place.
-- A pilot stopped at its time limit ends `KILLED` with a note saying so ("as planned"); size the next run
-  `--like` its token.
+- A pilot stopped at its time limit ends `PILOT_TIME_LIMIT` (exit 207, not 137) with a note saying so ("as
+  planned"); size the next run `--like` its token, or `--like last`.
 - Without `--group`, admitted jobs run in the group `sched`, so they start as soon as they fit.
 - Other constraints: `--gpu-model TEXT`, `--needs-path PATH`, `--data PATH` (its disk; heavy-disk jobs wait
   while that disk is busy), `--stop-at TIME` (with its UTC offset; stopped then, dropped if still held),

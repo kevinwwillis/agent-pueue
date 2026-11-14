@@ -94,6 +94,7 @@ EXIT = {
     "GONE": 204,
     "WRAPPER_ERROR": 205,
     "NO_ROOM": 206,
+    "PILOT_TIME_LIMIT": 207,
 }
 # Outcomes that end a multi-job wait at once (the agent must look now).
 URGENT = ("STALLED", "ALERT", "UNREACHABLE", "GONE", "WRAPPER_ERROR")
@@ -897,7 +898,7 @@ ADMISSION_DEFAULTS = {
     "oversize_fraction": 0.5,          # this long gets one ALERT saying so, with the command to shrink it
     "resize_margin": 1.25,             # a running job's new RAM limit must cover its measured peak times this
     "small": {"cpus": 1, "ram_gb": 4},
-    "pilot": {"max_minutes": 30, "gpu_min_gb": 2},
+    "pilot": {"max_minutes": 30, "gpu_min_gb": 2, "ram_floor_gb": 16},
     "margins": {"cpu": 1.2, "ram": 1.25, "gpu_mem": 1.15},
     "preemptible": False,
     "oom_score_adj": 500,
@@ -967,6 +968,7 @@ def _admission_settings(path=None, nthreads=None):
     _num(s["small"]["ram_gb"], "small.ram_gb", lo=0.01)
     _num(s["pilot"]["max_minutes"], "pilot.max_minutes", lo=1)
     _num(s["pilot"]["gpu_min_gb"], "pilot.gpu_min_gb", lo=0)
+    _num(s["pilot"]["ram_floor_gb"], "pilot.ram_floor_gb", lo=0)
     for k in ("cpu", "ram", "gpu_mem"):
         _num(s["margins"][k], "margins." + k, lo=1.0)
     if not isinstance(s["preemptible"], bool):
@@ -1391,8 +1393,9 @@ def compute_room(settings, samples, inflight, holds, now):
 
 
 def _pilot_ram_need(settings, size):
-    """The RAM room a pilot needs before it is released."""
-    return size["ram"]
+    """The RAM room a pilot needs before it is released: at least pilot.ram_floor_gb, so that a pilot released on
+    a busy host is not limited to a few GB and killed within minutes."""
+    return max(size["ram"], settings["pilot"]["ram_floor_gb"] * GB)
 
 
 def ram_limit(settings, ram):
@@ -1414,8 +1417,9 @@ def fits(settings, room, job, data_disk=None):
     size, pilot = job["size"], job.get("pilot")
     ram_room = room["ram"]["room"]
     if pilot:
-        if ram_room <= size["ram"]:
-            return False, "a pilot needs RAM room; %s free" % _gbs(max(0, ram_room))
+        if ram_room <= size["ram"] or ram_room < _pilot_ram_need(settings, size):
+            return False, "a pilot needs at least %s of RAM room (pilot.ram_floor_gb), %s free" % (
+                _gbs(_pilot_ram_need(settings, size)), _gbs(max(0, ram_room)))
         ram_counted = ram_room
     else:
         ram_counted = ram_limit(settings, size["ram"])
@@ -1501,8 +1505,9 @@ def fits_empty(settings, capacity, job):
         return "needs %g%% of a GPU's time; this host shares out at most %g%% of a card" % (
             size["gpu_share"], settings["gpu_busy_max_pct"])
     ram_max = capacity["mem_total"] - settings["ram_headroom_gb"] * GB
-    if job.get("pilot") and size["ram"] > ram_max:
-        return "needs %s RAM; this host has at most %s for jobs" % (_gbs(size["ram"]), _gbs(ram_max))
+    if job.get("pilot") and _pilot_ram_need(settings, size) > ram_max:
+        return "a pilot needs at least %s of RAM room (pilot.ram_floor_gb); this host has at most %s for jobs" % (
+            _gbs(_pilot_ram_need(settings, size)), _gbs(ram_max))
     if not job.get("pilot") and ram_limit(settings, size["ram"]) > ram_max:  # a job is counted at its limit
         return "needs %s RAM (its limit, %g times its size); this host has at most %s for jobs" % (
             _gbs(ram_limit(settings, size["ram"])), settings["ram_hard_factor"], _gbs(ram_max))
@@ -1641,6 +1646,16 @@ class Admission:
         con.execute("INSERT INTO jobs (%s) VALUES (%s) ON CONFLICT(token) DO UPDATE SET %s" % (
             ", ".join(cols), ", ".join("?" * len(cols)), ", ".join("%s=excluded.%s" % (c, c) for c in cols)), vals)
 
+    def find_last(self, con, task):
+        """The newest good run of a task here (exit 0, or a pilot that reached its time limit), measured often enough
+        to size from."""
+        con.row_factory = sqlite3.Row
+        r = con.execute("SELECT * FROM jobs WHERE task = ? AND ended IS NOT NULL AND ((how = 'exit' AND exit = 0) OR "
+                        "how = 'pilot time limit') AND peak_samples >= ? ORDER BY ended DESC LIMIT 1",
+                        (task, LIKE_MIN_SAMPLES)).fetchone()
+        con.row_factory = None
+        return dict(r) if r else None
+
     def find(self, con, ref):
         """The record a --like names: a token, or HOST#ID for the newest job with that id here."""
         con.row_factory = sqlite3.Row
@@ -1700,11 +1715,16 @@ def _size_from(settings, adm, capacity, req):
     if a.get("small"):
         return size, "small", False, None
     if a.get("like"):
+        last = str(a["like"]) == "last"
         con = adm.db()
         try:
-            r = adm.find(con, str(a["like"]))
+            r = adm.find_last(con, req.get("task")) if last else adm.find(con, str(a["like"]))
         finally:
             con.close()
+        if r is None and last:
+            raise JobError("--like last: no run of %s on %s exited 0 or was a pilot that reached its time limit, "
+                           "measured at least %d times; run a --pilot first" % (req.get("task"), socket.gethostname(),
+                                                                                LIKE_MIN_SAMPLES))
         if r is None:
             raise JobError("--like %s: no record of that job on %s" % (a["like"], socket.gethostname()))
         if not ((r["how"] == "exit" and r["exit"] == 0) or r["how"] == "pilot time limit"):
@@ -1728,6 +1748,22 @@ def _size_from(settings, adm, capacity, req):
         size["disk_mb_s"] = float(r.get("peak_disk_mb_s") or 0.0)
         return size, "like", False, r["token"]
     return size, "explicit", False, None
+
+
+def _like_source_text(adm, token):
+    """Which run a --like last size came from, with its peaks."""
+    con = adm.db()
+    try:
+        r = adm.find(con, token)
+    finally:
+        con.close()
+    if not r:
+        return "?"
+    return "#%s (%s, ended %s), peaks %.1f CPU, %s RAM%s from %d samples" % (
+        r.get("pueue_id"), "pilot stopped at its time limit" if r.get("how") == "pilot time limit" else "exit 0",
+        dt.datetime.fromtimestamp(r["ended"]).astimezone().strftime("%Y-%m-%d %H:%M %Z") if r.get("ended") else "?",
+        r.get("peak_cpu") or 0, _gbs(r.get("peak_ram") or 0),
+        ", GPU %s" % _gbs(r["peak_gpu_mem"]) if r.get("peak_gpu_mem") else "", r.get("peak_samples") or 0)
 
 
 def _read_progress(token):
@@ -1957,6 +1993,8 @@ def host_submit_admitted(req, settings, command):
             reply["sized"] = "sized like %s: %g CPU threads, %s RAM%s" % (
                 like_from, size["cpus"], _gbs(size["ram"]),
                 ", %d GPU(s) with %s each" % (size["gpus"], _gbs(size["gpu_mem"])) if size["gpus"] else "")
+            if str(a.get("like")) == "last":
+                reply["sized"] += "; that is the last good run of %s here, %s" % (q["task"], _like_source_text(adm, like_from))
         return reply
     finally:
         os.close(fd)
@@ -3608,8 +3646,9 @@ def scope_verdict(verdict, code, scope):
         return verdict, code, ("it ended with signal 9 and no out-of-memory event, so not by its RAM limit: "
                                "systemd-oomd under memory pressure, a person, or the job itself sent it")
     if how == "killed" and scope.get("stopped_by") == "pilot time limit":
-        return verdict, code, ("the admission loop stopped this pilot at its time limit, as planned; its peaks are "
-                               "recorded, so size the next run with --like and this job's token")
+        return "PILOT_TIME_LIMIT", EXIT["PILOT_TIME_LIMIT"], (
+            "the admission loop stopped this pilot at its time limit, as planned (not an out-of-memory kill); its peaks "
+            "are recorded, so size the next run with --like and this job's token, or --like last")
     if how == "killed" and scope.get("stopped_by") == "stop-at":
         return verdict, code, "the admission loop stopped it at its --stop-at time"
     if how == "scope_killed":
@@ -4151,7 +4190,8 @@ def build_parser():
         a = q.add_argument_group("size and constraints, for admission hosts and auto (docs/admission.md)")
         a.add_argument("--pilot", action="store_true", help="a first run to measure the job (time-limited)")
         a.add_argument("--max-minutes", type=int, default=None, metavar="N", help="a pilot's time limit")
-        a.add_argument("--like", default=None, metavar="TOKEN|HOST#ID", help="size it from that earlier job's peaks")
+        a.add_argument("--like", default=None, metavar="TOKEN|HOST#ID|last",
+                       help="size it from that earlier job's peaks; last: the last good run of this task id there")
         a.add_argument("--small", action="store_true", help="the host's small size")
         a.add_argument("--cpus", type=float, default=None, metavar="N", help="CPU threads")
         a.add_argument("--ram", type=_parse_size, default=None, metavar="SIZE", help="RAM, e.g. 20G or 512Mi")

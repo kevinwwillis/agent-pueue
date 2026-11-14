@@ -40,7 +40,10 @@ job release host2 <hold-id>
     release, and, with `--gpus N`, counted at all the free memory on the cards it gets (GPU memory is not
     capped), so nothing else can be admitted into room it may grow into. It has a time limit (`pilot.max_minutes`, or `--max-minutes`), so it never holds the
     room for long; the limit counts from its start. It takes `--cpus` and `--gpus`, and a GPU pilot needs at
-    least `pilot.gpu_min_gb` free on each card. Its use is sampled every `pilot_sample_interval_s`.
+    least `pilot.gpu_min_gb` free on each card. It is released only when the RAM room is at least
+    `pilot.ram_floor_gb` (default 16), so a pilot released on a busy host is not limited to the few GB left there
+    and stopped within minutes; a host with less than that for jobs refuses pilots at submit. Its use is sampled
+    every `pilot_sample_interval_s`.
   - **`--like TOKEN`** (or `HOST#ID`, the newest job with that id on that host): that job's measured peaks
     times the margins, each capped at the host's or card's maximum when the peak itself fits, and its peak disk
     rate. The size is printed (`sized like <token>: ...`). Accepted from a run that exited 0, or a pilot that
@@ -49,6 +52,9 @@ job release host2 <hold-id>
     holds the record: `HOST#ID` is sent only to HOST, and `auto` with a token tries the hosts in turn, the
     others refusing for want of the record. Sampled peaks are a lower bound even for a clean run; the margins
     and `ram_hard_factor` cover the gap between samples.
+  - **`--like last`**: the same, from the newest record on that host of the same task id that exited 0 or was a
+    pilot that reached its time limit, measured at least 3 times. The printed size names that run (pueue id, how
+    and when it ended) and its peaks. An older host reads `last` as a token and refuses it for want of a record.
   - **Explicit sizes:** `--ram SIZE` (required; the job's hard RAM limit is `ram_hard_factor` times it), with
     `--cpus N` (default: the small size's CPUs), `--gpus N`, `--gpu-mem SIZE` (per GPU), `--gpu-share PCT`; or
     `--small`, the settings file's small size.
@@ -117,7 +123,7 @@ standard-library Python 3.8. An example for a 32-thread host with 256 GB RAM (il
   "oversize_fraction": 0.5,
   "resize_margin": 1.25,
   "small": {"cpus": 1, "ram_gb": 4},
-  "pilot": {"max_minutes": 30, "gpu_min_gb": 2},
+  "pilot": {"max_minutes": 30, "gpu_min_gb": 2, "ram_floor_gb": 16},
   "margins": {"cpu": 1.2, "ram": 1.25, "gpu_mem": 1.15},
   "preemptible": false,
   "oom_score_adj": 500,
@@ -275,7 +281,8 @@ Limits and settings:
   scopes of tasks pueue still runs, are never touched.
 - A pilot past its time limit or a job past `--stop-at` is killed while Running; a paused one is killed once it
   is resumed. A kill that fails is tried again each cycle, with an ALERT. The wait ends `KILLED` with a note
-  saying the loop stopped it and why (for a pilot: "as planned").
+  saying the loop stopped it and why; a pilot stopped at its time limit ends `PILOT_TIME_LIMIT` (exit 207, used
+  for nothing else) with the note "as planned", so it is not read as an out-of-memory kill (137).
 
 ### Jobs that run containers
 
