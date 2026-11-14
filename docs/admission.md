@@ -74,7 +74,15 @@ job release host2 <hold-id>
     alert fires once per job.
   - While a job is held, its wait prints a line saying why (for example `held: needs 18.0 GB on GPU 0, 9.4 GB
     free`) every 10 minutes, and `job ls` shows `Held` with the reason. Being held is not a verdict and does not
-    end a multi-job wait.
+    end a multi-job wait. The submit itself computes the first reason from the loop's last snapshot, counting
+    the jobs held ahead of it as `fit_now` does (with no snapshot: the loop is measuring the host; with a stale
+    heartbeat: the loop is not running), so the first line is never a placeholder. A job held by the fairness
+    rule names the older job (task id and token) and that job's own reason. When a job is short of RAM, CPU or
+    GPU memory, the loop adds a start estimate: the running jobs that hold that room, in order of their
+    projected ends (see "Progress"), until what they free covers what it lacks (for GPUs, on as many cards as it
+    still needs); the reason gives that time and the job whose end it waits for, or says none is known because a
+    job on the way has no projected end, or the room it lacks is outside use or holds, or it waits on a busy
+    disk or GPU. The time is in the host's zone; `job room --json` has it as `start_estimate`.
   - A submit that cannot fit on any host even when that host is empty (its capacity minus headroom; for RAM, the
     job's hard limit must fit) is refused at once with `WRAPPER_ERROR` and the reason.
   - When a job's command ends, any processes it left running (for example a `nohup ... &`) are stopped within one

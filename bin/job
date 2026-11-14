@@ -1860,6 +1860,60 @@ def _simulate_fit(settings, adm, job):
     return fits(settings, room, job)
 
 
+def _submit_reason(settings, adm, job):
+    """Why a job just submitted is held, from the loop's last snapshot (the loop gives its own reason when it next
+    looks at the job)."""
+    snap = adm.read_json(adm.path("room.json"))
+    age = _heartbeat_age(adm)
+    if not snap:
+        return "the admission loop is measuring this host; it looks at the job in its next cycle"
+    if age is None or age > _heartbeat_limit(settings):
+        return "the admission loop on this host is not running, so the job stays held until it runs again"
+    if not snap.get("room"):
+        w = snap.get("warmup") or {}
+        return "the loop is measuring this host first (%s of %s)" % (_fmt_dur(w.get("covered_s")),
+                                                                      _fmt_dur(w.get("needed_s")))
+    ok, got = _simulate_fit(settings, adm, job)
+    return "it fits the room now; the admission loop starts it in its next cycle" if ok else got
+
+
+def start_estimate(lack, running, gpus_needed=0, gpus_fitting=0):
+    """When enough room should free for a held job that lacks {resource: amount}, as running jobs end at their
+    projected ends. running: [(projected end or None, {resource: what it frees}, task)]. Returns (time, task) or
+    (None, why none is known). A job needing n GPUs needs only n - gpus_fitting of the cards it is short on."""
+    def when(r, amt):
+        freed = 0.0
+        for end, frees, task in sorted((x for x in running if x[1].get(r)), key=lambda x: (x[0] is None, x[0] or 0)):
+            if end is None:
+                return None, ("none known: a running job that holds that room has no projected end (a job gets one "
+                              "by appending 'done total' lines to $JOB_PROGRESS)")
+            freed += frees[r]
+            if freed >= amt:
+                return (end, task), None
+        return None, "none known: the room it lacks is not held by running jobs (outside use or holds)"
+    times, gpu_times = [], []
+    for r, amt in lack.items():
+        if r.startswith("disk:") or amt <= 0:
+            return None, "none known: it waits on a busy disk or GPU, not on room a running job holds"
+        got, why = when(r, amt)
+        if r.startswith("gpu:"):
+            if got:
+                gpu_times.append(got)
+            continue
+        if got is None:
+            return None, why
+        times.append(got)
+    gpu_keys = [r for r in lack if r.startswith("gpu:")]
+    if gpu_keys:
+        k = max(1, gpus_needed - gpus_fitting)
+        if len(gpu_times) < k:
+            return None, "none known: no running job with a projected end frees enough GPU memory"
+        times.append(sorted(gpu_times)[k - 1])
+    if not times:
+        return None, "none known"
+    return max(times), None
+
+
 def _take(room, job, got):
     """Count a released job against a room (within one cycle, before the next measurement)."""
     room["ram"]["room"] -= got["ram_counted"]
@@ -1943,6 +1997,7 @@ def host_submit_admitted(req, settings, command):
             ok, got = _simulate_fit(settings, adm, q)
             if not ok:
                 raise JobError("no room on %s now: %s" % (socket.gethostname(), got))
+        q["reason"] = _submit_reason(settings, adm, q)  # the first held line says why, before the loop looks
         # The record and queue file come first: once pueue has the task, nothing may report the submit as failed
         # (the job would run anyway, and a resubmit would run it twice).
         qpath = adm.path("queue", token + ".json")
@@ -1989,6 +2044,7 @@ def host_submit_admitted(req, settings, command):
         except (OSError, sqlite3.Error):
             pass  # the job is queued; the loop records its id when it releases it
         reply["held"] = True
+        reply["held_reason"] = q["reason"]
         if source == "like":
             reply["sized"] = "sized like %s: %g CPU threads, %s RAM%s" % (
                 like_from, size["cpus"], _gbs(size["ram"]),
@@ -2612,6 +2668,7 @@ class Loop:
         taken = {}  # what younger jobs released past it, and still in flight, take of each of those resources
         small = self.s["fairness_small_fraction"]
         inflight = {q["token"] for q in queue if q.get("state") == "released"}
+        ending = [self._frees(q, now) for q in queue if q.get("state") == "released"]  # for start estimates
         for q in queue:
             if q.get("state") != "held":
                 continue
@@ -2644,8 +2701,17 @@ class Loop:
                     blocker.setdefault("fair_passed", {})[q["token"]] = passed
                     self.adm.save(blocker)
                 elif hit:
-                    ok, got = False, "waiting behind an older job that needs the same room"
+                    lack = {r: blocked[r] + need.get(r, 0) for r in hit}
+                    ok, got = False, "waiting behind an older job, %s (token %s), that needs: %s" % (
+                        blocker["task"], blocker["token"], blocker.get("reason"))
+            else:
+                lack = None
             if not ok:
+                if lack is None:
+                    lack = _lack(self.s, room, q)
+                q["start_estimate"] = None
+                if lack:
+                    got += "; " + self._estimate_text(q, room, lack, ending)
                 q["reason"] = got
                 self.adm.save(q)
                 if (blocked is None and now - q["submitted"] >= 60 * self.s["fairness_wait_min"]
@@ -2664,6 +2730,26 @@ class Loop:
             if self.enqueue(con, now, q, t, got):
                 _take(room, q, got)
                 running[q["group"]] = running.get(q["group"], 0) + 1
+                ending.append(self._frees(q, now))
+
+    def _frees(self, q, now):
+        """What a running job frees when it ends, and when that should be: (projected end, {resource: amount},
+        task)."""
+        c = self._counted(q, now)
+        frees = {"ram": c["ram_counted"], "cpu": c["size"]["cpus"]}
+        frees.update({"gpu:" + u: b for u, b in (c["gpu_counted"] or {}).items()})
+        return q.get("projected_end"), frees, q["task"]
+
+    def _estimate_text(self, q, room, lack, ending):
+        model = (q.get("constraints") or {}).get("gpu_model")
+        matching = [u for u, g in room["gpus"].items() if not model or model.lower() in g["name"].lower()]
+        fitting = len([u for u in matching if "gpu:" + u not in lack])
+        got, why = start_estimate(lack, ending, q["size"].get("gpus") or 0, fitting)
+        if got is None:
+            return "start estimate: " + why
+        q["start_estimate"] = got[0]
+        return "enough room should free about %s, when %s ends (its projected end)" % (
+            dt.datetime.fromtimestamp(got[0]).astimezone().strftime("%Y-%m-%d %H:%M %Z"), got[1])
 
     def _resources(self, q, got):
         r = {"ram", "cpu"} if q["size"]["ram"] or q["size"]["cpus"] else set()
@@ -2730,7 +2816,8 @@ class Loop:
 
     def write_snapshot(self, now, queue):
         held = [{"token": q["token"], "task": q["task"], "reason": q.get("reason"), "waited_s": now - q["submitted"],
-                 "size": q["size"], "pilot": q.get("pilot")} for q in queue if q.get("state") == "held"]
+                 "size": q["size"], "pilot": q.get("pilot"), "start_estimate": q.get("start_estimate")}
+                for q in queue if q.get("state") == "held"]
         jobs = [{"token": q["token"], "task": q["task"], "id": q.get("pueue_id"), "size": q["size"],
                  "gpus": q.get("gpus"), "released": q.get("released"),
                  "progress": (q.get("progress") or [[0, None, None]])[-1][1:3],
@@ -3348,6 +3435,7 @@ def submit_to(args, host, command, adm):
             r = call(host, "submit", req)
             if r.get("sized"):
                 sys.stderr.write("job: %s\n" % r["sized"])
+            args.held_reason = r.get("held_reason")
             return r["id"], r["token"]
         except Unreachable as e:
             last = e
@@ -3817,7 +3905,8 @@ class Waiter:
             if self.told_held is None or now - self.told_held >= HELD_NOTICE_S:
                 self.told_held = now
                 sys.stderr.write("job: %s#%s held: %s\n" % (self.host, self.tid,
-                                                             s.get("held_reason") or "waiting for the next check"))
+                                                             s.get("held_reason") or
+                                                             "not looked at by the admission loop yet"))
             if s.get("admission_stale") and not self.told_stale:
                 self.told_stale = True
                 return self._outcome("ALERT", EXIT["ALERT"], s, note="the admission loop on %s is not running, so "
@@ -3991,6 +4080,8 @@ def cmd_run(args, queue_only=False):
     if queue_only:
         print(tid)
         sys.stderr.write("job: queued %s#%s (%s). Wait on it with: %s\n" % (args.host, tid, args.task, again))
+        if getattr(args, "held_reason", None):
+            sys.stderr.write("job: %s#%s held: %s\n" % (args.host, tid, args.held_reason))
         return 0
     sys.stderr.write("job: queued %s#%s (%s); waiting. If this wait is lost, reattach with: %s\n"
                      % (args.host, tid, args.task, again))

@@ -269,6 +269,11 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   there. `--host NAME` (repeatable) limits the choice.
 - A held job's wait prints why every 10 minutes (`held: needs 22.5 GB RAM (its limit, 1.5 times its size), 9.4 GB
   free; ...`); being held is not a verdict. A job needs room for its hard RAM limit, not just its size. `job ls` shows it as `Held` with the reason; `job room` shows every host's room and held jobs.
+  The first held line, printed at submit, already gives the reason, from the loop's last measurement (or says
+  the loop is still measuring the host). A job held behind an older one names it (task id and token) and what it
+  needs. When the running jobs holding the room it lacks have projected ends (see `$JOB_PROGRESS` below), the
+  reason says when enough room should free (`enough room should free about ...`); otherwise it says no start
+  estimate is known, and why.
   Don't shrink a held job's size below what it needs to get it started: it then ends in exit 137 at its limit. Size
   it from a measured run (`--pilot`, then `--like`).
 - Release is oldest first. Once the oldest held job has waited `fairness_wait_min` (30 minutes), younger jobs that

@@ -702,6 +702,22 @@ class ResizeRules(unittest.TestCase):
         self.assertEqual(self.j.scope_verdict("KILLED", 137, {"how": "killed", "stopped_by": "stop-at"})[:2],
                          ("KILLED", 137))
 
+    def test_a_start_estimate_from_projected_ends(self):
+        est = self.j.start_estimate
+        running = [(2000.0, {"ram": 3 * GB, "cpu": 2}, "T-b"), (1000.0, {"ram": 3 * GB, "cpu": 1}, "T-a")]
+        self.assertEqual(est({"ram": 2 * GB}, running), ((1000.0, "T-a"), None))
+        self.assertEqual(est({"ram": 5 * GB, "cpu": 1}, running), ((2000.0, "T-b"), None))
+        got, why = est({"ram": 5 * GB}, running + [(None, {"ram": GB}, "T-c")])
+        self.assertEqual(got, (2000.0, "T-b"))  # enough frees before the job without a projected end matters
+        got, why = est({"ram": 7 * GB}, running + [(None, {"ram": GB}, "T-c")])
+        self.assertIsNone(got)
+        self.assertIn("no projected end", why)
+        self.assertIn("not held by running jobs", est({"ram": 10 * GB}, running)[1])
+        self.assertIn("busy disk or GPU", est({"disk:sda": 0.0}, running)[1])
+        gpu = [(500.0, {"gpu:a": 4 * GB}, "T-a"), (300.0, {"gpu:b": 4 * GB}, "T-b")]
+        self.assertEqual(est({"gpu:a": 2 * GB, "gpu:b": GB}, gpu, 1, 0)[0], (300.0, "T-b"))  # either card will do
+        self.assertEqual(est({"gpu:a": 2 * GB, "gpu:b": GB}, gpu, 2, 0)[0], (500.0, "T-a"))  # it needs both
+
     def test_what_a_held_job_lacks(self):
         r = self.j.compute_room(self.s, [sample(100, avail=5 * GB, busy=7.0, gpus={CARD: card(20 * GB)})], [], [], 100)
         lack = self.j._lack(self.s, r, held(cpus=3, ram=4 * GB, gpus=1, gpu_mem=6 * GB))
@@ -2179,6 +2195,24 @@ class LoopTests(Base):
         finally:
             self.d.pueue("remove", str(r["data"]["id"]))
 
+    # -- TASK-007.04: held messages ----------------------------------------------------------------------------
+
+    def test_the_first_held_line_gives_the_real_reason(self):
+        self.host.set(avail=3 * GB)
+        r = self.submit_sized("true", cpus=1, ram=4 * GB)  # no snapshot yet: the loop has not measured
+        self.assertIn("the admission loop is measuring this host", r["data"]["held_reason"])
+        loop = self.loop()
+        self.host.tick()
+        loop.cycle()
+        p = self.job("submit", "local", "T-held", "--cpus", "1", "--ram", "4G", "--", "true", **self.env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        tid = int(p.stdout.strip())
+        self.assertIn("held: needs 6.0 GB RAM (its limit, 1.5 times its size)", p.stderr)
+        ls = self.job("ls", "local", **self.env()).stdout
+        self.assertNotIn("not looked at", ls)
+        for x in (r["data"]["id"], tid):
+            self.d.pueue("remove", str(x))
+
     # -- TASK-007.02: small younger jobs pass the fairness rule ------------------------------------------------
 
     def test_a_small_younger_job_passes_an_older_one_that_waits(self):
@@ -2200,7 +2234,11 @@ class LoopTests(Base):
             self.assertEqual(self.status(tiny[1]["data"]["id"]), "Stashed")
             with open(os.path.join(self.state, "room.json")) as f:
                 reasons = {h["token"]: h["reason"] for h in json.load(f)["held"]}
-            self.assertIn("older job", reasons[tiny[1]["data"]["token"]])
+            why = reasons[tiny[1]["data"]["token"]]
+            # TASK-007.04: it names the older job and what that job needs, and says no start can be estimated
+            self.assertIn("waiting behind an older job, T-adm (token %s), that needs: needs 6.0 GB RAM"
+                          % big["data"]["token"], why)
+            self.assertIn("start estimate: none known: a running job that holds that room has no projected end", why)
         finally:
             for r in [first] + tiny:
                 self.job("kill", "local", str(r["data"]["id"]))
