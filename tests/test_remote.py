@@ -190,7 +190,7 @@ rm -rf -- "${D:?}"
     def test_group_and_ls(self):
         g = self.job("group", HOST, "rq", "1")
         self.assertEqual(g.returncode, 0, g.stdout + g.stderr)
-        a = int(self.job("submit", HOST, "T-r-g1", "--group", "rq", "--", "sleep 5").stdout)
+        a = int(self.job("submit", HOST, "T-r-g1", "--group", "rq", "--", "sleep 20").stdout)
         b = int(self.job("submit", HOST, "T-r-g2", "--group", "rq", "--", "true",
                          JOB_SESSION="remote-sess").stdout)
         time.sleep(2)
