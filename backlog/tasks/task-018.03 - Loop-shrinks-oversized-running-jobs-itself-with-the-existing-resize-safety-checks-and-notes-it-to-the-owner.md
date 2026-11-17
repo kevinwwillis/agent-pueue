@@ -3,10 +3,10 @@ id: TASK-018.03
 title: >-
   Loop shrinks oversized running jobs itself, with the existing resize safety
   checks, and notes it to the owner
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-17T20:36:00Z'
-updated_date: '2026-11-17T20:54:00Z'
+updated_date: '2026-11-17T22:39:00Z'
 labels: []
 dependencies: []
 parent_task_id: TASK-018
@@ -16,7 +16,7 @@ ordinal: 39000
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 An oversized job is resized by the loop without owner action; the owner gets a note, not a command to run
+- [x] #1 An oversized job is resized by the loop without owner action; the owner gets a note, not a command to run
 <!-- AC:END -->
 
 ## Implementation Notes

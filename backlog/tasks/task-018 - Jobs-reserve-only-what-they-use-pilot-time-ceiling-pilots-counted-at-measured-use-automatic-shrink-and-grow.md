@@ -3,10 +3,10 @@ id: TASK-018
 title: >-
   Jobs reserve only what they use: pilot time ceiling, pilots counted at
   measured use, automatic shrink and grow
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-17T20:35:00Z'
-updated_date: '2026-11-17T20:54:00Z'
+updated_date: '2026-11-17T22:39:00Z'
 labels:
   - admission
 dependencies: []
@@ -24,6 +24,6 @@ Found 2026-11-17 15:29 ET: a pilot gets a RAM limit of all free RAM at release a
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 No job can be counted at more than its measured peak plus margin once measured
-- [ ] #2 Automatic shrink and grow are live on sttp1 and sttp2
+- [x] #1 No job can be counted at more than its measured peak plus margin once measured
+- [x] #2 Automatic shrink and grow are live on sttp1 and sttp2
 <!-- AC:END -->

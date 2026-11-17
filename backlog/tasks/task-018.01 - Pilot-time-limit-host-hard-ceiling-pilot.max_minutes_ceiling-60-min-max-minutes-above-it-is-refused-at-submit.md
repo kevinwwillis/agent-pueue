@@ -3,10 +3,10 @@ id: TASK-018.01
 title: >-
   Pilot time limit: host hard ceiling pilot.max_minutes_ceiling (60 min);
   --max-minutes above it is refused at submit
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-17T20:36:00Z'
-updated_date: '2026-11-17T20:54:00Z'
+updated_date: '2026-11-17T22:39:00Z'
 labels: []
 dependencies: []
 parent_task_id: TASK-018
@@ -16,7 +16,7 @@ ordinal: 37000
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 --max-minutes above the host ceiling is refused with a message naming the ceiling
+- [x] #1 --max-minutes above the host ceiling is refused with a message naming the ceiling
 <!-- AC:END -->
 
 ## Implementation Notes
