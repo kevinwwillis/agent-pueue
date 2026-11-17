@@ -36,10 +36,17 @@ job release host2 <hold-id>
 - `auto` in place of a host name lets `job` choose the host (see "Placement"). A held job stays on the host it
   was sent to.
 - Every job submitted to an admission host needs a size, from one of:
-  - **`--pilot`**: a first run to measure the job. It is counted at, and limited to, all the RAM room at
+  - **`--pilot`**: a first run to measure the job. It starts counted at, and limited to, all the RAM room at
     release, and, with `--gpus N`, counted at all the free memory on the cards it gets (GPU memory is not
-    capped), so nothing else can be admitted into room it may grow into. It has a time limit (`pilot.max_minutes`, or `--max-minutes`), so it never holds the
-    room for long; the limit counts from its start. It takes `--cpus` and `--gpus`, and a GPU pilot needs at
+    capped). After `pilot.shrink_after_min` (default 5) of running, measured at least 3 times, the loop counts it
+    at its RAM peak times `pilot.shrink_margin` (default 2), its soft limit, so other jobs start beside it; its hard
+    limit stays, so a pilot that later loads more is held there (no swap), never stopped, and the loop raises the soft limit while
+    the host has room (see "Resizing a job"). Its GPU count stays: GPU memory has no limit to hold it to, and a
+    pilot may load its data before it uses a GPU. It has a time limit
+    (`pilot.max_minutes`, or `--max-minutes`, never over `pilot.max_minutes_ceiling`, default the larger of 60 and
+    `pilot.max_minutes`: a larger
+    `--max-minutes` is refused at submit, and a pilot queued with one is stopped at the ceiling), so it never
+    holds room for long; the limit counts from its start. It takes `--cpus` and `--gpus`, and a GPU pilot needs at
     least `pilot.gpu_min_gb` free on each card. It is released only when the RAM room is at least
     `pilot.ram_floor_gb` (default 16), so a pilot released on a busy host is not limited to the few GB left there
     and stopped within minutes; a host with less than that for jobs refuses pilots at submit. Its use is sampled
@@ -142,8 +149,15 @@ standard-library Python 3.8. An example for a 32-thread host with 256 GB RAM (il
   "oversize_fraction": 0.5,
   "resize_margin": 1.25,
   "undersize_stall_pct": 10,
+  "auto_resize": true,
+  "auto_shrink_min_saving": 0.2,
+  "grow_at_fraction": 0.9,
+  "grow_stall_pct": 2,
+  "grow_factor": 1.5,
   "small": {"cpus": 1, "ram_gb": 4},
-  "pilot": {"max_minutes": 30, "gpu_min_gb": 2, "ram_floor_gb": 16},
+  "auto_resize_retry_min": 5,
+  "pilot": {"max_minutes": 30, "max_minutes_ceiling": 60, "gpu_min_gb": 2, "ram_floor_gb": 16,
+            "shrink_after_min": 5, "shrink_margin": 2},
   "margins": {"cpu": 1.2, "ram": 1.25, "gpu_mem": 1.15},
   "preemptible": false,
   "oom_score_adj": 500,
@@ -381,11 +395,12 @@ other jobs; the admission loop assumes the only memory limits above the job scop
 
 A job stalled against its own limit for over `undersize_stall_pct` of the last minute (its `job/` cgroup's
 `full avg60`, while it is at its limit) is undersized: its owner gets one ALERT saying so (its stall, limit, use
-and file cache), and `job room` shows it under the job while it lasts. The ALERT is made only when the host is not
+and file cache), and `job room` shows it under the job while it lasts. With `auto_resize` on, the loop first raises
+its limit (see "Resizing a job"), and the ALERT is made only once it found no room to do so. The ALERT is made only when the host is not
 in global reclaim (by the same signal), nothing outside the jobs stalls (every member's figure under 1%, all of them
 read), and `MemAvailable` is above `ram_headroom_gb`: otherwise global reclaim may be what stalls it, and the
-once-per-job ALERT is not spent on a doubtful case. A running job's limit is never raised; the owner kills it and
-submits it again with a larger size, or measures it with `--pilot`.
+once-per-job ALERT is not spent on a doubtful case. With `auto_resize` off, a running job's limit is never raised;
+the owner kills it and submits it again with a larger size, or measures it with `--pilot`.
 
 ### Room
 
@@ -453,8 +468,40 @@ and holds alone leave too little.
 
 ### Resizing a job
 
-Running jobs stay counted at their hard limit, so a job sized far above its use keeps room from others. Two tools
-let its owner give that room back:
+Running jobs are counted at their hard limit, so a job sized far above its use keeps room from others, and one
+sized below its use stalls or is stopped. With `auto_resize` on (the default), the loop resizes running jobs
+itself and asks nothing of their owners:
+
+- **Shrink to a soft limit.** A running job (not one that runs its work in containers) that has run
+  `oversize_after_min` (a pilot: `pilot.shrink_after_min`) and was measured at least 3 times gets a soft RAM limit
+  (its `job/` cgroup's `memory.high`) at the limit of the size `--like` would give it (a pilot: its peak times
+  `pilot.shrink_margin`), never under the resize floor `job resize` checks, and is counted there, or at its use now
+  if that is more. Its hard limit (`memory.max`) is kept: a job at its soft limit is held there by the kernel (jobs
+  run without swap, so it makes no progress until it is raised), never stopped, so a later phase that needs more does not end it, and the loop raises the soft limit (Grow). It is made
+  when it lowers the count by at least `auto_shrink_min_saving` (default 0.2), not while the job stalls in its own
+  cgroup or reads dropped file pages back, not within `oversize_after_min` of a grow (it needed the room lately), and
+  a refused one is tried again after `auto_resize_retry_min`. Only the loop sets a soft limit, in the job's queue
+  file and record, which `job resize` does not write. Its record's `resized` entry says `"auto": "shrink"` with
+  `soft_limit` from and to. No oversize ALERT is made.
+- **Grow.** After the room is measured each cycle and before held jobs are released, a running job (not one in
+  containers) that presses against its limit (its soft limit if it has one, else its hard one: its use, file cache
+  excluded, at `grow_at_fraction` of it; a stall over `grow_stall_pct` of the last minute against it; or a RAM trend
+  from its progress lines on course to reach that share) gets that limit raised to `grow_factor` times it, as far
+  as the RAM room allows (the room is the host's, after limits, holds and `ram_headroom_gb`, and is lowered by what
+  the grow took before anything is released). A soft limit is raised up to the hard limit, then lifted, and the
+  hard limit is raised from then on, with the record, resize file and assignment `job resize` writes, made under
+  the queue lock after the cycle's records are committed (lock order: the queue lock, then the records), never put
+  back. One grow takes at most `grow_factor` times the limit, so a leak or a trend fit takes room by steps a cycle
+  apart, not all at once. A job held at its soft limit (its `memory.events` `high` count grew: it makes no progress)
+  has the soft limit doubled, not raised by `grow_factor`, the loop's next cycle comes at `pilot_sample_interval_s`,
+  and a soft limit that would reach 95% of the hard limit is lifted instead. That count also makes the job's stall
+  its own (not host memory pressure), like a stall at its hard limit. Such a job's record gets `soft_capped`: its peak
+  may be its soft limit rather than its need, so `--like` (and `--like last`) does not size from a pilot that was
+  held. A job whose cgroup has lost its soft limit (it restarted into a new scope) is counted at its hard limit
+  until the loop cuts it again. A raise under 5% is not made: the job is marked `grow_blocked`, and only then does an
+  undersized ALERT go to its owner. Its record's `resized` entry says `"auto": "grow"`.
+
+With `auto_resize` off, two tools let a job's owner give room back:
 
 - **Oversize ALERT.** When an admitted job that is not a pilot (and does not run its work in containers) has run for
   `oversize_after_min` and was measured at least 3 times, and its RAM need so far is under `oversize_fraction` of
@@ -519,7 +566,7 @@ let its owner give that room back:
       scope set the old one. It is counted at the new limit from the next cycle.
     - Its verdict, if it later goes over its limit, names the limit it ended under (its cgroup's `memory.max` at
       its end), and its record keeps that limit.
-  - A pilot is refused (it is measuring).
+  - A pilot is refused (it is measuring; the loop shrinks it, above).
   - `resize_margin` defaults to 1.25: the peak is sampled every `sample_interval_s`, so it is a lower bound, and
     1.25 is the margin `--like` already puts on a measured peak.
   - The change goes to `state_dir/resize/<token>.json`, not to the queue file, which the loop rewrites from the copy

@@ -354,8 +354,13 @@ A host with an admission settings file (`~/.config/agent-pueue/admission.json`) 
 when it fits. The design is [admission.md](admission.md). On such a host:
 
 - **Every job needs a size**, one of:
-  - `--pilot`: a first run to measure the job. It gets all the free RAM (and, with `--gpus N`, all the free
-    memory on those cards) and stops at its time limit (`--max-minutes`, or the host's setting).
+  - `--pilot`: a first run to measure the job. It starts with all the free RAM (and, with `--gpus N`, all the free
+    memory on those cards); after a few minutes (`pilot.shrink_after_min`) the loop counts its RAM at its measured
+    peak times `pilot.shrink_margin`, as a soft limit: it is held there (jobs run without swap), never stopped, and the
+    loop doubles the limit within a second while the host has room. It stops
+    at its time limit (`--max-minutes`, or the host's setting), never over the host's ceiling
+    (`pilot.max_minutes_ceiling`, 60 by default; a larger `--max-minutes` is refused). A pilot only measures:
+    run the job itself with `--like` after it.
     It takes `--cpus N` and `--gpus N`, not `--ram`. Its time limit counts from its start. It starts only when
     the host has at least `pilot.ram_floor_gb` (16 GB by default) of RAM room, so it is not limited to a few GB.
   - `--like TOKEN` (or `HOST#ID`): sized from that earlier job's measured peaks plus margins, printed as
@@ -396,22 +401,27 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   memory, and a spike between samples, cannot). A job stalled reclaiming memory in its own cgroup (over 1% of the
   last minute) or reading dropped file pages back in is not shrunk, and the refusal says which. Its RAM limit is never raised, so a `--cpus`-only resize keeps the limit it runs under, and
   `--cpus` may not go under its measured CPU peak. A refused or failed resize changes nothing. A pilot is not
-  resized, and a job the loop is releasing at that moment is refused with "try again". `job history` shows the
+  resized by hand (the loop shrinks it), and a job the loop is releasing at that moment is refused with "try again". `job history` shows the
   size a job ended with, and the size it was resized from.
-- A running job that has used under half of its RAM size for its first 30 minutes (`oversize_fraction`,
-  `oversize_after_min`) gets one `ALERT` saying what it peaked at, its size, what it is counted at, and the exact
-  `job resize` command that shrinks it to the size `--like` would give, on the same measure the resize checks, so
-  the size it gives is accepted when the alert is made, and none while a shrink would be refused for its stall or
-  its file pages being read back. A job whose RAM trend (its `$JOB_PROGRESS` lines) is still
-  rising is judged and sized by where the trend ends, and gets no alert when that is over half its size. `job
-  room` shows the same while it holds. The job keeps running; reattach with `job wait`.
+- **The loop resizes running jobs itself** (`auto_resize`, on by default); nothing is asked of the owner:
+  - A job that uses well under its size is counted, after 30 minutes (`oversize_after_min`; a pilot after
+    `pilot.shrink_after_min`), at the size `--like` would give it, when that lowers its count by at least a fifth
+    (`auto_shrink_min_saving`). That is a soft limit: its hard RAM limit stays, so if it later needs more it is
+    held at its soft limit, never stopped, until the loop raises it (it doubles it at once while the host has room). A job whose RAM trend (its `$JOB_PROGRESS` lines) is
+    still rising is sized by where the trend ends.
+  - A job that presses against its RAM limit (uses 90% of it, file cache excluded, stalls against it, or its RAM
+    trend is on course to reach it) gets its limit raised by half, a step each cycle, as far as the host's RAM room
+    allows. Only when there is no room does it get an undersized `ALERT` (below).
+  - `job history` shows the size a job ended with and each size it was resized from.
 - A running job that spends over `undersize_stall_pct` (10%) of its time stalled reclaiming memory against its
-  own RAM limit gets one `ALERT` that it is undersized: it runs slowly. A running job's limit is never raised; to
-  give it more, kill it and submit it again with a larger `--ram`. `job room` shows it while it lasts. Its stall is
+  own RAM limit, and that the loop could not grow for lack of room, gets one `ALERT` that it is undersized: it runs
+  slowly, and its limit is raised as soon as room frees. `job room` shows it while it lasts. Its stall is
   not host memory pressure and holds no other job. The alert is made only while nothing outside the jobs stalls
   and the host's `MemAvailable` is above its RAM headroom, so it is never a host short of RAM reclaiming from it.
+  On a host with `auto_resize` off, an oversized job instead gets one `ALERT` with the exact `job resize` command
+  that shrinks it, and an undersized one is never grown: kill it and submit it again with a larger `--ram`.
 - The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
-  for a pilot its free RAM at release), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
+  for a pilot its free RAM at release; the loop may raise it, and may count the job at a lower soft limit, above), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
   `note: it went over its RAM limit of N GB; the whole job was stopped`. Processes it leaves running when its
   command ends are stopped.
 - GPUs are given by UUID in `CUDA_VISIBLE_DEVICES` (also in `JOB_GPU_UUIDS`); a job without `--gpus` sees none.
