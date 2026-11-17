@@ -35,7 +35,7 @@ import time
 import traceback
 import uuid
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 PROTOCOL = 3
 # Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
 # option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
@@ -3828,8 +3828,11 @@ class Loop:
             projected = _ram_at_total(q.get("progress") or []) or 0
             if high:
                 limit = high
-                # at its soft limit (memory.events high grew) it makes no progress (no swap): raise it now
-                held = bool(psi.get("at_limit"))
+                # held at its soft limit: memory.events high grew and it stalls (no swap, so its own memory can't go
+                # anywhere). A job that only streams files through its soft limit also raises that count, but the
+                # kernel drops clean file cache without a stall, so that is not held
+                held = bool(psi.get("at_limit")) and max(psi.get("full10") or 0, psi.get("full60") or 0) >= \
+                    self.s["grow_stall_pct"]
                 pressing = held or need >= self.s["grow_at_fraction"] * limit
                 self.throttled = self.throttled or held
                 if held and not q.get("soft_capped"):
