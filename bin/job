@@ -1407,9 +1407,10 @@ ADMISSION_DEFAULTS = {
     "auto_shrink_min_saving": 0.2,     # a shrink is made only when it lowers the limit by at least this share
     "grow_at_fraction": 0.9,           # a job whose use (file cache excluded) reaches this share of its limit grows
     "grow_stall_pct": 2.0,             # so does one stalled this share of the last minute against its own limit
-    "grow_factor": 1.5,                # a grow raises its limit to at least this times the old one, room allowing
+    "grow_factor": 1.5,                # a grow raises its limit to this times the old one at most, room allowing
+    "auto_resize_retry_min": 5,        # a refused auto shrink is tried again after this long
     "small": {"cpus": 1, "ram_gb": 4},
-    "pilot": {"max_minutes": 30, "max_minutes_ceiling": 60, "gpu_min_gb": 2, "ram_floor_gb": 16,
+    "pilot": {"max_minutes": 30, "max_minutes_ceiling": None, "gpu_min_gb": 2, "ram_floor_gb": 16,
               "shrink_after_min": 5, "shrink_margin": 2.0},
     "margins": {"cpu": 1.2, "ram": 1.25, "gpu_mem": 1.15},
     "preemptible": False,
@@ -1480,6 +1481,8 @@ def _admission_settings(path=None, nthreads=None):
     _num(s["small"]["cpus"], "small.cpus", lo=0.01)
     _num(s["small"]["ram_gb"], "small.ram_gb", lo=0.01)
     _num(s["pilot"]["max_minutes"], "pilot.max_minutes", lo=1)
+    if s["pilot"]["max_minutes_ceiling"] is None:  # default: an hour, or the default limit if that is longer
+        s["pilot"]["max_minutes_ceiling"] = max(60, s["pilot"]["max_minutes"])
     _num(s["pilot"]["max_minutes_ceiling"], "pilot.max_minutes_ceiling", lo=s["pilot"]["max_minutes"])
     _num(s["pilot"]["shrink_after_min"], "pilot.shrink_after_min", lo=1)
     _num(s["pilot"]["shrink_margin"], "pilot.shrink_margin", lo=1.0, hi=10.0)
@@ -1489,6 +1492,7 @@ def _admission_settings(path=None, nthreads=None):
     _num(s["grow_at_fraction"], "grow_at_fraction", lo=0.5, hi=1.0)
     _num(s["grow_stall_pct"], "grow_stall_pct", lo=0.0, hi=100.0)
     _num(s["grow_factor"], "grow_factor", lo=1.05, hi=10.0)
+    _num(s["auto_resize_retry_min"], "auto_resize_retry_min", lo=0)
     _num(s["pilot"]["gpu_min_gb"], "pilot.gpu_min_gb", lo=0)
     _num(s["pilot"]["ram_floor_gb"], "pilot.ram_floor_gb", lo=0)
     for k in ("cpu", "ram", "gpu_mem"):
@@ -3509,8 +3513,15 @@ class Loop:
         # and never below the limit its cgroup has now (a resize lowers the limit before the count)
         path = self.scopes_now.get(q["token"])
         actual = _read_cg_int(os.path.join(path, "job"), "memory.max") if path else None
+        ram = max(q.get("ram_counted") or q["size"]["ram"], limit or 0, actual or 0)
+        if q.get("memory_high") and path:
+            # a pilot the loop has cut to its use: counted at its soft limit (memory.high) or what it uses now if
+            # more (a soft limit slows a job, it does not stop it), never at the hard limit it keeps
+            job_cg = os.path.join(path, "job")
+            ram = max(q["memory_high"], _read_cg_int(job_cg, "memory.high") or 0,
+                      _read_cg_int(job_cg, "memory.current") or 0)
         c = {"token": q["token"], "released": q["released"], "size": q["size"], "gpus": q.get("gpus", []),
-             "ram_counted": max(q.get("ram_counted") or q["size"]["ram"], limit or 0, actual or 0),
+             "ram_counted": ram,
              "gpu_counted": q.get("gpu_counted", {})}
         if ((q.get("constraints") or {}).get("in_containers") and q.get("started")
                 and now - q["started"] >= self.s["outside_window_s"]):
@@ -3706,7 +3717,8 @@ class Loop:
         limit, and ALERT its owner once: it is undersized. Its stall is not host memory pressure and holds no other
         job (Measure.pressure); it shows here instead (docs/admission.md, "Memory pressure")."""
         psi = (u or {}).get("psi")
-        if status != "Running" or not psi or not psi.get("at_limit") or psi["full60"] < self.s["undersize_stall_pct"]:
+        if (status != "Running" or not psi or not (psi.get("at_limit") or q.get("memory_high"))
+                or psi["full60"] < self.s["undersize_stall_pct"]):
             q["undersized"] = None
             return
         last = self.samples[-1] if self.samples else {}
@@ -3735,23 +3747,25 @@ class Loop:
                        extra={"undersized": {"stall": psi["full60"], "limit": limit}})
 
     def auto_shrink(self, con, q, now, status, p, u):
-        """Lower the RAM limit of a running job that uses well under it to the size --like would give it, and a pilot's
-        to its peak times pilot.shrink_margin once it has run pilot.shrink_after_min, with every check job resize
-        makes (_resize_running); its owner is not asked. A pilot's count on its GPUs comes down to its peak there
-        times the same margin. The limit is lowered only when that saves at least auto_shrink_min_saving of it.
+        """Count a running job that uses well under its limit at the size --like would give it, and a pilot at its peak
+        times pilot.shrink_margin once it has run pilot.shrink_after_min, by giving it that soft limit (_soft_limit,
+        memory.high); its hard limit is kept, so a job whose later phase needs more is slowed, never stopped, and the
+        loop raises the soft limit while the host has room. Its owner is not asked. The size covers the resize floor
+        job resize checks (_resize_floor), and nothing is cut while the job stalls in its own cgroup or reads dropped
+        file pages back. The count is lowered only when that saves at least auto_shrink_min_saving of it. A job grown in the last oversize_after_min is not shrunk (it needed the room
+        lately), and one whose shrink was refused is tried again only after auto_resize_retry_min. A pilot's GPU count
+        is left as it is: GPU memory has no limit to hold it to, and a pilot may load its data before it uses a GPU.
         Returns True when it shrank."""
         pilot = q.get("pilot")
         after = self.s["pilot"]["shrink_after_min"] if pilot else self.s["oversize_after_min"]
         if (status != "Running" or not q.get("started") or (q.get("constraints") or {}).get("in_containers")
                 or now - q["started"] < 60 * after or p["n"] < LIKE_MIN_SAMPLES):
             return False
-        if pilot and q.get("gpu_counted") and not q.get("gpu_recounted"):
-            floor = self.s["pilot"]["gpu_min_gb"] * GB
-            want = max(floor, (p.get("gpu") or 0) * self.s["pilot"]["shrink_margin"])
-            q["gpu_counted"] = {g: min(b, want) for g, b in q["gpu_counted"].items()}
-            q["gpu_recounted"] = now
-            self.adm.record(con, {"token": q["token"], "gpu_counted": q["gpu_counted"]})
-            con.commit()
+        grows = [r.get("t") or 0 for r in q.get("resized") or [] if isinstance(r, dict) and r.get("auto") == "grow"]
+        if grows and now - max(grows) < 60 * self.s["oversize_after_min"]:
+            return False
+        if now - (q.get("auto_resize_refused_at") or 0) < 60 * self.s["auto_resize_retry_min"]:
+            return False
         if _shrink_blocked(q.get("stall60"), q.get("refault_grew")):
             return False
         path = self.scopes_now.get(q["token"])
@@ -3759,6 +3773,7 @@ class Loop:
         if not path or not limits:
             return False
         limit_now = min(limits)
+        counted_now = q.get("memory_high") or limit_now
         projected = _ram_at_total(q.get("progress") or []) or 0
         kernel_peak = _read_cg_int(os.path.join(path, "job"), "memory.peak") or 0
         use, cache = (u or {}).get("need") or 0, (u or {}).get("cache") or 0
@@ -3768,11 +3783,10 @@ class Loop:
             s["margins"]["ram"] = self.s["pilot"]["shrink_margin"] / self.s["ram_hard_factor"]
         new_ram = _parse_size(_size_arg(_resize_suggestion(s, p["ram"], use, kernel_peak, cache, projected,
                                                            p.get("current") or 0, limit_now)))
-        if ram_limit(self.s, new_ram) > (1 - self.s["auto_shrink_min_saving"]) * limit_now:
+        new_high = ram_limit(self.s, new_ram)
+        if new_high > (1 - self.s["auto_shrink_min_saving"]) * counted_now:
             return False
-        old = dict(q["size"], ram=max(q["size"]["ram"] or 0, int(math.ceil(limit_now / self.s["ram_hard_factor"]))))
-        new = dict(q["size"], ram=new_ram)
-        return self._apply_resize(con, q, old, new, "shrink", lambda: _resize_running(self.s, con, q, old, new))
+        return self._soft_limit(con, q, new_high, "shrink")
 
     def auto_grow(self, con, now, inflight, tasks, use):
         """Raise the RAM limit of a running job that presses against it (its use, file cache excluded, at
@@ -3788,32 +3802,82 @@ class Loop:
                     or (q.get("constraints") or {}).get("in_containers") or not u.get("limit")):
                 continue
             limit, need, psi = u["limit"], u.get("need") or 0, u.get("psi") or {}
+            high = q.get("memory_high")
+            if high and high >= limit:  # its soft limit has grown to its hard limit: it presses that one now
+                if self._soft_limit(con, q, None, "grow"):
+                    self.adm.save(q)
+                high = None
+            if high:
+                limit = high  # a job cut to its use presses against its soft limit; any stall of its own counts
+                psi = dict(psi, at_limit=True)
             projected = _ram_at_total(q.get("progress") or []) or 0
             if not (need >= self.s["grow_at_fraction"] * limit or projected >= self.s["grow_at_fraction"] * limit
                     or (psi.get("at_limit") and (psi.get("full60") or 0) >= self.s["grow_stall_pct"])):
-                q.pop("grow_blocked", None)
+                if q.pop("grow_blocked", None) is not None:
+                    self.adm.save(q)
                 continue
             counted = self._counted(q, now)["ram_counted"]
-            want = max(limit * self.s["grow_factor"], need * self.s["resize_margin"],
-                       projected * self.s["resize_margin"])
+            want = limit * self.s["grow_factor"]  # at most this per grow: a trend fit or a leak takes room by steps
             new_limit = _whole_pages(int(min(want, counted + max(0, self.room["ram"]["room"]))))
+            if high:
+                new_limit = min(new_limit, u["limit"])  # never over the hard limit it keeps
             if new_limit < 1.05 * limit:
                 if not q.get("grow_blocked"):
                     q["grow_blocked"] = now
+                    self.adm.save(q)
+                continue
+            if high:
+                if self._soft_limit(con, q, new_limit, "grow"):
+                    self.room["ram"]["room"] -= max(0, new_limit - counted)
+                    q.pop("grow_blocked", None)
                     self.adm.save(q)
                 continue
             job_cg = os.path.join(path, "job")
             old = dict(q["size"], ram=max(q["size"]["ram"] or 0, int(math.ceil(limit / self.s["ram_hard_factor"]))))
             new = dict(q["size"], ram=int(math.ceil(new_limit / self.s["ram_hard_factor"])))
 
-            def do(job_cg=job_cg, new_limit=new_limit, limit=limit, q=q):
+            def do(job_cg=job_cg, new_limit=new_limit, q=q):
+                # no undo: the job may already use more than its old limit, and a raised limit is counted anyway
+                # (_counted takes its cgroup's memory.max when that is higher than its record)
                 _set_memory_max(job_cg, new_limit)
                 return ({"memory_max": new_limit, "ram_counted": new_limit, "was_memory_max": q.get("memory_max")},
-                        lambda: _set_memory_max(job_cg, limit))
+                        None)
             if self._apply_resize(con, q, old, new, "grow", do):
                 self.room["ram"]["room"] -= max(0, new_limit - counted)
                 q.pop("grow_blocked", None)
                 self.adm.save(q)
+
+    def _soft_limit(self, con, q, high, how):
+        """Set a running job's soft RAM limit (its job cgroup's memory.high; None lifts it) and count it there
+        (_counted: at its soft limit, or its use now if more). Its hard limit (memory.max) is kept, so a job that
+        needs more than it has used so far is slowed, not stopped, and the loop raises the soft limit while the host
+        has room. Only the loop sets a soft limit, and only in the job's queue file and record, which job resize
+        does not write, so no lock is taken. Returns True when it was set."""
+        path = self.scopes_now.get(q["token"])
+        if not path:
+            return False
+        try:
+            with open(os.path.join(path, "job", "memory.high"), "w") as f:
+                f.write("max" if high is None else str(int(high)))
+        except OSError as e:
+            if q.get("auto_resize_refused") != str(e):
+                sys.stderr.write("job _admit: %s of %s not made: %s\n" % (how, q["token"], e))
+            q["auto_resize_refused"], q["auto_resize_refused_at"] = str(e), time.time()
+            return False
+        old = q.get("memory_high") or q.get("memory_max") or 0
+        resized = (q.get("resized") or []) + [{"t": time.time(), "state": "released", "auto": how,
+                                               "soft_limit": {"from": old, "to": high}}]
+        q.update(resized=resized)
+        if high is None:
+            q.pop("memory_high", None)
+            q["ram_counted"] = q.get("memory_max") or q.get("ram_counted")
+        else:
+            q.update(memory_high=high, ram_counted=high)
+        q.pop("auto_resize_refused", None)
+        q.pop("auto_resize_refused_at", None)
+        self.adm.record(con, {"token": q["token"], "ram_counted": q["ram_counted"], "resized": resized})
+        con.commit()
+        return True
 
     def _apply_resize(self, con, q, old, new, how, do):
         """Resize a running job from the loop, as job resize does, under the queue lock: do() sets its cgroup's limit
@@ -3822,18 +3886,25 @@ class Loop:
         job is looked at again next cycle. A step that fails undoes the ones before it. Returns True when it
         resized."""
         token = q["token"]
+
+        def same(cur):
+            return (cur and cur.get("state") == "released" and cur.get("size") == q.get("size")
+                    and cur.get("memory_max") == q.get("memory_max"))
+        con.commit()  # lock order is queue.lock, then the records: a submit holds the lock while it writes one
+        if not same(self.adm.read_queue(token)):
+            return False
+        try:  # before the lock, as job resize does: lowering memory.max can force a long reclaim
+            change, undo = do()
+        except (JobError, sqlite3.Error, OSError) as e:
+            if q.get("auto_resize_refused") != str(e):
+                sys.stderr.write("job _admit: %s of %s not made: %s\n" % (how, token, e))
+            q["auto_resize_refused"], q["auto_resize_refused_at"] = str(e), time.time()
+            return False
         fd = self.adm.lock("queue.lock")
         try:
-            cur = self.adm.read_queue(token)
-            if (not cur or cur.get("state") != "released" or cur.get("size") != q.get("size")
-                    or cur.get("memory_max") != q.get("memory_max")):
-                return False
-            try:
-                change, undo = do()
-            except JobError as e:
-                if q.get("auto_resize_refused") != str(e):
-                    sys.stderr.write("job _admit: %s of %s not made: %s\n" % (how, token, e))
-                q["auto_resize_refused"] = str(e)
+            if not same(self.adm.read_queue(token)):  # a job resize landed meanwhile: it wins
+                if undo:
+                    undo()
                 return False
             resized = (q.get("resized") or []) + [{"t": time.time(), "state": "released", "auto": how, "from": {
                 "cpus": old["cpus"], "ram": old["ram"]}, "to": {"cpus": new["cpus"], "ram": new["ram"]}}]
@@ -3857,10 +3928,12 @@ class Loop:
                 if undo:
                     undo()
                 sys.stderr.write("job _admit: %s of %s not made: %s\n" % (how, token, e))
+                q["auto_resize_refused_at"] = time.time()
                 return False
             _set_assigned_limit(self.adm, token, change["memory_max"])
             q.update(size=new, resized=resized, memory_max=change["memory_max"], ram_counted=change["ram_counted"])
             q.pop("auto_resize_refused", None)
+            q.pop("auto_resize_refused_at", None)
             return True
         finally:
             os.close(fd)
@@ -5928,8 +6001,12 @@ def _history_size(j):
     by_hand = j.get("ram_counted") is not None and j.get("memory_max") is None
     if not j.get("pilot"):
         rs = j.get("resized") if isinstance(j.get("resized"), list) else []
-        first = rs[0].get("from") if rs and isinstance(rs[0], dict) and isinstance(rs[0].get("from"), dict) else None
-        return "%g CPU, %s%s%s%s" % (cpus, _gbs(z.get("ram") or 0),
+        hard = [r for r in rs if isinstance(r, dict) and isinstance(r.get("from"), dict)]
+        first = hard[0]["from"] if hard else None
+        soft = [r for r in rs if isinstance(r, dict) and isinstance(r.get("soft_limit"), dict)]
+        cut = (", counted at %s by the loop (its use)" % _gbs(j.get("ram_counted") or 0)
+               if soft and soft[-1]["soft_limit"].get("to") else "")
+        return "%g CPU, %s%s%s%s%s" % (cpus, _gbs(z.get("ram") or 0), cut,
                                      ", %d GPU %s" % (ngpu, _gbs(z.get("gpu_mem") or 0)) if ngpu else "",
                                      ", not released by the loop" if by_hand else "",
                                      ", resized from %g CPU, %s" % (first.get("cpus") or 0, _gbs(first.get("ram") or 0))
@@ -5940,6 +6017,11 @@ def _history_size(j):
         gc = [v for v in gc.values() if isinstance(v, (int, float))] if isinstance(gc, dict) else []
         gpus = (", %d GPU%s with %s" % (len(gc), "s" if len(gc) > 1 else "", " and ".join(_gbs(v) for v in gc))
                 if gc else ", %d GPU" % ngpu if ngpu else "")
+        rs = j.get("resized") if isinstance(j.get("resized"), list) else []
+        soft = [r["soft_limit"] for r in rs if isinstance(r, dict) and isinstance(r.get("soft_limit"), dict)]
+        if soft:  # cut by the loop to its use: counted at its soft limit
+            return "%g CPU, %s%s, cut by the loop from %s, the free room at its release" % (
+                cpus, _gbs(j.get("ram_counted") or 0), gpus, _gbs(j.get("memory_max") or 0))
         return "%g CPU, %s%s, the free room at its release" % (cpus, _gbs(j.get("ram_counted") or 0), gpus)
     if by_hand:
         return base + ", not released by the loop"

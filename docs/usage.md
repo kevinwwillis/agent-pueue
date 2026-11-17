@@ -355,8 +355,9 @@ when it fits. The design is [admission.md](admission.md). On such a host:
 
 - **Every job needs a size**, one of:
   - `--pilot`: a first run to measure the job. It starts with all the free RAM (and, with `--gpus N`, all the free
-    memory on those cards); after a few minutes (`pilot.shrink_after_min`) the loop cuts it to its measured peak
-    times `pilot.shrink_margin` (and raises it again if it presses against that while the host has room). It stops
+    memory on those cards); after a few minutes (`pilot.shrink_after_min`) the loop counts its RAM at its measured
+    peak times `pilot.shrink_margin`, as a soft limit it is slowed at, never stopped (and raises it if it presses
+    against it while the host has room). It stops
     at its time limit (`--max-minutes`, or the host's setting), never over the host's ceiling
     (`pilot.max_minutes_ceiling`, 60 by default; a larger `--max-minutes` is refused). A pilot only measures:
     run the job itself with `--like` after it.
@@ -403,13 +404,14 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   resized by hand (the loop shrinks it), and a job the loop is releasing at that moment is refused with "try again". `job history` shows the
   size a job ended with, and the size it was resized from.
 - **The loop resizes running jobs itself** (`auto_resize`, on by default); nothing is asked of the owner:
-  - A job that uses well under its size is shrunk, after 30 minutes (`oversize_after_min`; a pilot after
-    `pilot.shrink_after_min`), to the size `--like` would give it, with the checks `job resize` makes, when that
-    lowers its limit by at least a fifth (`auto_shrink_min_saving`). A job whose RAM trend (its `$JOB_PROGRESS`
-    lines) is still rising is sized by where the trend ends.
+  - A job that uses well under its size is counted, after 30 minutes (`oversize_after_min`; a pilot after
+    `pilot.shrink_after_min`), at the size `--like` would give it, when that lowers its count by at least a fifth
+    (`auto_shrink_min_saving`). That is a soft limit: its hard RAM limit stays, so if it later needs more it is
+    slowed, not stopped, while the loop raises the soft limit. A job whose RAM trend (its `$JOB_PROGRESS` lines) is
+    still rising is sized by where the trend ends.
   - A job that presses against its RAM limit (uses 90% of it, file cache excluded, stalls against it, or its RAM
-    trend is on course to reach it) gets its limit raised by half, or to what it needs if more, as far as the
-    host's RAM room allows. Only when there is no room does it get an undersized `ALERT` (below).
+    trend is on course to reach it) gets its limit raised by half, a step each cycle, as far as the host's RAM room
+    allows. Only when there is no room does it get an undersized `ALERT` (below).
   - `job history` shows the size a job ended with and each size it was resized from.
 - A running job that spends over `undersize_stall_pct` (10%) of its time stalled reclaiming memory against its
   own RAM limit, and that the loop could not grow for lack of room, gets one `ALERT` that it is undersized: it runs
@@ -419,7 +421,7 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   On a host with `auto_resize` off, an oversized job instead gets one `ALERT` with the exact `job resize` command
   that shrinks it, and an undersized one is never grown: kill it and submit it again with a larger `--ram`.
 - The job runs in its own systemd scope with a hard RAM limit (its size times the host's `ram_hard_factor`, or
-  for a pilot its free RAM at release until the loop cuts it to its use; the loop may lower or raise it, above), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
+  for a pilot its free RAM at release; the loop may raise it, and may count the job at a lower soft limit, above), no swap, and whole-job kill. A job over its limit ends `FAILED 137` with
   `note: it went over its RAM limit of N GB; the whole job was stopped`. Processes it leaves running when its
   command ends are stopped.
 - GPUs are given by UUID in `CUDA_VISIBLE_DEVICES` (also in `JOB_GPU_UUIDS`); a job without `--gpus` sees none.
