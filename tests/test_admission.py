@@ -3667,5 +3667,88 @@ class ReviewFiveRules(unittest.TestCase):
         self.assertEqual(loop.alerts, [])
 
 
+
+class SoftLimitRules(unittest.TestCase):
+    """TASK-018 review 2: soft limits (no daemon)."""
+
+    setUp = ReviewThreeRules.setUp
+    oversize_loop = ReviewThreeRules.oversize_loop
+
+    def grow_loop(self, room):
+        loop = self.oversize_loop()
+        loop.scopes_now = {"t" * 32: "/nonexistent"}
+        loop.room = {"pressure_ok": True, "ram": {"room": room}}
+        loop.calls = []
+        loop._soft_limit = lambda con, q, high, how: loop.calls.append((how, high)) or True
+        loop._counted = lambda q, now: {"ram_counted": max(q.get("memory_high") or 0, q["_cur"])}
+        loop.adm.save = lambda q: None
+        return loop
+
+    def test_a_soft_limit_just_under_the_hard_limit_is_lifted(self):
+        loop = self.grow_loop(200 * GB)
+        q = {"token": "t" * 32, "memory_high": 96 * GB, "_cur": 95 * GB, "constraints": {}, "size": {"cpus": 1}}
+        use = {"t" * 32: {"limit": 100 * GB, "need": 95 * GB, "psi": {"full60": 50.0, "at_limit": True}}}
+        orig = self.j._task_status
+        self.j._task_status = lambda t: "Running"
+        try:
+            con = loop.adm.db()
+            self.addCleanup(con.close)
+            loop.auto_grow(con, 1000.0, [q], {"t" * 32: {}}, use)
+        finally:
+            self.j._task_status = orig
+        self.assertEqual(loop.calls, [("grow", None)])
+        self.assertIsNone(q.get("grow_blocked"))
+        self.assertTrue(loop.throttled)  # the next cycle comes at the pilot interval
+
+    def test_a_job_held_at_its_soft_limit_doubles_it_when_there_is_room(self):
+        loop = self.grow_loop(200 * GB)
+        q = {"token": "t" * 32, "memory_high": 10 * GB, "_cur": 10 * GB, "constraints": {}, "size": {"cpus": 1}}
+        use = {"t" * 32: {"limit": 100 * GB, "need": 9.9 * GB, "psi": {"full60": 0.0, "at_limit": True}}}
+        orig = self.j._task_status
+        self.j._task_status = lambda t: "Running"
+        try:
+            con = loop.adm.db()
+            self.addCleanup(con.close)
+            loop.auto_grow(con, 1000.0, [q], {"t" * 32: {}}, use)
+        finally:
+            self.j._task_status = orig
+        self.assertEqual(loop.calls[0][0], "grow")
+        self.assertAlmostEqual(loop.calls[0][1], 20 * GB, delta=4096)
+        self.assertTrue(q.get("soft_capped"))  # its peak is no --like source now
+
+    def test_the_soft_limit_counts_as_its_own_limit_in_its_stall(self):
+        d = own_tmpdir()
+        self.addCleanup(remove_own_dir, d)
+        with open(os.path.join(d, "memory.events"), "w") as f:
+            f.write("low 0\nhigh 7\nmax 2\noom 0\n")
+        m = self.j.Measure(proc=d, psi_root=d)
+        self.assertEqual(m.limit_events(d), 9)
+
+    def test_a_job_whose_cgroup_lost_its_soft_limit_is_counted_at_its_hard_limit(self):
+        d = own_tmpdir()
+        self.addCleanup(remove_own_dir, d)
+        os.makedirs(os.path.join(d, "job"))
+        for name, v in (("memory.max", 8 * GB), ("memory.high", "max"), ("memory.current", GB)):
+            with open(os.path.join(d, "job", name), "w") as f:
+                f.write(str(v))
+        loop = self.oversize_loop()
+        loop.scopes_now = {"t" * 32: d}
+        q = {"token": "t" * 32, "released": 1.0, "size": {"cpus": 1, "ram": 2 * GB}, "memory_max": 8 * GB,
+             "ram_counted": 2 * GB, "memory_high": 2 * GB, "constraints": {}}
+        self.assertEqual(loop._counted(q, 10.0)["ram_counted"], 8 * GB)
+        self.assertNotIn("memory_high", q)
+
+    def test_like_refuses_a_pilot_held_at_its_soft_limit(self):
+        adm = self.j.Admission(self.s)
+        con = adm.db()
+        try:
+            adm.record(con, {"token": "a" * 32, "task": "T-s", "session": "x", "ended": 100.0, "how": "pilot time limit",
+                             "peak_samples": 10, "peak_ram": GB, "soft_capped": 1})
+            con.commit()
+            self.assertIsNone(adm.find_last(con, "T-s", "x"))
+        finally:
+            con.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -356,8 +356,8 @@ when it fits. The design is [admission.md](admission.md). On such a host:
 - **Every job needs a size**, one of:
   - `--pilot`: a first run to measure the job. It starts with all the free RAM (and, with `--gpus N`, all the free
     memory on those cards); after a few minutes (`pilot.shrink_after_min`) the loop counts its RAM at its measured
-    peak times `pilot.shrink_margin`, as a soft limit it is slowed at, never stopped (and raises it if it presses
-    against it while the host has room). It stops
+    peak times `pilot.shrink_margin`, as a soft limit: it is held there (jobs run without swap), never stopped, and the
+    loop doubles the limit within a second while the host has room. It stops
     at its time limit (`--max-minutes`, or the host's setting), never over the host's ceiling
     (`pilot.max_minutes_ceiling`, 60 by default; a larger `--max-minutes` is refused). A pilot only measures:
     run the job itself with `--like` after it.
@@ -407,7 +407,7 @@ when it fits. The design is [admission.md](admission.md). On such a host:
   - A job that uses well under its size is counted, after 30 minutes (`oversize_after_min`; a pilot after
     `pilot.shrink_after_min`), at the size `--like` would give it, when that lowers its count by at least a fifth
     (`auto_shrink_min_saving`). That is a soft limit: its hard RAM limit stays, so if it later needs more it is
-    slowed, not stopped, while the loop raises the soft limit. A job whose RAM trend (its `$JOB_PROGRESS` lines) is
+    held at its soft limit, never stopped, until the loop raises it (it doubles it at once while the host has room). A job whose RAM trend (its `$JOB_PROGRESS` lines) is
     still rising is sized by where the trend ends.
   - A job that presses against its RAM limit (uses 90% of it, file cache excluded, stalls against it, or its RAM
     trend is on course to reach it) gets its limit raised by half, a step each cycle, as far as the host's RAM room

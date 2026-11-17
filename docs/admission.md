@@ -40,7 +40,7 @@ job release host2 <hold-id>
     release, and, with `--gpus N`, counted at all the free memory on the cards it gets (GPU memory is not
     capped). After `pilot.shrink_after_min` (default 5) of running, measured at least 3 times, the loop counts it
     at its RAM peak times `pilot.shrink_margin` (default 2), its soft limit, so other jobs start beside it; its hard
-    limit stays, so a pilot that later loads more is slowed, not stopped, and the loop raises the soft limit while
+    limit stays, so a pilot that later loads more is held there (no swap), never stopped, and the loop raises the soft limit while
     the host has room (see "Resizing a job"). Its GPU count stays: GPU memory has no limit to hold it to, and a
     pilot may load its data before it uses a GPU. It has a time limit
     (`pilot.max_minutes`, or `--max-minutes`, never over `pilot.max_minutes_ceiling`, default the larger of 60 and
@@ -476,8 +476,8 @@ itself and asks nothing of their owners:
   `oversize_after_min` (a pilot: `pilot.shrink_after_min`) and was measured at least 3 times gets a soft RAM limit
   (its `job/` cgroup's `memory.high`) at the limit of the size `--like` would give it (a pilot: its peak times
   `pilot.shrink_margin`), never under the resize floor `job resize` checks, and is counted there, or at its use now
-  if that is more. Its hard limit (`memory.max`) is kept: a job past its soft limit is slowed by the kernel, not
-  stopped, so a later phase that needs more does not end it, and the loop raises the soft limit (Grow). It is made
+  if that is more. Its hard limit (`memory.max`) is kept: a job at its soft limit is held there by the kernel (jobs
+  run without swap, so it makes no progress until it is raised), never stopped, so a later phase that needs more does not end it, and the loop raises the soft limit (Grow). It is made
   when it lowers the count by at least `auto_shrink_min_saving` (default 0.2), not while the job stalls in its own
   cgroup or reads dropped file pages back, not within `oversize_after_min` of a grow (it needed the room lately), and
   a refused one is tried again after `auto_resize_retry_min`. Only the loop sets a soft limit, in the job's queue
@@ -492,7 +492,13 @@ itself and asks nothing of their owners:
   hard limit is raised from then on, with the record, resize file and assignment `job resize` writes, made under
   the queue lock after the cycle's records are committed (lock order: the queue lock, then the records), never put
   back. One grow takes at most `grow_factor` times the limit, so a leak or a trend fit takes room by steps a cycle
-  apart, not all at once. A raise under 5% is not made: the job is marked `grow_blocked`, and only then does an
+  apart, not all at once. A job held at its soft limit (its `memory.events` `high` count grew: it makes no progress)
+  has the soft limit doubled, not raised by `grow_factor`, the loop's next cycle comes at `pilot_sample_interval_s`,
+  and a soft limit that would reach 95% of the hard limit is lifted instead. That count also makes the job's stall
+  its own (not host memory pressure), like a stall at its hard limit. Such a job's record gets `soft_capped`: its peak
+  may be its soft limit rather than its need, so `--like` (and `--like last`) does not size from a pilot that was
+  held. A job whose cgroup has lost its soft limit (it restarted into a new scope) is counted at its hard limit
+  until the loop cuts it again. A raise under 5% is not made: the job is marked `grow_blocked`, and only then does an
   undersized ALERT go to its owner. Its record's `resized` entry says `"auto": "grow"`.
 
 With `auto_resize` off, two tools let a job's owner give room back:
