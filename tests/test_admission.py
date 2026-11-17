@@ -3703,7 +3703,7 @@ class SoftLimitRules(unittest.TestCase):
     def test_a_job_held_at_its_soft_limit_doubles_it_when_there_is_room(self):
         loop = self.grow_loop(200 * GB)
         q = {"token": "t" * 32, "memory_high": 10 * GB, "_cur": 10 * GB, "constraints": {}, "size": {"cpus": 1}}
-        use = {"t" * 32: {"limit": 100 * GB, "need": 9.9 * GB, "psi": {"full60": 0.0, "at_limit": True}}}
+        use = {"t" * 32: {"limit": 100 * GB, "need": 9.9 * GB, "psi": {"full10": 40.0, "full60": 5.0, "at_limit": True}}}
         orig = self.j._task_status
         self.j._task_status = lambda t: "Running"
         try:
@@ -3715,6 +3715,22 @@ class SoftLimitRules(unittest.TestCase):
         self.assertEqual(loop.calls[0][0], "grow")
         self.assertAlmostEqual(loop.calls[0][1], 20 * GB, delta=4096)
         self.assertTrue(q.get("soft_capped"))  # its peak is no --like source now
+
+    def test_a_job_that_only_trims_file_cache_at_its_soft_limit_is_not_held(self):
+        loop = self.grow_loop(200 * GB)
+        q = {"token": "t" * 32, "memory_high": 10 * GB, "_cur": 10 * GB, "constraints": {}, "size": {"cpus": 1}}
+        use = {"t" * 32: {"limit": 100 * GB, "need": 2 * GB, "psi": {"full10": 0.0, "full60": 0.1, "at_limit": True}}}
+        orig = self.j._task_status
+        self.j._task_status = lambda t: "Running"
+        try:
+            con = loop.adm.db()
+            self.addCleanup(con.close)
+            loop.auto_grow(con, 1000.0, [q], {"t" * 32: {}}, use)
+        finally:
+            self.j._task_status = orig
+        self.assertEqual(loop.calls, [])
+        self.assertFalse(q.get("soft_capped"))
+        self.assertFalse(loop.throttled)
 
     def test_the_soft_limit_counts_as_its_own_limit_in_its_stall(self):
         d = own_tmpdir()
