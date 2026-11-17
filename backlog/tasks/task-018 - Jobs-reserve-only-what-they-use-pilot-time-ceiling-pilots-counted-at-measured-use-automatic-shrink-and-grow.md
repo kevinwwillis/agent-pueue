@@ -3,9 +3,10 @@ id: TASK-018
 title: >-
   Jobs reserve only what they use: pilot time ceiling, pilots counted at
   measured use, automatic shrink and grow
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-17T20:35:00Z'
+updated_date: '2026-11-17T20:54:00Z'
 labels:
   - admission
 dependencies: []
