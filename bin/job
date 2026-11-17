@@ -35,7 +35,7 @@ import time
 import traceback
 import uuid
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 PROTOCOL = 3
 # Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
 # option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
@@ -1402,8 +1402,15 @@ ADMISSION_DEFAULTS = {
     "resize_margin": 1.25,             # a running job's new RAM limit must cover its measured peak times this
     "undersize_stall_pct": 10.0,       # a running job stalled this share of its time (memory full avg60) against its
                                        # own RAM limit gets one ALERT that it is undersized
+    "auto_resize": True,               # the loop itself shrinks oversized running jobs and pilots, and grows a job
+                                       # that presses against its RAM limit while the host has room
+    "auto_shrink_min_saving": 0.2,     # a shrink is made only when it lowers the limit by at least this share
+    "grow_at_fraction": 0.9,           # a job whose use (file cache excluded) reaches this share of its limit grows
+    "grow_stall_pct": 2.0,             # so does one stalled this share of the last minute against its own limit
+    "grow_factor": 1.5,                # a grow raises its limit to at least this times the old one, room allowing
     "small": {"cpus": 1, "ram_gb": 4},
-    "pilot": {"max_minutes": 30, "gpu_min_gb": 2, "ram_floor_gb": 16},
+    "pilot": {"max_minutes": 30, "max_minutes_ceiling": 60, "gpu_min_gb": 2, "ram_floor_gb": 16,
+              "shrink_after_min": 5, "shrink_margin": 2.0},
     "margins": {"cpu": 1.2, "ram": 1.25, "gpu_mem": 1.15},
     "preemptible": False,
     "oom_score_adj": 500,
@@ -1473,6 +1480,15 @@ def _admission_settings(path=None, nthreads=None):
     _num(s["small"]["cpus"], "small.cpus", lo=0.01)
     _num(s["small"]["ram_gb"], "small.ram_gb", lo=0.01)
     _num(s["pilot"]["max_minutes"], "pilot.max_minutes", lo=1)
+    _num(s["pilot"]["max_minutes_ceiling"], "pilot.max_minutes_ceiling", lo=s["pilot"]["max_minutes"])
+    _num(s["pilot"]["shrink_after_min"], "pilot.shrink_after_min", lo=1)
+    _num(s["pilot"]["shrink_margin"], "pilot.shrink_margin", lo=1.0, hi=10.0)
+    if not isinstance(s["auto_resize"], bool):
+        raise JobError("admission setting auto_resize must be true or false")
+    _num(s["auto_shrink_min_saving"], "auto_shrink_min_saving", lo=0.0, hi=0.9)
+    _num(s["grow_at_fraction"], "grow_at_fraction", lo=0.5, hi=1.0)
+    _num(s["grow_stall_pct"], "grow_stall_pct", lo=0.0, hi=100.0)
+    _num(s["grow_factor"], "grow_factor", lo=1.05, hi=10.0)
     _num(s["pilot"]["gpu_min_gb"], "pilot.gpu_min_gb", lo=0)
     _num(s["pilot"]["ram_floor_gb"], "pilot.ram_floor_gb", lo=0)
     for k in ("cpu", "ram", "gpu_mem"):
@@ -2802,6 +2818,11 @@ def host_submit_admitted(req, settings, command):
         if not pilot:
             raise JobError("--max-minutes is a pilot's time limit; use --stop-at to stop another job at a time")
         constraints["max_minutes"] = float(_num(a["max_minutes"], "--max-minutes", lo=1))
+        if constraints["max_minutes"] > settings["pilot"]["max_minutes_ceiling"]:
+            raise JobError("--max-minutes %g is over this host's ceiling for a pilot, %g minutes "
+                           "(pilot.max_minutes_ceiling): a pilot only measures the job; run the job itself with "
+                           "--like after the pilot" % (constraints["max_minutes"],
+                                                       settings["pilot"]["max_minutes_ceiling"]))
     job = {"size": size, "pilot": pilot, "constraints": constraints}
     why = fits_empty(settings, capacity, job)
     if why:
@@ -3449,6 +3470,7 @@ class Loop:
                     self.room = compute_room(self.s, self.samples, [self._counted(q, now) for q in inflight], hl,
                                              now)
                     self.room_empty = compute_room(self.s, self.samples, [], hl, now)  # as if no admitted job ran
+                    self.auto_grow(con, now, inflight, tasks, use)
                 else:  # too little history to know the outside use over the windows: release nothing yet
                     self.warming = {"covered_s": covered, "needed_s": self.s["warmup_s"]}
                     self.room = self.room_empty = None
@@ -3570,8 +3592,9 @@ class Loop:
             if status == "Running" and q.get("stop_reason") is None:  # a paused job is stopped once resumed
                 limit = None
                 if q.get("pilot"):  # a pilot's time counts from its start, not from its release
-                    limit = q["started"] + 60 * float(q["constraints"].get("max_minutes") or
-                                                      self.s["pilot"]["max_minutes"])
+                    limit = q["started"] + 60 * min(float(q["constraints"].get("max_minutes") or
+                                                          self.s["pilot"]["max_minutes"]),
+                                                    self.s["pilot"]["max_minutes_ceiling"])
                     reason = "pilot time limit"
                 if q["constraints"].get("stop_at"):
                     at = q["constraints"]["stop_at"]
@@ -3592,7 +3615,11 @@ class Loop:
                 self.track_progress(q, now, u)
                 self.keep_resized_limit(q)
                 self.track_memory(q, u)
-                self.check_oversize(q, now, status, p, u)
+                if self.s["auto_resize"]:
+                    q["oversize"] = None  # the loop shrinks it itself (auto_shrink); its owner is not asked to
+                    self.auto_shrink(con, q, now, status, p, u)
+                else:
+                    self.check_oversize(q, now, status, p, u)
                 self.check_undersize(q, now, status, u)
                 self.record_peaks(con, q, final=False)
                 self.adm.save(q)
@@ -3691,16 +3718,152 @@ class Loop:
             # reclaim may be what stalls it, so the once-per-job ALERT is not spent on a doubtful case
             q["undersized"] = None
             return
+        if self.s["auto_resize"] and not q.get("grow_blocked"):
+            q["undersized"] = None  # the loop grows it (auto_grow) while the host has room; no ALERT unless it has none
+            return
         limit = u.get("limit") or q.get("memory_max") or 0
         files = u.get("files", u.get("cache")) or 0
         q["undersized"] = {"stall": psi["full60"], "limit": limit, "ram": u.get("ram") or 0,
                            "cache": files, "since": (q.get("undersized") or {}).get("since") or now}
         self.adm.alert(q, "undersized", "undersized: over the last minute it spent %.0f%% of its time stalled reclaiming "
                        "memory against its own RAM limit of %s (it uses %s, file cache %s more), so it runs slowly. "
-                       "This is not host memory pressure and holds no other job. A running job's limit is never "
-                       "raised: to give it more, kill it and submit it again with a larger --ram, or measure it with "
-                       "--pilot" % (psi["full60"], _gbs(limit), _gbs(u.get("ram") or 0), _gbs(files)),
+                       "This is not host memory pressure and holds no other job. %s" % (psi["full60"], _gbs(limit), _gbs(u.get("ram") or 0), _gbs(files),
+                           "The loop raises its limit when this host has room, and it has none now; it is raised as "
+                           "soon as room frees" if self.s["auto_resize"] else
+                           "A running job's limit is not raised here (auto_resize is off): to give it more, kill it "
+                           "and submit it again with a larger --ram, or measure it with --pilot"),
                        extra={"undersized": {"stall": psi["full60"], "limit": limit}})
+
+    def auto_shrink(self, con, q, now, status, p, u):
+        """Lower the RAM limit of a running job that uses well under it to the size --like would give it, and a pilot's
+        to its peak times pilot.shrink_margin once it has run pilot.shrink_after_min, with every check job resize
+        makes (_resize_running); its owner is not asked. A pilot's count on its GPUs comes down to its peak there
+        times the same margin. The limit is lowered only when that saves at least auto_shrink_min_saving of it.
+        Returns True when it shrank."""
+        pilot = q.get("pilot")
+        after = self.s["pilot"]["shrink_after_min"] if pilot else self.s["oversize_after_min"]
+        if (status != "Running" or not q.get("started") or (q.get("constraints") or {}).get("in_containers")
+                or now - q["started"] < 60 * after or p["n"] < LIKE_MIN_SAMPLES):
+            return False
+        if pilot and q.get("gpu_counted") and not q.get("gpu_recounted"):
+            floor = self.s["pilot"]["gpu_min_gb"] * GB
+            want = max(floor, (p.get("gpu") or 0) * self.s["pilot"]["shrink_margin"])
+            q["gpu_counted"] = {g: min(b, want) for g, b in q["gpu_counted"].items()}
+            q["gpu_recounted"] = now
+            self.adm.record(con, {"token": q["token"], "gpu_counted": q["gpu_counted"]})
+            con.commit()
+        if _shrink_blocked(q.get("stall60"), q.get("refault_grew")):
+            return False
+        path = self.scopes_now.get(q["token"])
+        limits = [x for x in (q.get("memory_max"), (u or {}).get("limit")) if x]
+        if not path or not limits:
+            return False
+        limit_now = min(limits)
+        projected = _ram_at_total(q.get("progress") or []) or 0
+        kernel_peak = _read_cg_int(os.path.join(path, "job"), "memory.peak") or 0
+        use, cache = (u or {}).get("need") or 0, (u or {}).get("cache") or 0
+        s = self.s
+        if pilot:  # its limit comes to its peak times shrink_margin: --like's margin is for a measured job
+            s = json.loads(json.dumps(self.s))
+            s["margins"]["ram"] = self.s["pilot"]["shrink_margin"] / self.s["ram_hard_factor"]
+        new_ram = _parse_size(_size_arg(_resize_suggestion(s, p["ram"], use, kernel_peak, cache, projected,
+                                                           p.get("current") or 0, limit_now)))
+        if ram_limit(self.s, new_ram) > (1 - self.s["auto_shrink_min_saving"]) * limit_now:
+            return False
+        old = dict(q["size"], ram=max(q["size"]["ram"] or 0, int(math.ceil(limit_now / self.s["ram_hard_factor"]))))
+        new = dict(q["size"], ram=new_ram)
+        return self._apply_resize(con, q, old, new, "shrink", lambda: _resize_running(self.s, con, q, old, new))
+
+    def auto_grow(self, con, now, inflight, tasks, use):
+        """Raise the RAM limit of a running job that presses against it (its use, file cache excluded, at
+        grow_at_fraction of the limit, a stall against it over grow_stall_pct of the last minute, or a RAM trend on
+        course for it) to grow_factor times the limit, or what it needs if more, as far as the host's RAM room
+        allows. The room this cycle releases from is lowered by what it took. A job that needs more than the room
+        is marked grow_blocked, which is what makes its undersized ALERT."""
+        if not self.s["auto_resize"] or self.room is None or not self.room.get("pressure_ok"):
+            return
+        for q in inflight:
+            u, path = use.get(q["token"]), self.scopes_now.get(q["token"])
+            if (_task_status(tasks.get(q["token"])) != "Running" or q.get("stop_reason") or not u or not path
+                    or (q.get("constraints") or {}).get("in_containers") or not u.get("limit")):
+                continue
+            limit, need, psi = u["limit"], u.get("need") or 0, u.get("psi") or {}
+            projected = _ram_at_total(q.get("progress") or []) or 0
+            if not (need >= self.s["grow_at_fraction"] * limit or projected >= self.s["grow_at_fraction"] * limit
+                    or (psi.get("at_limit") and (psi.get("full60") or 0) >= self.s["grow_stall_pct"])):
+                q.pop("grow_blocked", None)
+                continue
+            counted = self._counted(q, now)["ram_counted"]
+            want = max(limit * self.s["grow_factor"], need * self.s["resize_margin"],
+                       projected * self.s["resize_margin"])
+            new_limit = _whole_pages(int(min(want, counted + max(0, self.room["ram"]["room"]))))
+            if new_limit < 1.05 * limit:
+                if not q.get("grow_blocked"):
+                    q["grow_blocked"] = now
+                    self.adm.save(q)
+                continue
+            job_cg = os.path.join(path, "job")
+            old = dict(q["size"], ram=max(q["size"]["ram"] or 0, int(math.ceil(limit / self.s["ram_hard_factor"]))))
+            new = dict(q["size"], ram=int(math.ceil(new_limit / self.s["ram_hard_factor"])))
+
+            def do(job_cg=job_cg, new_limit=new_limit, limit=limit, q=q):
+                _set_memory_max(job_cg, new_limit)
+                return ({"memory_max": new_limit, "ram_counted": new_limit, "was_memory_max": q.get("memory_max")},
+                        lambda: _set_memory_max(job_cg, limit))
+            if self._apply_resize(con, q, old, new, "grow", do):
+                self.room["ram"]["room"] -= max(0, new_limit - counted)
+                q.pop("grow_blocked", None)
+                self.adm.save(q)
+
+    def _apply_resize(self, con, q, old, new, how, do):
+        """Resize a running job from the loop, as job resize does, under the queue lock: do() sets its cgroup's limit
+        and returns (change, undo); then its record, its resize file (what the loop counts it by) and its assignment
+        (what a restart runs under). A job resize made since this cycle read the job wins: nothing is done, and the
+        job is looked at again next cycle. A step that fails undoes the ones before it. Returns True when it
+        resized."""
+        token = q["token"]
+        fd = self.adm.lock("queue.lock")
+        try:
+            cur = self.adm.read_queue(token)
+            if (not cur or cur.get("state") != "released" or cur.get("size") != q.get("size")
+                    or cur.get("memory_max") != q.get("memory_max")):
+                return False
+            try:
+                change, undo = do()
+            except JobError as e:
+                if q.get("auto_resize_refused") != str(e):
+                    sys.stderr.write("job _admit: %s of %s not made: %s\n" % (how, token, e))
+                q["auto_resize_refused"] = str(e)
+                return False
+            resized = (q.get("resized") or []) + [{"t": time.time(), "state": "released", "auto": how, "from": {
+                "cpus": old["cpus"], "ram": old["ram"]}, "to": {"cpus": new["cpus"], "ram": new["ram"]}}]
+            before = {"token": token, "size": q["size"], "resized": q.get("resized") or None,
+                      "memory_max": q.get("memory_max"), "ram_counted": q.get("ram_counted")}
+            try:
+                self.adm.record(con, dict({k: v for k, v in change.items() if k in RECORD_FIELDS}, token=token,
+                                          size=new, resized=resized))
+                con.commit()
+                try:
+                    self.adm.write_json(self.adm.resize_path(token), dict(change, size=new, resized=resized))
+                except OSError:
+                    self.adm.record(con, before)
+                    con.commit()
+                    raise
+            except (OSError, sqlite3.Error) as e:
+                try:
+                    con.rollback()
+                except sqlite3.Error:
+                    pass
+                if undo:
+                    undo()
+                sys.stderr.write("job _admit: %s of %s not made: %s\n" % (how, token, e))
+                return False
+            _set_assigned_limit(self.adm, token, change["memory_max"])
+            q.update(size=new, resized=resized, memory_max=change["memory_max"], ram_counted=change["ram_counted"])
+            q.pop("auto_resize_refused", None)
+            return True
+        finally:
+            os.close(fd)
 
     def keep_resized_limit(self, q):
         """A job resized while its scope was starting may have been given its old RAM limit: lower it again."""

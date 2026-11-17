@@ -2260,7 +2260,7 @@ class LoopTests(Base):
             return json.load(f)
 
     def test_an_oversized_running_job_alerts_and_shrinks(self):
-        self.write_settings(oversize_after_min=1)
+        self.write_settings(oversize_after_min=1, auto_resize=False)
         now = [time.time()]
         loop = self.loop(clock=lambda: now[0])
         r = self.submit_sized("python3 -c 'b = bytearray(60 * 1024 * 1024); import time; time.sleep(300)'",
@@ -2363,6 +2363,139 @@ class LoopTests(Base):
             self.assertIn("is a pilot", p.stdout)
         finally:
             self.d.pueue("remove", str(r["data"]["id"]))
+
+    # -- TASK-018: jobs reserve only what they use --------------------------------------------------------------
+
+    def _limit(self, loop, tok):
+        with open(os.path.join(loop.m.scopes()[tok], "job", "memory.max")) as f:
+            return int(f.read())
+
+    def test_max_minutes_over_the_ceiling_is_refused(self):
+        self.write_settings(pilot={"max_minutes": 1, "max_minutes_ceiling": 10})
+        r = self.submit_sized("true", pilot=True, max_minutes=11)
+        self.assertFalse(r["ok"])
+        self.assertIn("ceiling for a pilot, 10 minutes", r["error"])
+        r = self.submit_sized("true", pilot=True, max_minutes=10)
+        self.assertTrue(r["ok"], r)
+        self.d.pueue("remove", str(r["data"]["id"]))
+
+    def test_a_pilot_queued_with_a_longer_limit_is_stopped_at_the_ceiling(self):
+        self.write_settings(pilot={"max_minutes": 1, "max_minutes_ceiling": 2})
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized("sleep 300", pilot=True)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        qpath = os.path.join(self.state, "queue", tok + ".json")
+        with open(qpath) as f:
+            q = json.load(f)
+        q["constraints"]["max_minutes"] = 1080  # submitted before the ceiling existed
+        with open(qpath, "w") as f:
+            json.dump(q, f)
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+        self.assertTrue(self.cycles(loop, lambda: self.queue_file(tok).get("started"), n=10))
+        now[0] += 61
+        self.cycles(loop, lambda: False, n=3)
+        self.assertEqual(self.status(tid), "Running")  # under the ceiling still
+        now[0] += 60
+        self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Done"))
+
+    def test_an_oversized_running_job_is_shrunk_by_the_loop(self):
+        self.write_settings(oversize_after_min=1)
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized("python3 -c 'b = bytearray(60 * 1024 * 1024); import time; time.sleep(300)'",
+                              cpus=2, ram=400 * MiB)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        try:
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+            self.assertTrue(self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= 60 * MiB
+                                        and loop.peaks[tok]["n"] >= 3, n=40))
+            before = self._limit(loop, tok)
+            now[0] += 61  # past oversize_after_min
+            self.host.tick()
+            loop.cycle()
+            after = self._limit(loop, tok)
+            self.assertLess(after, 0.8 * before)
+            self.assertGreaterEqual(after, 60 * MiB * self.settings["resize_margin"])
+            self.host.tick()
+            loop.cycle()
+            with open(os.path.join(self.state, "room.json")) as f:
+                j = [x for x in json.load(f)["jobs"] if x["token"] == tok][0]
+            self.assertEqual(j["ram_counted"], after)
+            self.assertIsNone(j.get("oversize"))
+            q = self.queue_file(tok)
+            self.assertEqual(q["memory_max"], after)
+            self.assertNotIn("oversize", q.get("alerted") or [])  # nothing asked of its owner
+            self.assertEqual(q["resized"][-1]["auto"], "shrink")
+            self.assertFalse(os.path.exists(os.path.join(self.state, "alerts", tok + ".jsonl")))
+        finally:
+            self.job("kill", "local", str(tid))
+        self.cycles(loop, lambda: (self.record(tok) or {}).get("how") is not None, n=10)
+        self.assertEqual(self.record(tok)["memory_max"], after)
+
+    def test_a_pilot_is_counted_at_its_use_after_its_measuring_window(self):
+        self.write_settings(pilot={"max_minutes": 30, "shrink_after_min": 1, "shrink_margin": 2.0})
+        now = [time.time()]
+        loop = self.loop(clock=lambda: now[0])
+        r = self.submit_sized("python3 -c 'b = bytearray(60 * 1024 * 1024); import time; time.sleep(300)'",
+                              pilot=True)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        try:
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+            self.assertTrue(self.cycles(loop, lambda: (loop.peaks.get(tok) or {}).get("ram", 0) >= 60 * MiB
+                                        and loop.peaks[tok]["n"] >= 3, n=40))
+            before = self._limit(loop, tok)
+            self.assertGreater(before, 10 * GB)  # all the room at its release
+            now[0] += 61
+            self.host.tick()
+            loop.cycle()
+            after = self._limit(loop, tok)
+            peak = loop.peaks[tok]["ram"]
+            self.assertLess(after, 1 * GB)
+            self.assertGreaterEqual(after, 2.0 * peak * 0.99)
+            self.host.tick()
+            loop.cycle()
+            with open(os.path.join(self.state, "room.json")) as f:
+                j = [x for x in json.load(f)["jobs"] if x["token"] == tok][0]
+            self.assertEqual(j["ram_counted"], after)
+        finally:
+            self.job("kill", "local", str(tid))
+
+    def test_a_job_pressing_its_limit_grows_when_the_host_has_room(self):
+        loop = self.loop()
+        size = 300 * MiB  # limit 450 MiB; it uses about 430 MiB, over grow_at_fraction of it
+        r = self.submit_sized("python3 -c 'b = bytearray(415 * 1024 * 1024); b[::4096] = b\"x\" * len(b[::4096]); "
+                              "import time; time.sleep(300)'", cpus=1, ram=size)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        try:
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+            first = self.j.ram_limit(self.settings, size)
+            self.assertTrue(self.cycles(loop, lambda: self._limit(loop, tok) > first, n=40))
+            grown = self._limit(loop, tok)
+            self.assertGreaterEqual(grown, int(first * self.settings["grow_factor"]) - 4096)
+            q = self.queue_file(tok)
+            self.assertEqual(q["memory_max"], grown)
+            self.assertEqual(q["resized"][-1]["auto"], "grow")
+            self.host.tick()
+            loop.cycle()
+            self.assertEqual(self._limit(loop, tok), grown)  # not shrunk back, nor grown again
+        finally:
+            self.job("kill", "local", str(tid))
+
+    def test_a_job_pressing_its_limit_is_not_grown_without_room(self):
+        loop = self.loop()
+        size = 300 * MiB
+        r = self.submit_sized("python3 -c 'b = bytearray(415 * 1024 * 1024); b[::4096] = b\"x\" * len(b[::4096]); "
+                              "import time; time.sleep(300)'", cpus=1, ram=size)
+        tid, tok = r["data"]["id"], r["data"]["token"]
+        try:
+            self.assertTrue(self.cycles(loop, lambda: self.status(tid) == "Running"))
+            self.host.set(avail=1 * GB)  # under the 1 GB headroom once the job's own use is set aside
+            first = self.j.ram_limit(self.settings, size)
+            self.assertTrue(self.cycles(loop, lambda: self.queue_file(tok).get("grow_blocked"), n=20))
+            self.assertEqual(self._limit(loop, tok), first)
+        finally:
+            self.job("kill", "local", str(tid))
 
     # -- TASK-007.04: held messages ----------------------------------------------------------------------------
 
@@ -2677,10 +2810,24 @@ class LoopTests(Base):
             return real_events(path)
         loop.m.cgroup_pressure, loop.m.limit_events = pressure, limit_events
 
+    def test_a_job_stalled_against_its_own_limit_is_grown_while_the_host_has_room(self):
+        self.fake_pressure("system.slice", 0.2)
+        self.fake_pressure("user.slice/user-4242.slice", 0.5)
+        loop, tid, tok, now = self.running_job()
+        self.stalled_at_its_limit(loop, tok)
+        first = self.queue_file(tok)["memory_max"]
+        for _ in range(2):
+            self.host.tick()
+            loop.cycle()
+        q = self.queue_file(tok)
+        self.assertGreater(q["memory_max"], first)
+        self.assertEqual(q["resized"][-1]["auto"], "grow")
+        self.assertNotIn("undersized", q.get("alerted") or [])
+
     def test_a_job_stalled_against_its_own_limit_holds_no_one_and_alerts_its_owner(self):
         self.fake_pressure("system.slice", 0.2)
         self.fake_pressure("user.slice/user-4242.slice", 0.5)  # under 1%: nothing outside the jobs is stalled
-        loop, tid, tok, now = self.running_job()
+        loop, tid, tok, now = self.running_job(auto_resize=False)
         self.stalled_at_its_limit(loop, tok)
         self.host.set(psi=22.4)  # the system-wide figure counts the job's own stall
         w = subprocess.Popen([sys.executable, JOB, "wait", "local", str(tid), "--token", tok, "--poll", "0.3"],
@@ -3414,10 +3561,15 @@ class ReviewFiveRules(unittest.TestCase):
                             (dict(quiet, psi_outside=0.0, avail=50 * GB), True)):
             loop = self.oversize_loop()
             loop.samples = [dict(sample(9999), **last)]
-            q = self.oversized_job()
+            q = self.oversized_job(grow_blocked=9990.0)  # the loop found no room to raise its limit
             loop.check_undersize(q, 10000.0, "Running", u)
             self.assertEqual([a[0] for a in loop.alerts], ["undersized"] if fires else [], last)
             self.assertEqual(q["undersized"] is not None, fires)
+        loop = self.oversize_loop()  # with room to raise its limit, the loop grows it instead (auto_grow): no ALERT
+        loop.samples = [dict(sample(9999), **dict(quiet, psi_outside=0.0, avail=50 * GB))]
+        q = self.oversized_job()
+        loop.check_undersize(q, 10000.0, "Running", u)
+        self.assertEqual(loop.alerts, [])
 
 
 if __name__ == "__main__":
