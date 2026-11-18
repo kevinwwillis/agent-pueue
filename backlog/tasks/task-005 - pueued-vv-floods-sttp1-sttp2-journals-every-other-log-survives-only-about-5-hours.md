@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-11-14T14:24:00Z'
-updated_date: '2026-11-18T16:26:00Z'
+updated_date: '2026-11-18T16:29:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -29,4 +29,6 @@ Found 2026-11-14 09:23 ET by the TARS/MO manager. pueued.service on sttp1 and st
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-11-18 11:26 ET (data-org manager): sttp2 / at 95% (46 GB free): /var/log/syslog 316 GB since 11-15 00:02 ET plus syslog.1 92 GB, almost all pueued -vv task-list dumps (193,104 of the last ~194k lines in 20 MB). Growth 172 KB/s measured over 60 s, about 1 MB/s average since 11-15. sttp1: syslog 94 GB + syslog.1 46 GB, / at 40%. Stopgap asked of Kevin (aqua c976e096161a): rsyslog filter dropping pueued lines, delete syslog.1.
+
+2026-11-18 11:28 ET: stopgap done on sttp2 with Kevin's OK (aqua c976e096161a): /etc/rsyslog.d/10-drop-pueued.conf drops pueued lines from syslog (journal still gets them); syslog.1 (92 GB) removed; / at 85%. Remove the filter once pueued runs without -vv. sttp1 unchanged (syslog 94+46 GB, / at 40%).
 <!-- SECTION:NOTES:END -->
