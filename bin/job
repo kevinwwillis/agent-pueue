@@ -35,7 +35,7 @@ import time
 import traceback
 import uuid
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 PROTOCOL = 3
 # Protocol 4 is sent only by a submit that asks for normal priority. A host that predates the
 # option accepts 3 only, so it refuses such a request instead of queueing it at idle priority.
@@ -2364,8 +2364,10 @@ class Admission:
         r = self.read_json(self.resize_path(q["token"]))
         if isinstance(r, dict) and isinstance(r.get("size"), dict):
             q["size"] = r["size"]
-            soft = [x for x in q.get("resized") or [] if isinstance(x, dict) and "soft_limit" in x]
-            q["resized"] = sorted((r.get("resized") or []) + soft,  # the loop's soft limits live in the queue file
+            soft = [x for x in q.get("resized") or [] if _is_soft(x)]
+            own = [x for x in r.get("resized") or [] if not _is_soft(x)]  # a resize file written before 0.9.2 may
+            # carry soft limits too; taking them from both files doubled them on every read (TASK-021)
+            q["resized"] = sorted(_unique(own + soft),  # the loop's soft limits live in the queue file
                                   key=lambda x: x.get("t") or 0 if isinstance(x, dict) else 0)
             last = q["resized"][-1] if q["resized"] and isinstance(q["resized"][-1], dict) else {}
             if q.get("fair_base") is not None and (last.get("t") or 0) > (q.get("fair_base_at") or 0):
@@ -2418,6 +2420,8 @@ class Admission:
         return con
 
     def record(self, con, row):
+        if isinstance(row.get("resized"), list):
+            row = dict(row, resized=_unique(row["resized"]))  # a record grown before 0.9.2 shrinks back (TASK-021)
         cols = [k for k in RECORD_FIELDS if k in row]
         vals = [json.dumps(row[k]) if isinstance(row[k], (dict, list)) else row[k] for k in cols]
         con.execute("INSERT INTO jobs (%s) VALUES (%s) ON CONFLICT(token) DO UPDATE SET %s" % (
@@ -2632,6 +2636,26 @@ def _capacity(measure):
 def _measure_from_env():
     return Measure(proc=os.environ.get("JOB_TEST_PROC", "/proc"), sys_root=os.environ.get("JOB_TEST_SYS", "/sys"),
                    cgroup_root=os.environ.get("JOB_TEST_CGROUP", "/sys/fs/cgroup"))
+
+
+def _is_soft(x):
+    """A resize entry the loop wrote for a soft limit; these live in the queue file only, never in the resize file."""
+    return isinstance(x, dict) and "soft_limit" in x
+
+
+def _no_soft(resized):
+    return [x for x in resized or [] if not _is_soft(x)]
+
+
+def _unique(entries):
+    """The entries without repeats, first occurrence kept (a record grown by TASK-021 shrinks back on its next save)."""
+    seen, out = set(), []
+    for x in entries:
+        k = json.dumps(x, sort_keys=True)
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+    return out
 
 
 def _heartbeat_age(adm):
@@ -3139,7 +3163,7 @@ def host_resize(req):
                                          size=new, resized=resized))
                     con.commit()
                     try:
-                        adm.write_json(adm.resize_path(token), dict(change, size=new, resized=resized))
+                        adm.write_json(adm.resize_path(token), dict(change, size=new, resized=_no_soft(resized)))
                     except OSError:
                         adm.record(con, before)
                         con.commit()
@@ -3959,7 +3983,7 @@ class Loop:
                                           size=new, resized=resized))
                 con.commit()
                 try:
-                    self.adm.write_json(self.adm.resize_path(token), dict(change, size=new, resized=resized))
+                    self.adm.write_json(self.adm.resize_path(token), dict(change, size=new, resized=_no_soft(resized)))
                 except OSError:
                     self.adm.record(con, before)
                     con.commit()
@@ -4045,6 +4069,8 @@ class Loop:
             if res.get("memory_max_at_end"):
                 row["memory_max"] = res["memory_max_at_end"]  # the limit it ended under
         row["how"] = how
+        if q.get("resized"):
+            row["resized"] = q["resized"]  # its final list, without the repeats a 0.9.1 record could hold (TASK-021)
         # Under the queue lock, which job resize holds from reading the queue file to writing its own: a resize either
         # finishes before the job's files are removed (and its change is in the record) or finds the job gone.
         con.commit()  # lock order is queue.lock, then the records

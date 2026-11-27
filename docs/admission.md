@@ -575,6 +575,8 @@ With `auto_resize` off, two tools let a job's owner give room back:
     under the same lock, so a resize either lands before the job's end (and its change is in the final record) or
     finds the job gone; resize files whose job left the queue are removed each cycle. The record gets the new size, limit and count, and `resized` (each change: when,
     held or running, from and to).
+  - The resize file holds only these resizes. The loop's soft limits live in the queue file alone, and a reader
+    merges the two lists without repeats, so reading the queue never adds entries (TASK-021).
 
 ### Records
 

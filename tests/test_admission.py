@@ -764,6 +764,26 @@ class ResizeRules(unittest.TestCase):
         self.assertNotIn("fair_passed", got)
         os.remove(adm.resize_path(q["token"]))
 
+    def test_soft_limits_in_a_resize_file_do_not_grow_the_record(self):
+        # TASK-021: a resize file that carried the loop's soft limits doubled them on every read of the queue file
+        adm = self.j.Admission(self.s)
+        soft = {"t": 10.0, "state": "released", "auto": "shrink", "soft_limit": {"from": 5 * GB, "to": GB}}
+        grow = {"t": 20.0, "state": "released", "auto": "grow", "from": {"cpus": 1, "ram": GB}, "to": {"cpus": 1, "ram": 2 * GB}}
+        q = {"token": "e" * 32, "size": {"cpus": 1, "ram": GB}, "state": "released", "resized": [soft, soft, soft]}
+        adm.write_json(adm.resize_path(q["token"]), {"size": {"cpus": 1, "ram": 2 * GB}, "resized": [soft, grow]})
+        for _ in range(5):
+            q = adm.overlay(dict(q))
+        self.assertEqual(q["resized"], [soft, grow])
+        self.assertEqual(q["size"]["ram"], 2 * GB)
+        self.assertEqual(self.j._no_soft([soft, grow]), [grow])
+        os.remove(adm.resize_path(q["token"]))
+        con = adm.db()
+        adm.record(con, {"token": q["token"], "task": "T-021", "resized": [soft] * 4 + [grow]})
+        con.commit()
+        got = json.loads(con.execute("SELECT resized FROM jobs WHERE token = ?", (q["token"],)).fetchone()[0])
+        con.close()
+        self.assertEqual(got, [soft, grow])  # a grown record shrinks back when it is written
+
     def test_like_last_prefers_the_newest_run_that_exited_0(self):
         adm = self.j.Admission(self.s)
         cap = {"mem_total": 64 * GB, "threads": 8, "gpus": []}
